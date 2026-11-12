@@ -1036,6 +1036,8 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor"
                 | "OperationsService/GetPortfolio"
                 | "OperationsService/GetOperationsByCursor"
+                | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations"
+                | "OperationsService/GetOperations"
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
                 | "OperationsService/GetBrokerReport" => Some("OperationsService"),
                 "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
@@ -3368,6 +3370,23 @@ mod tests {
 
         let sent = gateway.transport.sent_at();
         assert_eq!(sent[1] - sent[0], Duration::from_millis(100));
+    }
+
+    #[test]
+    fn legacy_operations_uses_the_existing_operations_service_budget() {
+        for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+            for path in [
+                "OperationsService/GetOperations",
+                "/OperationsService/GetOperations",
+                "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+                "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            ] {
+                assert_eq!(
+                    broker_budget_key(destination, path),
+                    Some("OperationsService")
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -2318,6 +2318,17 @@ pub trait BrokerChannel: Send + Sync {
     ) {
     }
 
+    /// Best-effort diagnostics for paired fund redemptions whose units never
+    /// arrived. No journal or parsing decision may depend on this hook.
+    async fn diagnose_missing_fund_units(
+        &self,
+        _instruments: &[InstrumentId],
+        _account: &str,
+        _period: (Date, Date),
+        _context: BrokerRequestContext<'_>,
+    ) {
+    }
+
     /// Portfolio claims for the requested account and their date semantics.
     ///
     /// Returns the source's assertions, not a calculation: the values calculated

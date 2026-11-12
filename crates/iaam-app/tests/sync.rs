@@ -5888,6 +5888,145 @@ async fn repeated_sync_warns_about_existing_invalid_outbound_transfer_without_de
 }
 
 #[tokio::test]
+async fn missing_fund_units_diagnostics_only_cover_missing_paired_redemptions() {
+    struct DiagnosticBroker {
+        inner: FakeBroker,
+        calls: Mutex<Vec<Vec<InstrumentId>>>,
+    }
+
+    #[async_trait]
+    impl BrokerChannel for DiagnosticBroker {
+        async fn fetch_account_numbers(
+            &self,
+            context: BrokerRequestContext<'_>,
+        ) -> Result<Vec<String>, BrokerError> {
+            self.inner.fetch_account_numbers(context).await
+        }
+
+        async fn fetch_operations(
+            &self,
+            account: AccountId,
+            broker_account: &str,
+            from: Date,
+            to: Date,
+            context: BrokerRequestContext<'_>,
+        ) -> Result<ParsedOperations, BrokerError> {
+            self.inner
+                .fetch_operations(account, broker_account, from, to, context)
+                .await
+        }
+
+        async fn fetch_portfolio(
+            &self,
+            account: AccountId,
+            broker_account: &str,
+            at: Date,
+            context: BrokerRequestContext<'_>,
+        ) -> Result<PortfolioSnapshot, BrokerError> {
+            self.inner
+                .fetch_portfolio(account, broker_account, at, context)
+                .await
+        }
+
+        async fn diagnose_missing_fund_units(
+            &self,
+            instruments: &[InstrumentId],
+            broker_account: &str,
+            period: (Date, Date),
+            _context: BrokerRequestContext<'_>,
+        ) {
+            assert!(
+                self.inner
+                    .requested_numbers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|number| number == broker_account)
+            );
+            assert_eq!(period, (date!(2026 - 03 - 01), date!(2026 - 03 - 31)));
+            self.calls.lock().unwrap().push(instruments.to_vec());
+        }
+
+        fn channel(&self) -> SourceChannel {
+            self.inner.channel()
+        }
+
+        fn identity_scope(&self) -> IdentityScope {
+            self.inner.identity_scope()
+        }
+    }
+
+    // No units, too few units, excess units, and an unpaired bond refusal.
+    for (held, paired, expected_calls) in [(0, true, 1), (1, true, 0), (3, true, 0), (0, false, 0)]
+    {
+        let owner = OwnerId::new_random();
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let services = services_with(date!(2026 - 03 - 31), |store| {
+            seed_account(store, owner, account, "Main");
+            seed_instrument(store, instrument, "INVENTEDDIAGNOSTIC");
+        });
+        if held > 0 {
+            seed_redemption_history(
+                &services,
+                owner,
+                account,
+                instrument,
+                &[(date!(2026 - 03 - 01), held)],
+            )
+            .await;
+        }
+        let mut inner = api_with_claims(
+            SourceId::new_random(),
+            trade_without_custody(account, instrument),
+            vec![],
+        );
+        let operations = inner.operations.as_mut().unwrap();
+        operations.accepted.clear();
+        for id in ["invented-first-redemption", "invented-second-redemption"] {
+            operations
+                .pending_redemptions
+                .push(iaam_app::ports::PendingFullRedemption {
+                    withdrawn_quantity: paired.then_some(iaam_core::money::Quantity(Dec::new(
+                        rust_decimal::Decimal::from(2),
+                    ))),
+                    withdrawal_operation_id: paired.then(|| format!("withdrawal-{id}")),
+                    account,
+                    instrument,
+                    compensation: iaam_core::money::Money::new(
+                        PostedMinor::new(20_000),
+                        CurrencyCode::Rub,
+                    ),
+                    effective_date: date!(2026 - 03 - 15),
+                    idempotency_key: id.to_owned(),
+                    source_operation_id: id.to_owned(),
+                    raw: "{}".to_owned(),
+                });
+        }
+        let broker = DiagnosticBroker {
+            inner,
+            calls: Mutex::new(Vec::new()),
+        };
+        let outcome = sync_broker(
+            &services,
+            &principal(owner),
+            &broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .expect("invented diagnostic sync");
+        assert_eq!(outcome.set_aside, 2);
+        let calls = broker.calls.lock().unwrap();
+        assert_eq!(calls.len(), expected_calls, "held={held}, paired={paired}");
+        if expected_calls > 0 {
+            assert_eq!(*calls, vec![vec![instrument]]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn paired_fund_redemption_retires_exact_units_and_never_invents_a_twin_arrival() {
     use iaam_app::ports::PendingFullRedemption;
     use iaam_core::event::corporate_action::CorporateAction;

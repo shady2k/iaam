@@ -302,6 +302,33 @@ impl TinkoffClient {
         Ok(body)
     }
 
+    /// Return the raw legacy operations body for diagnostics only.
+    ///
+    /// All operation states and instruments are requested. This response is
+    /// neither validated as a cursor page nor normalized into ledger events.
+    pub async fn get_legacy_operations(
+        &self,
+        account: &str,
+        period: (&str, &str),
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            LEGACY_OPERATIONS,
+            json!({
+                "accountId": account,
+                "from": period.0,
+                "to": period.1,
+                "state": "OPERATION_STATE_UNSPECIFIED",
+                "figi": ""
+            }),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
+    }
+
     /// Start asynchronous report generation for one account and UTC period.
     pub async fn generate_broker_report(
         &self,
@@ -422,6 +449,11 @@ const INSTRUMENT: ReadCall = ReadCall {
 const BROKER_REPORT: ReadCall = ReadCall {
     method: Method::BrokerReport,
     path: "OperationsService/GetBrokerReport",
+};
+
+const LEGACY_OPERATIONS: ReadCall = ReadCall {
+    method: Method::Operations,
+    path: "OperationsService/GetOperations",
 };
 
 const OPERATIONS: ReadCall = ReadCall {
@@ -672,6 +704,69 @@ mod tests {
 
     fn sent(paths: &Mutex<Vec<String>>) -> usize {
         paths.lock().expect("paths").len()
+    }
+
+    #[tokio::test]
+    async fn legacy_operations_posts_an_unfiltered_diagnostic_request_and_returns_raw_body() {
+        struct LegacyDiagnostic {
+            deadline: Instant,
+        }
+
+        impl Outbound for LegacyDiagnostic {
+            fn send<'a>(
+                &'a self,
+                request: &'a HttpRequest,
+                deadline: Option<Instant>,
+            ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    assert_eq!(deadline, Some(self.deadline));
+                    assert_eq!(request.destination(), Destination::TinkoffProd);
+                    assert_eq!(
+                        request.path(),
+                        "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations"
+                    );
+                    assert!(request.is_idempotent());
+                    let payload: Value =
+                        serde_json::from_str(request.body().expect("JSON request body").payload())
+                            .expect("request JSON");
+                    assert_eq!(
+                        payload,
+                        json!({
+                            "accountId": "invented-account",
+                            "from": "2026-01-01T00:00:00Z",
+                            "to": "2026-02-01T00:00:00Z",
+                            "state": "OPERATION_STATE_UNSPECIFIED",
+                            "figi": ""
+                        })
+                    );
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: br#"{ "operations": [{"id":"invented-operation"}] }"#.to_vec(),
+                        ..Default::default()
+                    })
+                })
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let key = Key::from_bytes([3; 32]);
+        let token = open(&key, &seal(&key, TOKEN)).expect("token opens");
+        let client = TinkoffClient::new(
+            Environment::Prod,
+            token,
+            Arc::new(LegacyDiagnostic { deadline }),
+        );
+        let body = client
+            .get_legacy_operations(
+                "invented-account",
+                ("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"),
+                Some(deadline),
+                &RequestAllowance::new(1),
+            )
+            .await
+            .expect("legacy diagnostics do not require cursor fields");
+        assert_eq!(body, r#"{ "operations": [{"id":"invented-operation"}] }"#);
     }
 
     #[tokio::test]

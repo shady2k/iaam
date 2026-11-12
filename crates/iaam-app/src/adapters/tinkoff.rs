@@ -462,6 +462,27 @@ fn trace_instrument_miss(
     );
 }
 
+fn received_by_type(operations: &[ChannelOperation]) -> std::collections::BTreeMap<&str, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for operation in operations {
+        let kind = operation
+            .raw
+            .get("type")
+            .or_else(|| operation.raw.get("operationType"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or_else(|| {
+                if operation.source_kind.is_empty() {
+                    "<missing>"
+                } else {
+                    &operation.source_kind
+                }
+            });
+        *counts.entry(kind).or_default() += 1;
+    }
+    counts
+}
+
 #[async_trait]
 impl BrokerChannel for TinkoffChannel {
     async fn diagnose_instruments(
@@ -472,6 +493,17 @@ impl BrokerChannel for TinkoffChannel {
         context: BrokerRequestContext<'_>,
     ) {
         self.trace_instrument_history(instruments, broker_account, period, context)
+            .await;
+    }
+
+    async fn diagnose_missing_fund_units(
+        &self,
+        instruments: &[InstrumentId],
+        broker_account: &str,
+        period: (Date, Date),
+        context: BrokerRequestContext<'_>,
+    ) {
+        self.trace_missing_fund_units(instruments, broker_account, period, context)
             .await;
     }
 
@@ -514,6 +546,11 @@ impl BrokerChannel for TinkoffChannel {
                 .await
         })
         .await?;
+        tracing::info!(
+            phase = "fetch_operations",
+            received_by_type = ?received_by_type(&operations),
+            "received T-Invest operation types"
+        );
         let mut diagnostic_operations = diagnostics::capture(&operations);
         self.resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;
@@ -2847,6 +2884,24 @@ mod tests {
         assert!(log.contains("status=\"deadline_elapsed\""), "{log}");
     }
 
+    #[test]
+    fn received_type_counts_include_unmapped_and_refused_operations() {
+        let mut input = report_operation();
+        input.source_kind = "OPERATION_TYPE_INPUT_SECURITIES".to_owned();
+        input.raw = serde_json::json!({"type":"OPERATION_TYPE_INPUT_SECURITIES"});
+        let mut unknown = report_operation();
+        unknown.source_kind.clear();
+        unknown.raw = serde_json::json!({"type":"OPERATION_TYPE_NOT_IN_DICTIONARY"});
+        unknown.rejection = Some(iaam_broker::tinkoff::ParseError::PartialResponse);
+        assert_eq!(
+            super::received_by_type(&[input.clone(), unknown, input]),
+            std::collections::BTreeMap::from([
+                ("OPERATION_TYPE_INPUT_SECURITIES", 2),
+                ("OPERATION_TYPE_NOT_IN_DICTIONARY", 1),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn position_refusal_diagnostics_skip_low_remaining_without_report_requests() {
         let (gateway, requests, _) = fake::gateway(
@@ -2893,6 +2948,155 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("low_rate_capacity_or_host_pause"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn missing_fund_units_cross_checks_only_formation_windows_without_recording() {
+        let legacy = serde_json::json!({"operations":[
+            {"id":"invented-arrival", "operationType":"OPERATION_TYPE_INPUT_SECURITIES", "figi":"OLD_FIGI", "isin":"INVENTED_TWIN_ISIN", "quantity":"3", "date":"2023-11-01T12:00:00Z"},
+            {"id":"unrelated-legacy", "operationType":"OPERATION_TYPE_OUTPUT", "figi":"UNRELATED"}
+        ]});
+        let report = serde_json::json!({"getBrokerReportResponse":{
+            "brokerReport":[{"figi":"OLD_FIGI", "name":"invented historical fund", "quantity":"3"}, {"figi":"UNRELATED", "name":"unrelated report name"}],
+            "itemsCount":2,"pagesCount":1,"page":0
+        }});
+        let mut answers = vec![Answer::status(200, "{}")];
+        for _ in 0..3 {
+            answers.push(Answer::status(200, &legacy.to_string()));
+        }
+        for _ in 0..3 {
+            answers.push(Answer::status(
+                200,
+                r#"{"generateBrokerReportResponse":{"taskId":"invented-formation-task"}}"#,
+            ));
+            answers.push(Answer::status(200, &report.to_string()));
+        }
+        let (gateway, requests, _) = fake::gateway(answers, None);
+        let channel = channel(gateway);
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let affected = InstrumentId::new_random();
+        let mut operation = report_operation();
+        operation.raw = serde_json::json!({"id":"invented-withdrawal", "figi":"NEW_FIGI", "isin":"INVENTED_TWIN_ISIN", "date":"2026-08-20T00:00:00Z"});
+        let mut rows = super::diagnostics::capture(&[operation]);
+        rows[0].instrument = Some(affected);
+        *channel.diagnostic_operations.lock().await = rows;
+        channel
+            .trace_missing_fund_units(
+                &[affected],
+                "invented",
+                (
+                    time::macros::date!(2015 - 01 - 01),
+                    time::macros::date!(2026 - 11 - 12),
+                ),
+                broker_context(None),
+            )
+            .await;
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 10);
+        let legacy_requests: Vec<serde_json::Value> = sent[1..4]
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(legacy_requests[0]["from"], "2023-10-01T00:00:00Z");
+        assert_eq!(legacy_requests[2]["to"], "2023-12-31T23:59:59.999999999Z");
+        for request in &legacy_requests {
+            let from = time::OffsetDateTime::parse(
+                request["from"].as_str().unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+            let to = time::OffsetDateTime::parse(
+                request["to"].as_str().unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+            assert!(to - from <= time::Duration::days(31));
+        }
+        for (request, legacy) in sent[4..].iter().step_by(2).zip(&legacy_requests) {
+            let request: serde_json::Value = serde_json::from_str(request).unwrap();
+            assert_eq!(
+                request["generateBrokerReportRequest"]["from"],
+                legacy["from"]
+            );
+            assert_eq!(request["generateBrokerReportRequest"]["to"], legacy["to"]);
+        }
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("invented-arrival"), "{log}");
+        assert!(log.contains("invented historical fund"), "{log}");
+        assert!(!log.contains("unrelated-legacy"), "{log}");
+        assert!(!log.contains("unrelated report name"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn missing_fund_units_logs_local_inputs_even_when_network_capacity_is_low() {
+        let (gateway, requests, _) = fake::gateway(
+            vec![Answer {
+                status: 200,
+                body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
+                reset: Some(Duration::from_secs(30)),
+                remaining: Some(5),
+            }],
+            None,
+        );
+        let channel = channel(gateway);
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let mut operation = report_operation();
+        operation.raw = serde_json::json!({"id":"invented-unrelated-input", "type":"OPERATION_TYPE_INPUT_SECURITIES", "figi":"UNRELATED_FIGI", "date":"2023-11-01T00:00:00Z", "quantity":"3"});
+        *channel.diagnostic_operations.lock().await = super::diagnostics::capture(&[operation]);
+        channel
+            .trace_missing_fund_units(
+                &[InstrumentId::new_random()],
+                "invented",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+            )
+            .await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("low_rate_capacity_or_host_pause"), "{log}");
+        assert!(log.contains("invented-unrelated-input"), "{log}");
+        assert!(log.contains("cursor_received"), "{log}");
     }
 
     #[tokio::test]

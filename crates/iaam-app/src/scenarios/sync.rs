@@ -325,6 +325,7 @@ pub async fn sync_broker(
     );
     let mut diagnostic_instruments =
         audit_outbound_transfers(&bounded_events, account, broker_context.deadline)?;
+    let mut missing_fund_units = std::collections::BTreeSet::new();
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -628,7 +629,11 @@ pub async fn sync_broker(
                 }
                 match resolve_full_redemption(services, principal.owner, &pending).await? {
                     Ok(submitted) => submitted,
-                    Err(reason) => {
+                    Err(refusal) => {
+                        if refusal.missing_fund_units {
+                            missing_fund_units.insert(pending.instrument);
+                        }
+                        let reason = refusal.reason;
                         diagnostic_instruments.insert(pending.instrument);
                         tracing::debug!(phase = "map", row_index, reason = %reason, "broker full redemption set aside");
                         let key = SourceRowKey {
@@ -770,6 +775,17 @@ pub async fn sync_broker(
             known.push(known_record(&event, event_id));
         }
         recorded.push(verdict);
+    }
+
+    if !missing_fund_units.is_empty() {
+        broker
+            .diagnose_missing_fund_units(
+                &missing_fund_units.into_iter().collect::<Vec<_>>(),
+                &broker_account,
+                (from, to),
+                broker_context,
+            )
+            .await;
     }
 
     if !diagnostic_instruments.is_empty() {
@@ -1423,11 +1439,16 @@ async fn held_quantity_before_transfer(
         .unwrap_or_else(Quantity::zero))
 }
 
+struct FullRedemptionRefusal {
+    reason: String,
+    missing_fund_units: bool,
+}
+
 async fn resolve_full_redemption(
     services: &AppServices,
     owner: OwnerId,
     pending: &crate::ports::PendingFullRedemption,
-) -> Result<Result<iaam_ingest::SubmittedJournalEvent, String>, AppError> {
+) -> Result<Result<iaam_ingest::SubmittedJournalEvent, FullRedemptionRefusal>, AppError> {
     use iaam_core::event::corporate_action::CorporateAction;
     use iaam_core::projection::balances::{Balances, PositionKey};
     let events = services
@@ -1466,11 +1487,14 @@ async fn resolve_full_redemption(
                 reason,
                 "fund unit redemption set aside; no arrival inferred"
             );
-            return Ok(Err(format!(
-                "fund unit redemption of instrument {}: {} units withdrawn; {reason}",
-                pending.instrument.inner(),
-                withdrawn.0.inner()
-            )));
+            return Ok(Err(FullRedemptionRefusal {
+                reason: format!(
+                    "fund unit redemption of instrument {}: {} units withdrawn; {reason}",
+                    pending.instrument.inner(),
+                    withdrawn.0.inner()
+                ),
+                missing_fund_units: !held.0.is_positive(),
+            }));
         }
     }
     let Some(quantity) = pending
@@ -1481,10 +1505,13 @@ async fn resolve_full_redemption(
         if tracing::enabled!(tracing::Level::DEBUG) {
             trace_full_redemption_refusal(services, pending, &effective).await;
         }
-        return Ok(Err(format!(
-            "bond redemption reports zero quantity and the journal holds no positive position of this instrument on this account at {}; history may start after the holding",
-            pending.effective_date
-        )));
+        return Ok(Err(FullRedemptionRefusal {
+            reason: format!(
+                "bond redemption reports zero quantity and the journal holds no positive position of this instrument on this account at {}; history may start after the holding",
+                pending.effective_date
+            ),
+            missing_fund_units: false,
+        }));
     };
     Ok(Ok(iaam_ingest::SubmittedJournalEvent {
         account: pending.account,

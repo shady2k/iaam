@@ -835,22 +835,39 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Refresh a broker-reported trading block without changing owner descriptions.
+    /// Refresh one broker handle and derive the catalogue flag from all handles.
+    /// `handle` is broker-namespaced, not an owner's account or source channel.
     pub fn update_blocked_tca_flag(
         &self,
         id: InstrumentId,
+        handle: &str,
         blocked_tca_flag: bool,
     ) -> Result<(), StoreError> {
-        let changed = self.conn.execute(
-            "UPDATE instruments SET blocked_tca_flag = ?2 WHERE id = ?1",
-            params![id.inner().to_string(), blocked_tca_flag],
-        )?;
-        if changed == 0 {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = id.inner().to_string();
+        if !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM instruments WHERE id = ?1)",
+            [&id],
+            |row| row.get::<_, bool>(0),
+        )? {
             return Err(StoreError::NotFound {
                 what: "instrument",
-                id: id.inner().to_string(),
+                id,
             });
         }
+        tx.execute(
+            "INSERT INTO instrument_broker_blocks (instrument, handle, blocked_tca_flag)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (instrument, handle) DO UPDATE SET blocked_tca_flag = excluded.blocked_tca_flag",
+            params![id, handle, blocked_tca_flag],
+        )?;
+        tx.execute(
+            "UPDATE instruments SET blocked_tca_flag = EXISTS(
+                 SELECT 1 FROM instrument_broker_blocks WHERE instrument = ?1 AND blocked_tca_flag = 1
+             ) WHERE id = ?1",
+            [&id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

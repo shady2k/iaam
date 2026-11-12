@@ -68,6 +68,7 @@ struct CachedDescription<T = BrokerInstrumentDescription> {
     uid_not_found: bool,
     probes: HashSet<String>,
     broker_instrument_type: Option<String>,
+    request_handle: String,
 }
 
 /// Broker channel implementation for T-Invest.
@@ -155,18 +156,11 @@ impl TinkoffChannel {
         descriptions: &mut HashMap<String, CachedDescription<T>>,
         (method, parse): (DescriptionMethod, DescriptionParser<T>),
     ) -> Result<CachedDescription<T>, BrokerError> {
-        let key = match id_type {
-            InstrumentIdType::Uid => format!(
-                "uid:{}",
-                Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string())
-            ),
-            InstrumentIdType::Figi => format!("figi:{id}"),
-            InstrumentIdType::PositionUid => format!("position_uid:{id}"),
-        };
-        if descriptions
+        let key = description_handle(id, id_type);
+        let cache_hit = descriptions
             .get(&key)
-            .is_none_or(|cached| cached.read_at.elapsed() >= std::time::Duration::from_secs(3600))
-        {
+            .is_some_and(|cached| cached.read_at.elapsed() < std::time::Duration::from_secs(3600));
+        if !cache_hit {
             tracing::info!(
                 phase = "describe_instruments",
                 status = "start",
@@ -210,6 +204,7 @@ impl TinkoffChannel {
                     uid_not_found,
                     probes: HashSet::new(),
                     broker_instrument_type,
+                    request_handle: key.clone(),
                 },
             );
         }
@@ -251,6 +246,7 @@ impl TinkoffChannel {
                                         .as_str()
                                         .map(str::to_owned)
                                 });
+                        cached.request_handle = description_handle(identifier, fallback_type);
                         cached.description = parse(&body);
                         cached.uid_not_found = false;
                         tracing::info!(
@@ -288,6 +284,12 @@ impl TinkoffChannel {
                 }
             }
         }
+        tracing::debug!(
+            phase = "describe_instruments",
+            request_handle = cached.request_handle,
+            cache_hit,
+            "broker description resolved"
+        );
         Ok(cached.clone())
     }
 
@@ -298,6 +300,19 @@ impl TinkoffChannel {
         on: Date,
         context: BrokerRequestContext<'_>,
     ) -> Result<Result<InstrumentId, String>, BrokerError> {
+        Ok(self
+            .resolve_instrument_with_flag(uid, raw, on, context)
+            .await?
+            .map(|(instrument, _)| instrument))
+    }
+
+    async fn resolve_instrument_with_flag(
+        &self,
+        uid: Option<&str>,
+        raw: &serde_json::Value,
+        on: Date,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<Result<(InstrumentId, bool), String>, BrokerError> {
         let (id, id_type) = match uid.filter(|value| !value.is_empty()) {
             Some(uid) => (uid, InstrumentIdType::Uid),
             None => match raw.get("figi").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
@@ -320,6 +335,7 @@ impl TinkoffChannel {
                 }),
             )
             .await?;
+        let request_handle = cached.request_handle;
         let description = cached.description;
         let uid_not_found = cached.uid_not_found;
         let broker_instrument_type = cached.broker_instrument_type;
@@ -368,7 +384,7 @@ impl TinkoffChannel {
             detail: error.to_string(),
         })?;
         self.instruments
-            .update_blocked_tca_flag(instrument, description.blocked_tca_flag)
+            .update_blocked_tca_flag(instrument, &request_handle, description.blocked_tca_flag)
             .await
             .map_err(|error| BrokerError::Adapter {
                 broker: BROKER.to_owned(),
@@ -377,11 +393,30 @@ impl TinkoffChannel {
         tracing::debug!(
             phase = "describe_instruments",
             instrument = %instrument.inner(),
+            request_handle,
+            instrument_uid = raw.get("instrumentUid").and_then(serde_json::Value::as_str),
+            figi = raw.get("figi").and_then(serde_json::Value::as_str),
+            position_uid = raw.get("positionUid").and_then(serde_json::Value::as_str),
             blocked_tca_flag = description.blocked_tca_flag,
             "broker instrument blocking flag refreshed"
         );
-        Ok(Ok(instrument))
+        Ok(Ok((instrument, description.blocked_tca_flag)))
     }
+}
+
+fn description_handle(id: &str, id_type: InstrumentIdType) -> String {
+    let (kind, identifier) = match id_type {
+        InstrumentIdType::Uid | InstrumentIdType::PositionUid => (
+            if id_type == InstrumentIdType::Uid {
+                "uid"
+            } else {
+                "position_uid"
+            },
+            Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string()),
+        ),
+        InstrumentIdType::Figi => ("figi", id.to_owned()),
+    };
+    format!("tinkoff:{kind}:{identifier}")
 }
 
 fn trace_instrument_lookup(
@@ -585,6 +620,7 @@ impl BrokerChannel for TinkoffChannel {
         let mut refused = Vec::new();
         let mut currency_cache = HashMap::new();
         let mut currency_rows = HashMap::new();
+        let mut blocking_flags = HashMap::new();
         for (operation_index, mut operation) in operations.into_iter().enumerate() {
             let has_identity = operation.instrument_uid.is_some()
                 || ["figi", "ticker", "isin", "positionUid"]
@@ -657,7 +693,7 @@ impl BrokerChannel for TinkoffChannel {
                 && !(is_currency && matches!(kind, ChannelOperationKind::Commission))
             {
                 match self
-                    .resolve_instrument(
+                    .resolve_instrument_with_flag(
                         operation.instrument_uid.as_deref(),
                         &operation.raw,
                         operation.date.unwrap_or(from),
@@ -665,7 +701,8 @@ impl BrokerChannel for TinkoffChannel {
                     )
                     .await?
                 {
-                    Ok(instrument) => {
+                    Ok((instrument, blocked_tca_flag)) => {
+                        blocking_flags.insert(operation.operation_id.clone(), blocked_tca_flag);
                         if let Some(row) = diagnostic_operations.get_mut(operation_index) {
                             row.instrument = Some(instrument);
                         }
@@ -706,6 +743,14 @@ impl BrokerChannel for TinkoffChannel {
         *self.diagnostic_operations.lock().await = diagnostic_operations;
         let (mut parsed, accounting) =
             adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
+        for pending in &mut parsed.pending_redemptions {
+            pending.blocked_tca_flag = pending
+                .withdrawal_operation_id
+                .as_ref()
+                .and_then(|id| blocking_flags.get(id))
+                .copied()
+                .unwrap_or(false);
+        }
         let quarantined_instrument_resolution = refused.len();
         parsed.quarantined.extend(refused);
         tracing::info!(
@@ -1545,6 +1590,7 @@ fn pending_redemption(
         idempotency_key: operation.deduplication_key.clone(),
         source_operation_id: operation.operation_id.clone(),
         withdrawn_quantity: None,
+        blocked_tca_flag: false,
         withdrawal_operation_id: None,
         withdrawal_date: None,
         raw,
@@ -3409,6 +3455,102 @@ mod tests {
                 assert!(
                     call.get("query").is_none(),
                     "currency must not use FindInstrument"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_withdrawal_keeps_its_handle_flag_when_isin_is_shared() {
+        for position_handle in [false, true] {
+            for first_blocked in [false, true] {
+                let page = |blocked: bool| {
+                    let identity = |blocked| {
+                        let handle = if blocked {
+                            "BLOCKED_HANDLE"
+                        } else {
+                            "OPEN_HANDLE"
+                        };
+                        if position_handle {
+                            serde_json::json!({"positionUid":handle})
+                        } else {
+                            serde_json::json!({"figi":handle})
+                        }
+                    };
+                    let mut withdrawal = serde_json::json!({
+                        "id":"withdrawal", "cursor":"out", "brokerAccountId":"invented-account",
+                        "date":"2026-08-01T10:00:00Z", "type":"OPERATION_TYPE_OUTPUT_SECURITIES",
+                        "state":"OPERATION_STATE_EXECUTED", "quantity":"12",
+                        "payment":{"currency":"rub","units":"0","nano":0},
+                        "description":"Вывод 12.75 лотов фонда Invented Fund в другой депозитарий"
+                    });
+                    let mut redemption = serde_json::json!({
+                        "id":"redemption", "cursor":"paid", "brokerAccountId":"invented-account",
+                        "date":"2026-08-02T10:00:00Z", "type":"OPERATION_TYPE_BOND_REPAYMENT_FULL",
+                        "state":"OPERATION_STATE_EXECUTED", "quantity":"0",
+                        "payment":{"currency":"rub","units":"71","nano":0}
+                    });
+                    withdrawal
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(identity(blocked).as_object().unwrap().clone());
+                    redemption
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(identity(!blocked).as_object().unwrap().clone());
+                    serde_json::json!({"hasNext":false,"items":[withdrawal, redemption]})
+                        .to_string()
+                };
+                let description = |blocked| {
+                    serde_json::json!({"instrument":{
+                        "isin":"XX0000000042", "ticker":"TEST", "name":"Invented fund",
+                        "instrumentType":"etf", "currency":"rub", "blockedTcaFlag":blocked
+                    }})
+                    .to_string()
+                };
+                let answers = vec![
+                    Answer::status(200, &page(first_blocked)),
+                    Answer::status(200, &description(first_blocked)),
+                    Answer::status(200, &description(!first_blocked)),
+                    Answer::status(200, &page(!first_blocked)),
+                ];
+                let (gateway, requests, _) = fake::gateway_with_instruments(answers, None, true);
+                let mut channel = channel(gateway);
+                let (dictionary, unreadable) = OperationKindDictionary::build(
+                    iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                        .iter()
+                        .copied(),
+                );
+                assert!(unreadable.is_empty());
+                channel.dictionary = dictionary;
+                let mut canonical = None;
+                for expected in [first_blocked, !first_blocked] {
+                    let parsed = fetch(&channel).await.unwrap();
+                    assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+                    assert_eq!(parsed.pending_redemptions.len(), 1);
+                    let pending = &parsed.pending_redemptions[0];
+                    assert_eq!(
+                        pending.withdrawal_operation_id.as_deref(),
+                        Some("withdrawal")
+                    );
+                    assert_eq!(pending.blocked_tca_flag, expected);
+                    assert_eq!(
+                        *canonical.get_or_insert(pending.instrument),
+                        pending.instrument
+                    );
+                    let records = channel.instruments.list_instruments().await.unwrap();
+                    assert!(
+                        records
+                            .iter()
+                            .find(|record| record.id == pending.instrument)
+                            .unwrap()
+                            .blocked_tca_flag
+                    );
+                }
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    4,
+                    "second fetch uses cached descriptions"
                 );
             }
         }

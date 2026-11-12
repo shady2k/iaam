@@ -1786,7 +1786,7 @@ async fn broker_block_is_read_only_in_instrument_api() {
     seed_instrument(&path, &harness);
     SqliteStore::open(&path)
         .unwrap()
-        .update_blocked_tca_flag(harness.instrument, true)
+        .update_blocked_tca_flag(harness.instrument, "tinkoff:invented-blocked-handle", true)
         .unwrap();
     let (status, loaded) = call(
         &harness.router,

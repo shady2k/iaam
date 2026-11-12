@@ -48,7 +48,9 @@ fn alias(
 fn broker_block_refresh_is_readable_and_owner_edits_preserve_it() {
     let (store, id) = store_with_one_bond();
     assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
-    store.update_blocked_tca_flag(id, true).unwrap();
+    store
+        .update_blocked_tca_flag(id, "tinkoff:uid:invented", true)
+        .unwrap();
     let mut renamed = store.instrument(id).unwrap().unwrap();
     assert!(renamed.blocked_tca_flag);
     renamed.title = "Owner title".into();
@@ -58,12 +60,77 @@ fn broker_block_refresh_is_readable_and_owner_edits_preserve_it() {
     assert_eq!(loaded.title, "Owner title");
     assert!(loaded.blocked_tca_flag);
     assert!(store.list_instruments().unwrap()[0].blocked_tca_flag);
-    store.update_blocked_tca_flag(id, false).unwrap();
+    store
+        .update_blocked_tca_flag(id, "tinkoff:uid:invented", false)
+        .unwrap();
     assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
     assert!(matches!(
-        store.update_blocked_tca_flag(InstrumentId::new_random(), true),
+        store.update_blocked_tca_flag(InstrumentId::new_random(), "tinkoff:uid:invented", true),
         Err(StoreError::NotFound { .. })
     ));
+}
+
+#[test]
+fn broker_blocks_are_aggregated_per_handle_in_either_read_order() {
+    for blocked_first in [true, false] {
+        let (store, id) = store_with_one_bond();
+        let reads = if blocked_first {
+            [
+                ("tinkoff:uid:blocked", true),
+                ("tinkoff:uid:ordinary", false),
+            ]
+        } else {
+            [
+                ("tinkoff:uid:ordinary", false),
+                ("tinkoff:uid:blocked", true),
+            ]
+        };
+        for (handle, blocked) in reads {
+            store.update_blocked_tca_flag(id, handle, blocked).unwrap();
+        }
+        assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+        assert!(store.list_instruments().unwrap()[0].blocked_tca_flag);
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:ordinary", false)
+            .unwrap();
+        assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:ordinary", true)
+            .unwrap();
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:blocked", false)
+            .unwrap();
+        assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:ordinary", false)
+            .unwrap();
+        assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+    }
+}
+
+#[test]
+fn a_failed_broker_block_refresh_rolls_back_its_handle_evidence() {
+    let (store, id) = store_with_one_bond();
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER refuse_block_refresh BEFORE UPDATE OF blocked_tca_flag ON instruments
+         BEGIN SELECT RAISE(ABORT, 'invented refresh failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:test", true)
+            .is_err()
+    );
+    let count: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM instrument_broker_blocks", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
 }
 
 #[test]

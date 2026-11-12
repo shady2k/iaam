@@ -215,6 +215,9 @@ pub struct InstrumentSection {
     pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub blocked_tca_flag: bool,
+    /// Description evidence by broker-namespaced request handle.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub broker_block_flags: std::collections::BTreeMap<String, bool>,
 }
 
 /// An owner classification rule, carried the way `classification_rules`
@@ -1299,6 +1302,7 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("contour_accounts", TableDisposition::Carried),
     ("custody_places", TableDisposition::Carried),
     ("instruments", TableDisposition::Carried),
+    ("instrument_broker_blocks", TableDisposition::Carried),
     // --- The owner's standing decisions (iaam-k3gh.9.2). Carried as of that
     // task: `classification_rules`, `category_rules`, `event_category_assignments`
     // and the account declarations below, each with its own bundle section. ---
@@ -1549,6 +1553,13 @@ impl SqliteStore {
                 lineage_reason,
                 metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
                 blocked_tca_flag,
+                broker_block_flags: {
+                    let mut flags = self.conn.prepare(
+                        "SELECT handle, blocked_tca_flag FROM instrument_broker_blocks WHERE instrument = ?1 ORDER BY handle",
+                    )?;
+                    flags.query_map([&id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))?
+                        .collect::<Result<_, _>>()?
+                },
             });
         }
 
@@ -3152,7 +3163,7 @@ impl SqliteStore {
                     still_pending.push(instrument);
                     continue;
                 }
-                transaction.execute(
+                let inserted = transaction.execute(
                     "INSERT INTO instruments
                          (id, kind, symbol, title,
                           denomination_currency, settlement_currency, quote_currency,
@@ -3178,6 +3189,23 @@ impl SqliteStore {
                         instrument.blocked_tca_flag,
                     ],
                 )?;
+                if inserted != 0 {
+                    for (handle, blocked) in &instrument.broker_block_flags {
+                        transaction.execute(
+                            "INSERT INTO instrument_broker_blocks (instrument, handle, blocked_tca_flag)
+                             VALUES (?1, ?2, ?3) ON CONFLICT (instrument, handle) DO NOTHING",
+                            params![instrument.id.to_string(), handle, blocked],
+                        )?;
+                    }
+                    if !instrument.broker_block_flags.is_empty() {
+                        transaction.execute(
+                            "UPDATE instruments SET blocked_tca_flag = EXISTS(
+                                SELECT 1 FROM instrument_broker_blocks WHERE instrument = ?1 AND blocked_tca_flag = 1
+                             ) WHERE id = ?1",
+                            [instrument.id.to_string()],
+                        )?;
+                    }
+                }
                 placed.insert(instrument.id);
                 progressed = true;
             }

@@ -21,6 +21,8 @@ use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
 fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
+    conn.execute_batch("DROP TABLE instrument_broker_blocks;")
+        .expect("remove version-18 broker handle evidence");
     conn.execute_batch("ALTER TABLE instruments DROP COLUMN blocked_tca_flag;")
         .expect("remove version-17 broker trading block");
     conn.execute_batch(
@@ -60,6 +62,63 @@ fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
          ALTER TABLE event_corporate_action_old RENAME TO event_corporate_action;",
     )
     .expect("remove the version-14 posted-principal columns");
+}
+
+#[test]
+fn version_seventeen_rebuilds_unverifiable_blocks_from_handle_evidence() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (version, sql) in iaam_store::schema::MIGRATIONS {
+        if version <= 17 {
+            conn.execute_batch(sql).unwrap();
+        }
+    }
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         INSERT INTO instruments (id, kind, symbol, title, denomination_currency, settlement_currency, quote_currency, created_at, blocked_tca_flag)
+         VALUES ('i', 'bond', 'BOND', 'Bond', 'RUB', 'RUB', 'RUB', '2026-01-01T00:00:00Z', 1);
+         PRAGMA user_version = 17;"
+    ).unwrap();
+    migrate(&conn).unwrap();
+    let blocked: bool = conn
+        .query_row(
+            "SELECT blocked_tca_flag FROM instruments WHERE id = 'i'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !blocked,
+        "the old last-write-wins aggregate has no known handle"
+    );
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM instrument_broker_blocks", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0, "migration must not invent handle evidence");
+    conn.execute(
+        "INSERT INTO instrument_broker_blocks VALUES ('i', 'tinkoff:uid:test', 1)",
+        [],
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO instrument_broker_blocks VALUES ('i', 'tinkoff:uid:test', 0)",
+        "INSERT INTO instrument_broker_blocks VALUES ('i', '', 0)",
+        "INSERT INTO instrument_broker_blocks VALUES ('i', 'other', 2)",
+        "INSERT INTO instrument_broker_blocks VALUES ('missing', 'other', 0)",
+    ] {
+        assert!(conn.execute(sql, []).is_err());
+    }
+    let title: String = conn
+        .query_row("SELECT title FROM instruments WHERE id = 'i'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(title, "Bond");
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
 }
 
 #[test]

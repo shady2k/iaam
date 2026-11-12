@@ -1510,12 +1510,7 @@ async fn derived_blocked_arrival(
     if !quantity.0.is_positive() {
         return Ok(None);
     }
-    let instrument = services
-        .directory
-        .as_ref()
-        .instrument(pending.instrument)
-        .await?;
-    if !instrument.is_some_and(|instrument| instrument.blocked_tca_flag) {
+    if !pending.blocked_tca_flag {
         return Ok(None);
     }
     let history = services

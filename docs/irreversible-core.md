@@ -374,7 +374,16 @@ defect of the comparison.
 
 ## Blocked-asset units inferred from a broker withdrawal (iaam-xzz5.4.12)
 
-The broker's `blocked_tca_flag` is catalogue evidence, not an owner setting.
+The broker's `blocked_tca_flag` is broker-description evidence, not an owner setting.
+A paired withdrawal uses the flag of its own resolved broker description, not
+that of another handle with the same ISIN. The catalogue exposes the OR of the
+latest persisted descriptions per broker handle; reading a different unblocked
+handle cannot clear a blocked handle. Each handle can refresh its own flag in
+both directions. DEBUG records name the catalogue instrument, resolved handle
+and reported flag. Migration 18 clears the old last-write-wins aggregate because
+it has no per-handle provenance; description reads rebuild it. New backups carry
+the per-handle evidence. A legacy backup keeps its old aggregate until a handle
+refresh replaces that unverifiable value with the new aggregate.
 Only a paired fund withdrawal and full redemption may establish missing units,
 with the exact withdrawn quantity. Derivation requires a zero recorded holding
 and no broker-recorded positive securities movement in the effective journal

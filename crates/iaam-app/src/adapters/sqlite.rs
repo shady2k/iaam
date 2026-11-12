@@ -1671,11 +1671,13 @@ impl InstrumentDirectory for SqliteAdapter {
     async fn update_blocked_tca_flag(
         &self,
         id: InstrumentId,
+        handle: &str,
         blocked_tca_flag: bool,
     ) -> Result<(), AppError> {
+        let handle = handle.to_owned();
         self.blocking(move |store| {
             store
-                .update_blocked_tca_flag(id, blocked_tca_flag)
+                .update_blocked_tca_flag(id, &handle, blocked_tca_flag)
                 .map_err(store_error)
         })
         .await

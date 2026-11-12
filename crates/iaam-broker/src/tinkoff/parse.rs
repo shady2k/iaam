@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/8";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/9";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -654,8 +654,12 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
             source_kind = operation_type,
             reason = "subminor_payment_unrepresentable",
             field,
-            source_instrument_type = raw.get("instrumentType").and_then(serde_json::Value::as_str),
-            source_instrument_kind = raw.get("instrumentKind").and_then(serde_json::Value::as_str),
+            source_instrument_type = raw
+                .get("instrumentType")
+                .and_then(serde_json::Value::as_str),
+            source_instrument_kind = raw
+                .get("instrumentKind")
+                .and_then(serde_json::Value::as_str),
             source_ticker = raw.get("ticker").and_then(serde_json::Value::as_str),
             source_figi = raw.get("figi").and_then(serde_json::Value::as_str),
             source_instrument_uid = raw.get("instrumentUid").and_then(serde_json::Value::as_str),

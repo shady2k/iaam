@@ -83,7 +83,7 @@ impl TinkoffChannel {
             descriptions: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
-    // Diagnostic only: never use these answers to replace the UID miss.
+    // FindInstrument results are diagnostic only; typed lookups resolve identity.
     async fn probe_instrument(
         &self,
         identifier: &str,
@@ -191,17 +191,77 @@ impl TinkoffChannel {
                     .and_then(serde_json::Value::as_str)
                     .filter(|value| !value.is_empty())
             };
-            for (identifier, id_type) in [
-                (field("positionUid"), Some(InstrumentIdType::PositionUid)),
-                (Some(id), None),
-                (field("figi"), None),
-                (field("figi"), Some(InstrumentIdType::Figi)),
+            for (identifier, fallback_type) in [
+                (field("positionUid"), InstrumentIdType::PositionUid),
+                (field("figi"), InstrumentIdType::Figi),
             ] {
-                if let Some(identifier) = identifier {
-                    let probe_key = format!("{id_type:?}:{identifier}");
-                    if cached.probes.insert(probe_key) {
-                        self.probe_instrument(identifier, id_type, raw, context)
-                            .await;
+                let Some(identifier) = identifier else {
+                    continue;
+                };
+                let probe_key = format!("{fallback_type:?}:{identifier}");
+                if !cached.probes.insert(probe_key) {
+                    continue;
+                }
+                let response = self
+                    .client
+                    .get_instrument(
+                        identifier,
+                        fallback_type,
+                        context.deadline,
+                        context.allowance,
+                    )
+                    .await;
+                trace_instrument_lookup(raw, identifier, Some(fallback_type), &response);
+                let not_found = matches!(
+                    &response,
+                    Err(TinkoffError::UnexpectedStatus { status: 404, .. })
+                );
+                match response.map_err(tinkoff_error) {
+                    Ok(body) => {
+                        cached.broker_instrument_type =
+                            serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|value| {
+                                    value
+                                        .get("instrument")?
+                                        .get("instrumentType")?
+                                        .as_str()
+                                        .map(str::to_owned)
+                                });
+                        cached.description = iaam_broker::tinkoff::parse_instrument(&body)
+                            .map_err(|error| error.to_string());
+                        cached.uid_not_found = false;
+                        tracing::info!(
+                            phase = "resolve_instruments",
+                            lookup_identifier = identifier,
+                            lookup_type = ?fallback_type,
+                            instrument_uid = id,
+                            "broker instrument fallback answered"
+                        );
+                        break;
+                    }
+                    Err(BrokerError::Refused { .. }) if not_found => {}
+                    Err(
+                        BrokerError::Refused { detail, .. }
+                        | BrokerError::Unparsable { detail, .. },
+                    ) => {
+                        cached.description = Err(detail);
+                        cached.uid_not_found = false;
+                        break;
+                    }
+                    Err(error) => {
+                        // A budget or transient failure must remain retryable.
+                        cached
+                            .probes
+                            .remove(&format!("{fallback_type:?}:{identifier}"));
+                        return Err(error);
+                    }
+                }
+            }
+            if cached.uid_not_found {
+                for identifier in [Some(id), field("figi")].into_iter().flatten() {
+                    if cached.probes.insert(format!("search:{identifier}")) {
+                        self.probe_instrument(identifier, None, raw, context).await;
                     }
                 }
             }
@@ -271,7 +331,9 @@ fn trace_instrument_lookup(
             .as_str()
             .map(str::to_owned)
     });
-    tracing::warn!(
+    macro_rules! trace_lookup {
+        ($level:ident) => {
+            tracing::$level!(
         phase = "describe_instruments",
         broker_instrument_type = broker_instrument_type.as_deref(),
         operation_id = field("id").or_else(|| field("operationId")),
@@ -288,6 +350,13 @@ fn trace_instrument_lookup(
         lookup_status = status,
         "broker instrument lookup"
     );
+        };
+    }
+    if response.is_ok() {
+        trace_lookup!(debug);
+    } else {
+        trace_lookup!(warn);
+    }
 }
 
 fn trace_instrument_miss(
@@ -2121,31 +2190,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uid_404_probes_are_ordered_diagnostic_only_and_cached() {
-        for (status, body, outcome) in [
-            (
-                200,
-                r#"{"instrument":{"isin":"XX0000000042","ticker":"PROBE","name":"Invented probe","instrumentType":"share","currency":"rub"}}"#,
-                "200",
-            ),
-            (404, "{}", "404"),
-        ] {
-            let (gateway, requests, _) = fake::gateway_with_instruments(
-                vec![
-                    Answer::status(404, "{}"),
-                    Answer::status(status, body),
-                    Answer::status(status, body),
-                    Answer::status(status, body),
-                    Answer::status(status, body),
-                ],
-                None,
-                true,
-            );
+    async fn uid_miss_uses_the_first_typed_fallback_and_caches_it() {
+        let body = r#"{"instrument":{"isin":"XX0000000042","ticker":"FALLBACK","name":"Invented fallback","instrumentType":"share","currency":"rub"}}"#;
+        for position_found in [true, false] {
+            let mut answers = vec![Answer::status(404, "{}")];
+            if !position_found {
+                answers.push(Answer::status(404, "{}"));
+            }
+            answers.push(Answer::status(200, body));
+            let (gateway, requests, _) = fake::gateway_with_instruments(answers, None, true);
             let channel = channel(gateway);
             let row = serde_json::json!({
-                "id":"invented-operation", "type":"OPERATION_TYPE_BUY", "instrumentType":"share",
-                "instrumentUid":"invented-uid", "positionUid":"invented-position", "figi":"TESTFIGI",
-                "ticker":"TEST", "name":"Invented share", "payment":{"units":"987654321"},
+                "id":"invented-operation", "instrumentUid":"invented-uid",
+                "positionUid":"invented-position", "figi":"TESTFIGI"
             });
             let writer = InstrumentLog::default();
             let captured = writer.clone();
@@ -2156,7 +2213,7 @@ mod tests {
                 .finish();
             let _subscriber = tracing::subscriber::set_default(subscriber);
             for _ in 0..2 {
-                let result = channel
+                let resolved = channel
                     .resolve_instrument(
                         Some("invented-uid"),
                         &row,
@@ -2164,63 +2221,93 @@ mod tests {
                         broker_context(None),
                     )
                     .await
-                    .expect("404 stays local");
-                assert!(
-                    result
-                        .expect_err("probe must not repair UID miss")
-                        .contains("404")
+                    .expect("fallback request")
+                    .expect("fallback resolves");
+                assert_eq!(
+                    resolved,
+                    channel
+                        .instruments
+                        .resolve("isin", "XX0000000042", time::macros::date!(2026 - 01 - 01),)
+                        .await
+                        .expect("ISIN identity recorded")
                 );
             }
-            {
-                let requests = requests.lock().expect("requests");
-                assert_eq!(
-                    requests.len(),
-                    5,
-                    "one UID call and four diagnostic probes, cached across rows"
-                );
-                let first: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
-                let second: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
-                assert_eq!(first["idType"], "INSTRUMENT_ID_TYPE_UID");
-                assert_eq!(second["idType"], "INSTRUMENT_ID_TYPE_POSITION_UID");
-                assert_eq!(second["id"], "invented-position");
-                let uid_search: serde_json::Value = serde_json::from_str(&requests[2]).unwrap();
-                let figi_search: serde_json::Value = serde_json::from_str(&requests[3]).unwrap();
-                let figi: serde_json::Value = serde_json::from_str(&requests[4]).unwrap();
-                assert_eq!(uid_search["query"], "invented-uid");
-                assert_eq!(figi_search["query"], "TESTFIGI");
-                assert_eq!(figi["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), if position_found { 2 } else { 3 });
+            let calls: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|request| serde_json::from_str(request).unwrap())
+                .collect();
+            assert_eq!(calls[0]["idType"], "INSTRUMENT_ID_TYPE_UID");
+            assert_eq!(calls[1]["idType"], "INSTRUMENT_ID_TYPE_POSITION_UID");
+            assert_eq!(calls[1]["id"], "invented-position");
+            if !position_found {
+                assert_eq!(calls[2]["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+                assert_eq!(calls[2]["id"], "TESTFIGI");
             }
             let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-            for expected in [
-                "invented-operation",
-                "OPERATION_TYPE_BUY",
-                "share",
-                "invented-uid",
-                "invented-position",
-                "TESTFIGI",
-                "TEST",
-                "Invented share",
-                "uid_not_found",
-                outcome,
-            ] {
-                assert!(log.contains(expected), "missing {expected}: {log}");
-            }
+            assert!(log.contains("broker instrument fallback answered"), "{log}");
             assert!(
-                !log.contains("987654321"),
-                "amount escaped into diagnostics: {log}"
-            );
-            assert!(
-                channel
-                    .instruments
-                    .resolve("isin", "XX0000000042", time::macros::date!(2026 - 01 - 01))
-                    .await
-                    .is_err()
+                log.contains(if position_found {
+                    "PositionUid"
+                } else {
+                    "Figi"
+                }),
+                "{log}"
             );
         }
     }
 
     #[tokio::test]
-    async fn cached_uid_miss_probes_once_when_a_later_row_supplies_figi() {
+    async fn all_typed_lookups_missing_stays_set_aside_and_searches_are_diagnostic() {
+        let body = r#"{"instruments":[{"isin":"XX0000000042","ticker":"SEARCH"}]}"#;
+        let (gateway, requests, _) = fake::gateway_with_instruments(
+            vec![
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(200, body),
+                Answer::status(200, body),
+            ],
+            None,
+            true,
+        );
+        let channel = channel(gateway);
+        let row = serde_json::json!({"positionUid":"invented-position", "figi":"TESTFIGI"});
+        for _ in 0..2 {
+            let result = channel
+                .resolve_instrument(
+                    Some("invented-uid"),
+                    &row,
+                    time::macros::date!(2026 - 01 - 01),
+                    broker_context(None),
+                )
+                .await
+                .expect("404 is local");
+            assert!(result.unwrap_err().contains("404"));
+        }
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            let calls: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|request| serde_json::from_str(request).unwrap())
+                .collect();
+            assert_eq!(calls[2]["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+            assert_eq!(calls[3]["query"], "invented-uid");
+            assert_eq!(calls[4]["query"], "TESTFIGI");
+        }
+        assert!(
+            channel
+                .instruments
+                .resolve("isin", "XX0000000042", time::macros::date!(2026 - 01 - 01))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_uid_miss_tries_figi_once_when_a_later_row_supplies_it() {
         let (gateway, requests, _) = fake::gateway_with_instruments(
             vec![
                 Answer::status(404, "{}"),
@@ -2252,16 +2339,16 @@ mod tests {
         assert_eq!(
             requests.len(),
             4,
-            "UID lookup, UID search and later FIGI search and lookup"
+            "UID lookup and search, then later FIGI lookup and search"
         );
         let uid: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
-        let figi: serde_json::Value = serde_json::from_str(&requests[3]).unwrap();
+        let figi: serde_json::Value = serde_json::from_str(&requests[2]).unwrap();
         assert_eq!(uid["idType"], "INSTRUMENT_ID_TYPE_UID");
         assert_eq!(figi["idType"], "INSTRUMENT_ID_TYPE_FIGI");
     }
 
     #[tokio::test]
-    async fn uid_404_figi_probe_uses_the_same_request_allowance() {
+    async fn uid_404_figi_fallback_uses_the_same_request_allowance() {
         let (gateway, requests, _) =
             fake::gateway_with_instruments(vec![Answer::status(404, "{}")], None, true);
         let channel = channel(gateway);
@@ -2278,12 +2365,10 @@ mod tests {
                 context,
             )
             .await;
-        assert!(
-            result
-                .expect("diagnostic ceiling stays local")
-                .expect_err("original UID miss remains quarantined")
-                .contains("404")
-        );
+        assert!(matches!(
+            result,
+            Err(BrokerError::RequestCeiling { ceiling: 1, .. })
+        ));
         assert_eq!(
             requests.lock().unwrap().len(),
             1,

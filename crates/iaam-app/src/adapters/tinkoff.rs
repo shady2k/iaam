@@ -50,6 +50,9 @@ mod diagnostics;
 #[path = "tinkoff_fund_redemption.rs"]
 mod fund_redemption;
 
+#[path = "tinkoff_questions_timestamps.rs"]
+mod questions_timestamps;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
@@ -605,6 +608,7 @@ impl BrokerChannel for TinkoffChannel {
             received_by_type = ?received_by_type(&operations),
             "received T-Invest operation types"
         );
+        questions_timestamps::trace_timestamps(&operations, from, to);
         let mut diagnostic_operations = diagnostics::capture(&operations);
         self.resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;

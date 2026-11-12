@@ -43,6 +43,7 @@ is how you match a term in them to the code.
 | Russian | English | Note |
 |---|---|---|
 | бумага, инструмент | instrument | in prose, prefer “security” |
+| заблокированный актив | blocked asset | An instrument marked by the broker's `blocked_tca_flag` |
 | выпуск | issue | `issue_terms` |
 | партия, лот | lot | |
 | позиция | position | |

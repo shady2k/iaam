@@ -24,6 +24,7 @@ fn store() -> (SqliteStore, InstrumentId) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("instrument created");
     (store, instrument)

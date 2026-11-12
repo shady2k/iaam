@@ -21,6 +21,8 @@ use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
 fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
+    conn.execute_batch("ALTER TABLE instruments DROP COLUMN blocked_tca_flag;")
+        .expect("remove version-17 broker trading block");
     conn.execute_batch(
         "DROP TABLE event_currency_exchange; DROP TABLE event_securities_transfer_out;",
     )
@@ -58,6 +60,34 @@ fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
          ALTER TABLE event_corporate_action_old RENAME TO event_corporate_action;",
     )
     .expect("remove the version-14 posted-principal columns");
+}
+
+#[test]
+fn version_sixteen_instruments_gain_an_unblocked_default() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (version, sql) in iaam_store::schema::MIGRATIONS {
+        if version <= 16 {
+            conn.execute_batch(sql).unwrap();
+        }
+    }
+    conn.execute_batch(
+        "INSERT INTO instruments (id, kind, symbol, title, denomination_currency, settlement_currency, quote_currency, created_at)
+         VALUES ('i', 'bond', 'BOND', 'Bond', 'RUB', 'RUB', 'RUB', '2026-01-01T00:00:00Z');
+         PRAGMA user_version = 16;",
+    ).unwrap();
+    migrate(&conn).unwrap();
+    let blocked: bool = conn
+        .query_row(
+            "SELECT blocked_tca_flag FROM instruments WHERE id = 'i'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!blocked);
+    assert!(
+        conn.execute("UPDATE instruments SET blocked_tca_flag = 2", [])
+            .is_err()
+    );
 }
 
 #[test]

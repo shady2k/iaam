@@ -533,6 +533,8 @@ pub struct InstrumentView {
     pub settlement_currency: String,
     pub quote_currency: String,
     pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
+    /// Broker-reported trading block, read-only to the owner API.
+    pub blocked_tca_flag: bool,
 }
 
 /// Active instrument alias.
@@ -627,6 +629,13 @@ pub trait InstrumentDirectory: Send + Sync {
     /// Writing is needed by source synchronisation and the administrator; an agent
     /// token is not given access to this method through an HTTP route (§7, §14).
     async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError>;
+
+    /// Refresh a broker-reported trading block independently of owner descriptions.
+    async fn update_blocked_tca_flag(
+        &self,
+        id: InstrumentId,
+        blocked_tca_flag: bool,
+    ) -> Result<(), AppError>;
 
     /// Resolve an ISIN or atomically record the instrument and its ISIN alias.
     async fn register_instrument_with_isin(
@@ -2189,6 +2198,8 @@ pub struct PendingFullRedemption {
     /// Exact units named by a paired withdrawal, not an inferred arrival.
     pub withdrawn_quantity: Option<iaam_core::money::Quantity>,
     pub withdrawal_operation_id: Option<String>,
+    /// Date of the paired withdrawal, a bound rather than an acquisition date.
+    pub withdrawal_date: Option<Date>,
     pub account: AccountId,
     pub instrument: InstrumentId,
     pub compensation: iaam_core::money::Money,

@@ -422,6 +422,7 @@ fn instrument_view(record: iaam_store::reference::InstrumentRecord) -> Instrumen
         settlement_currency: record.currencies.settlement.code().to_owned(),
         quote_currency: record.currencies.quote.code().to_owned(),
         metadata: record.metadata,
+        blocked_tca_flag: record.blocked_tca_flag,
     }
 }
 
@@ -1659,9 +1660,23 @@ impl InstrumentDirectory for SqliteAdapter {
                     currencies,
                     lineage,
                     metadata,
+                    blocked_tca_flag: false,
                 })
                 .map_err(store_error)?;
             Ok(id)
+        })
+        .await
+    }
+
+    async fn update_blocked_tca_flag(
+        &self,
+        id: InstrumentId,
+        blocked_tca_flag: bool,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .update_blocked_tca_flag(id, blocked_tca_flag)
+                .map_err(store_error)
         })
         .await
     }
@@ -1684,6 +1699,7 @@ impl InstrumentDirectory for SqliteAdapter {
                         currencies: record.currencies,
                         lineage: record.lineage,
                         metadata: record.metadata,
+                        blocked_tca_flag: false,
                     },
                     &isin,
                     source,

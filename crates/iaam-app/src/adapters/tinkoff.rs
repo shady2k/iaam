@@ -335,6 +335,12 @@ impl TinkoffChannel {
                 )));
             }
         };
+        tracing::debug!(
+            phase = "describe_instruments",
+            lookup_identifier = id,
+            blocked_tca_flag = description.blocked_tca_flag,
+            "broker instrument description parsed"
+        );
         if description
             .isin
             .as_deref()
@@ -350,18 +356,31 @@ impl TinkoffChannel {
             );
             return Ok(Err(format!("instrument {id} description names no ISIN")));
         }
-        super::catalogue::resolve_or_record(
+        let instrument = super::catalogue::resolve_or_record(
             self.instruments.as_ref(),
             &description,
             self.source,
             on,
         )
         .await
-        .map(Ok)
         .map_err(|error| BrokerError::Adapter {
             broker: BROKER.to_owned(),
             detail: error.to_string(),
-        })
+        })?;
+        self.instruments
+            .update_blocked_tca_flag(instrument, description.blocked_tca_flag)
+            .await
+            .map_err(|error| BrokerError::Adapter {
+                broker: BROKER.to_owned(),
+                detail: error.to_string(),
+            })?;
+        tracing::debug!(
+            phase = "describe_instruments",
+            instrument = %instrument.inner(),
+            blocked_tca_flag = description.blocked_tca_flag,
+            "broker instrument blocking flag refreshed"
+        );
+        Ok(Ok(instrument))
     }
 }
 
@@ -621,7 +640,7 @@ impl BrokerChannel for TinkoffChannel {
                 };
                 match result {
                     Ok(description) => {
-                        tracing::debug!(phase = "describe_currency", iso_currency = description.nominal.currency().code(), settlement = description.settlement.code(), lot = description.lot, nominal = ?description.nominal.value(), "currency description read");
+                        tracing::debug!(phase = "describe_currency", iso_currency = description.nominal.currency().code(), settlement = description.settlement.code(), lot = description.lot, blocked_tca_flag = description.blocked_tca_flag, nominal = ?description.nominal.value(), "currency description read");
                         currency_rows.insert(operation.deduplication_key.clone(), description);
                     }
                     Err(reason) => {
@@ -1301,11 +1320,12 @@ fn adapt_operations_with_currencies(
             {
                 match pending_redemption(account, &operation, raw.to_string()) {
                     Ok(mut pending) => {
-                        if let Some((quantity, operation_id)) =
+                        if let Some((quantity, operation_id, withdrawal_date)) =
                             pairing.redemptions.get(&operation_index)
                         {
                             pending.withdrawn_quantity = Some(*quantity);
                             pending.withdrawal_operation_id = Some(operation_id.clone());
+                            pending.withdrawal_date = Some(*withdrawal_date);
                         }
                         pending_redemptions.push(pending);
                     }
@@ -1526,6 +1546,7 @@ fn pending_redemption(
         source_operation_id: operation.operation_id.clone(),
         withdrawn_quantity: None,
         withdrawal_operation_id: None,
+        withdrawal_date: None,
         raw,
     })
 }
@@ -3391,6 +3412,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn reread_description_refreshes_blocking_flag_in_both_directions() {
+        let answers = [true, false, true].map(|blocked| {
+            Answer::status(
+                200,
+                &serde_json::json!({"instrument": {
+                    "isin":"XX0000000042", "ticker":"TEST", "name":"Invented share",
+                    "instrumentType":"share", "currency":"rub", "blockedTcaFlag":blocked
+                }})
+                .to_string(),
+            )
+        });
+        let (gateway, requests, _) = fake::gateway_with_instruments(answers.into(), None, true);
+        let channel = channel(gateway);
+        let mut identity = None;
+        for expected in [true, false, true] {
+            channel.descriptions.lock().await.clear();
+            let instrument = channel
+                .resolve_instrument(
+                    Some("invented-uid"),
+                    &serde_json::json!({}),
+                    time::macros::date!(2026 - 01 - 01),
+                    broker_context(None),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(*identity.get_or_insert(instrument), instrument);
+            let records = channel.instruments.list_instruments().await.unwrap();
+            let record = records
+                .iter()
+                .find(|record| record.id == instrument)
+                .unwrap();
+            assert_eq!(record.blocked_tca_flag, expected);
+        }
+        assert_eq!(requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -5716,6 +5775,7 @@ mod tests {
                     ),
                     lineage: None,
                     metadata: None,
+                    blocked_tca_flag: false,
                 })
                 .expect("seed instrument");
             store

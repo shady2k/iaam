@@ -6836,6 +6836,7 @@ fn instrument_dto(instrument: iaam_app::ports::InstrumentView) -> InstrumentDto 
         denomination_currency: instrument.denomination_currency,
         settlement_currency: instrument.settlement_currency,
         quote_currency: instrument.quote_currency,
+        blocked_tca_flag: instrument.blocked_tca_flag,
         metadata: instrument
             .metadata
             .map(|metadata| crate::dto::InstrumentMetadataDto {

@@ -307,6 +307,8 @@ pub struct InstrumentRecord {
     pub currencies: CurrencyRoles,
     pub lineage: Option<Lineage>,
     pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
+    /// Broker-reported trading block; not an owner declaration.
+    pub blocked_tca_flag: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,8 +801,8 @@ impl SqliteStore {
             "INSERT INTO instruments
                  (id, kind, symbol, title,
                   denomination_currency, settlement_currency, quote_currency,
-                  lineage_parent, lineage_reason, created_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                  lineage_parent, lineage_reason, created_at, metadata, blocked_tca_flag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT (id) DO UPDATE SET
                  kind = excluded.kind,
                  symbol = excluded.symbol,
@@ -827,8 +829,28 @@ impl SqliteStore {
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?,
+                instrument.blocked_tca_flag,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Refresh a broker-reported trading block without changing owner descriptions.
+    pub fn update_blocked_tca_flag(
+        &self,
+        id: InstrumentId,
+        blocked_tca_flag: bool,
+    ) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE instruments SET blocked_tca_flag = ?2 WHERE id = ?1",
+            params![id.inner().to_string(), blocked_tca_flag],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound {
+                what: "instrument",
+                id: id.inner().to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -1046,7 +1068,7 @@ impl SqliteStore {
             .query_row(
                 "SELECT kind, symbol, title, denomination_currency,
                         settlement_currency, quote_currency,
-                        lineage_parent, lineage_reason, metadata
+                        lineage_parent, lineage_reason, metadata, blocked_tca_flag
                  FROM instruments WHERE id = ?1",
                 [id.inner().to_string()],
                 |row| {
@@ -1060,6 +1082,7 @@ impl SqliteStore {
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<String>>(8)?,
+                        row.get::<_, bool>(9)?,
                     ))
                 },
             )
@@ -1071,7 +1094,7 @@ impl SqliteStore {
         let mut statement = self.conn.prepare(
             "SELECT id, kind, symbol, title, denomination_currency,
                     settlement_currency, quote_currency,
-                    lineage_parent, lineage_reason, metadata
+                    lineage_parent, lineage_reason, metadata, blocked_tca_flag
              FROM instruments ORDER BY symbol, id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1086,6 +1109,7 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, bool>(10)?,
             ))
         })?;
         rows.map(|row| {
@@ -1100,6 +1124,7 @@ impl SqliteStore {
                 parent,
                 reason,
                 metadata,
+                blocked_tca_flag,
             ) = row?;
             let id = InstrumentId(parse_uuid(&id, "instrument")?);
             decode_instrument(
@@ -1114,6 +1139,7 @@ impl SqliteStore {
                     parent,
                     reason,
                     metadata,
+                    blocked_tca_flag,
                 ),
             )
         })
@@ -2079,13 +2105,25 @@ type InstrumentParts = (
     Option<String>,
     Option<String>,
     Option<String>,
+    bool,
 );
 
 fn decode_instrument(
     id: InstrumentId,
     parts: InstrumentParts,
 ) -> Result<InstrumentRecord, StoreError> {
-    let (kind, symbol, title, denomination, settlement, quote, parent, reason, metadata) = parts;
+    let (
+        kind,
+        symbol,
+        title,
+        denomination,
+        settlement,
+        quote,
+        parent,
+        reason,
+        metadata,
+        blocked_tca_flag,
+    ) = parts;
     let kind = kind
         .map(|value| {
             InstrumentKind::from_code(&value).ok_or_else(|| StoreError::NotFound {
@@ -2134,5 +2172,6 @@ fn decode_instrument(
         currencies,
         lineage,
         metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
+        blocked_tca_flag,
     })
 }

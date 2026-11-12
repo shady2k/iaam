@@ -507,6 +507,7 @@ impl BondReferenceData {
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,
+                blocked_tca_flag: false,
             })
             .unwrap();
         store
@@ -518,6 +519,7 @@ impl BondReferenceData {
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,
+                blocked_tca_flag: false,
             })
             .unwrap();
         store
@@ -806,6 +808,32 @@ fn a_tampered_custody_place_breaks_the_checksum() {
 }
 
 #[test]
+fn broker_block_survives_bundle_restore() {
+    let (store, owner, refs) = a_store_holding_one_security_event();
+    store
+        .update_blocked_tca_flag(refs.instrument, true)
+        .unwrap();
+    let bundle = store.export_bundle(owner).unwrap();
+    assert!(
+        bundle
+            .instruments
+            .iter()
+            .find(|row| row.id == refs.instrument.inner())
+            .unwrap()
+            .blocked_tca_flag
+    );
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    assert!(
+        restored
+            .instrument(refs.instrument)
+            .unwrap()
+            .unwrap()
+            .blocked_tca_flag
+    );
+}
+
+#[test]
 fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
     // Instruments are global reference data shared with whatever else the
     // target database holds. Unlike accounts and custody places, which are
@@ -832,6 +860,7 @@ fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
 
@@ -892,6 +921,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
     store
@@ -906,6 +936,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 reason: LineageReason::Replacement,
             }),
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
     store
@@ -920,6 +951,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 reason: LineageReason::Replacement,
             }),
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
 
@@ -2233,6 +2265,7 @@ fn measure_the_size_of_a_realistic_export() {
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,
+                blocked_tca_flag: false,
             })
             .unwrap();
         store

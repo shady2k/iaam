@@ -84,6 +84,7 @@ fn store() -> (SqliteStore, InstrumentId) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("instrument created");
     store
@@ -253,6 +254,7 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("market instrument");
     store

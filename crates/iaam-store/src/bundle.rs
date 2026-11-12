@@ -213,6 +213,8 @@ pub struct InstrumentSection {
     pub lineage_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked_tca_flag: bool,
 }
 
 /// An owner classification rule, carried the way `classification_rules`
@@ -1210,7 +1212,7 @@ pub const REFERENCE_CLOSURE_SQL: &str = "
     )
     SELECT n.id, n.kind, n.symbol, n.title,
            n.denomination_currency, n.settlement_currency, n.quote_currency,
-           n.lineage_parent, n.lineage_reason, n.metadata
+           n.lineage_parent, n.lineage_reason, n.metadata, n.blocked_tca_flag
       FROM instruments n JOIN reached r ON n.id = r.id
      ORDER BY n.symbol, n.id
 ";
@@ -1514,6 +1516,7 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, bool>(10)?,
             ))
         })?;
         let mut instruments = Vec::new();
@@ -1529,6 +1532,7 @@ impl SqliteStore {
                 lineage_parent,
                 lineage_reason,
                 metadata,
+                blocked_tca_flag,
             ) = row?;
             let lineage_parent = lineage_parent
                 .map(|value| parse(&value, "instrument"))
@@ -1544,6 +1548,7 @@ impl SqliteStore {
                 lineage_parent,
                 lineage_reason,
                 metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
+                blocked_tca_flag,
             });
         }
 
@@ -3151,8 +3156,8 @@ impl SqliteStore {
                     "INSERT INTO instruments
                          (id, kind, symbol, title,
                           denomination_currency, settlement_currency, quote_currency,
-                          lineage_parent, lineage_reason, created_at, metadata)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                          lineage_parent, lineage_reason, created_at, metadata, blocked_tca_flag)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT (id) DO NOTHING",
                     params![
                         instrument.id.to_string(),
@@ -3170,6 +3175,7 @@ impl SqliteStore {
                             .as_ref()
                             .map(serde_json::to_string)
                             .transpose()?,
+                        instrument.blocked_tca_flag,
                     ],
                 )?;
                 placed.insert(instrument.id);

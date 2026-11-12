@@ -20,6 +20,7 @@ fn store_with_one_bond() -> (SqliteStore, InstrumentId) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("instrument created");
     (store, instrument)
@@ -41,6 +42,28 @@ fn alias(
         },
         source: SourceId::new_random(),
     }
+}
+
+#[test]
+fn broker_block_refresh_is_readable_and_owner_edits_preserve_it() {
+    let (store, id) = store_with_one_bond();
+    assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+    store.update_blocked_tca_flag(id, true).unwrap();
+    let mut renamed = store.instrument(id).unwrap().unwrap();
+    assert!(renamed.blocked_tca_flag);
+    renamed.title = "Owner title".into();
+    renamed.blocked_tca_flag = false;
+    store.upsert_instrument(&renamed).unwrap();
+    let loaded = store.instrument(id).unwrap().unwrap();
+    assert_eq!(loaded.title, "Owner title");
+    assert!(loaded.blocked_tca_flag);
+    assert!(store.list_instruments().unwrap()[0].blocked_tca_flag);
+    store.update_blocked_tca_flag(id, false).unwrap();
+    assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+    assert!(matches!(
+        store.update_blocked_tca_flag(InstrumentId::new_random(), true),
+        Err(StoreError::NotFound { .. })
+    ));
 }
 
 #[test]
@@ -205,6 +228,7 @@ fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code()
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("foreign instrument created");
     store
@@ -316,6 +340,7 @@ fn instrument_returns_the_stored_record_and_none_for_an_unknown_id() {
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
         metadata: None,
+        blocked_tca_flag: false,
     };
     store
         .upsert_instrument(&expected)
@@ -344,6 +369,7 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
         metadata: None,
+        blocked_tca_flag: false,
     };
     let earlier = InstrumentRecord {
         id: InstrumentId::new_random(),
@@ -353,6 +379,7 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
         metadata: None,
+        blocked_tca_flag: false,
     };
     store
         .upsert_instrument(&later)

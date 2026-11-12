@@ -81,6 +81,7 @@ mod tests {
             board: Some("TQBR".to_owned()),
             lot: Some(10),
             price_decimals: Some(2),
+            blocked_tca_flag: false,
         };
         let (first, second) = tokio::join!(
             resolve_or_record(

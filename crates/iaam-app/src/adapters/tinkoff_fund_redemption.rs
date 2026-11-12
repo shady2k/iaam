@@ -8,7 +8,7 @@ const PAIR_WINDOW_DAYS: i64 = 30;
 #[derive(Default)]
 pub(super) struct Pairing {
     pub withdrawals: HashSet<usize>,
-    pub redemptions: HashMap<usize, (Quantity, String)>,
+    pub redemptions: HashMap<usize, (Quantity, String, Date)>,
     pub refusals: HashMap<usize, String>,
 }
 
@@ -138,6 +138,7 @@ pub(super) fn prepare(
             (
                 out.quantity.expect("validated withdrawal quantity"),
                 out.operation_id.clone(),
+                out.date.expect("validated withdrawal date"),
             ),
         );
         tracing::info!(
@@ -207,6 +208,10 @@ mod tests {
         assert_eq!(
             pending.withdrawal_operation_id.as_deref(),
             Some("fund-withdrawal")
+        );
+        assert_eq!(
+            pending.withdrawal_date,
+            Some(time::macros::date!(2026 - 08 - 01))
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&pending.raw).unwrap(),

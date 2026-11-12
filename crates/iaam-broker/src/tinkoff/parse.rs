@@ -185,6 +185,7 @@ pub struct CurrencyDescription {
     pub nominal: CalcMoney,
     pub settlement: CurrencyCode,
     pub lot: i64,
+    pub blocked_tca_flag: bool,
 }
 
 /// Parse `CurrencyBy`; nominal carries the foreign currency and exact unit size.
@@ -230,6 +231,7 @@ pub fn parse_currency_description(body: &str) -> Result<CurrencyDescription, Par
         nominal,
         settlement,
         lot,
+        blocked_tca_flag: blocked_tca_flag(instrument)?,
     })
 }
 
@@ -285,6 +287,16 @@ pub fn parse_instrument(body: &str) -> Result<crate::BrokerInstrumentDescription
         board: optional("classCode"),
         lot,
         price_decimals: None,
+        blocked_tca_flag: blocked_tca_flag(instrument)?,
+    })
+}
+
+fn blocked_tca_flag(instrument: &Value) -> Result<bool, ParseError> {
+    instrument.get("blockedTcaFlag").map_or(Ok(false), |value| {
+        value.as_bool().ok_or_else(|| ParseError::InvalidField {
+            field: "blockedTcaFlag",
+            value: value.to_string(),
+        })
     })
 }
 

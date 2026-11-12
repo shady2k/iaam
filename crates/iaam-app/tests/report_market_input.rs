@@ -158,6 +158,7 @@ async fn seed_market_price_with(
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap_or_else(|error| panic!("insert market instrument: {error}"));
     let run = store

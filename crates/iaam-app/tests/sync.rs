@@ -3322,6 +3322,79 @@ async fn a_zero_quantity_full_repayment_retires_the_position_at_its_date_only_on
 }
 
 #[tokio::test]
+async fn a_refused_full_redemption_logs_identity_and_matching_journal_history() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument =
+        InstrumentId(uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").unwrap());
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBOND");
+    });
+    seed_redemption_history(
+        &services,
+        owner,
+        account,
+        instrument,
+        &[
+            (date!(2026 - 03 - 01), 2),
+            (date!(2026 - 03 - 10), -2),
+            (date!(2026 - 03 - 20), 5),
+        ],
+    )
+    .await;
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let channel = zero_quantity_repayment_channel(&services);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("unproven repayment sync");
+    assert_eq!(outcome.set_aside, 1);
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let diagnostic = logs
+        .lines()
+        .find(|line| line.contains("full redemption has no positive journal position"))
+        .expect("refusal diagnostic");
+    for expected in [
+        "DEBUG",
+        "operation_id=invented-zero-full-repayment",
+        "instrument=bbbbbbbb-0000-0000-0000-000000000005",
+        "instrument_uid=Some(\"bbbbbbbb-0000-0000-0000-000000000005\")",
+        "position_uid=Some(\"aaaaaaaa-0000-0000-0000-000000000005\")",
+        "catalogue_ticker=Some(\"INVENTEDBOND\")",
+        "history_through=2026-03-15",
+        "facts_by_kind={\"trade\": 2}",
+        "first_fact_date=Some(2026-03-01)",
+        "last_fact_date=Some(2026-03-10)",
+        "buys=1",
+        "sells=1",
+        "transfers_in=0",
+        "transfers_out=0",
+    ] {
+        assert!(diagnostic.contains(expected), "{expected}: {diagnostic}");
+    }
+    assert!(diagnostic.contains(&format!("account={}", account.inner())));
+    assert!(diagnostic.contains(&format!("isin=Some(\"{}\")", invented_isin(instrument))));
+    for forbidden in ["payment=", "compensation="] {
+        assert!(!diagnostic.contains(forbidden), "{diagnostic}");
+    }
+}
+
+#[tokio::test]
 async fn a_zero_quantity_full_repayment_without_journal_history_is_set_aside() {
     zero_quantity_repayment_without_position(false).await;
 }

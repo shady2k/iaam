@@ -1263,7 +1263,7 @@ async fn resolve_full_redemption(
         .await?;
     let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
     let mut balances = Balances::new();
-    for event in effective {
+    for event in &effective {
         balances
             .apply(event)
             .map_err(iaam_core::projection::ProjectionError::from)
@@ -1276,6 +1276,9 @@ async fn resolve_full_redemption(
         })
         .filter(|quantity| quantity.0.is_positive())
     else {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            trace_full_redemption_refusal(services, pending, &effective).await;
+        }
         return Ok(Err(format!(
             "bond redemption reports zero quantity and the journal holds no positive position of this instrument on this account at {}; history may start after the holding",
             pending.effective_date
@@ -1298,6 +1301,96 @@ async fn resolve_full_redemption(
         idempotency_key: Some(pending.idempotency_key.clone()),
         source_operation_id: Some(pending.source_operation_id.clone()),
     }))
+}
+
+async fn trace_full_redemption_refusal(
+    services: &AppServices,
+    pending: &crate::ports::PendingFullRedemption,
+    events: &[&Event],
+) {
+    use iaam_core::event::kind::{EventKind, TradeSide};
+
+    let raw = serde_json::from_str::<serde_json::Value>(&pending.raw).unwrap_or_default();
+    let ticker = services
+        .directory
+        .as_ref()
+        .instrument(pending.instrument)
+        .await;
+    let aliases = services.directory.list_aliases().await;
+    let isin = aliases.as_ref().ok().and_then(|aliases| {
+        aliases.iter().find(|alias| {
+            alias.instrument == pending.instrument
+                && alias.namespace == "isin"
+                && alias.valid_from <= pending.effective_date
+                && alias.valid_to.is_none_or(|to| pending.effective_date < to)
+        })
+    });
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut first = None;
+    let mut last = None;
+    let mut buys = 0;
+    let mut sells = 0;
+    // Inbound securities transfers are quarantined, not journal facts.
+    let transfers_in = 0;
+    let mut transfers_out = 0;
+    for event in events {
+        let has_instrument_leg = event.legs.iter().any(|leg| {
+            leg.account == pending.account && leg.instrument == Some(pending.instrument)
+        });
+        let names_instrument = match &event.kind {
+            EventKind::Income { instrument, .. } | EventKind::Tax { instrument, .. } => {
+                *instrument == Some(pending.instrument)
+            }
+            EventKind::Valuation { instrument, .. } => *instrument == pending.instrument,
+            EventKind::ControlAssertion {
+                claim: ControlClaim::PositionQuantity { instrument, .. },
+                ..
+            } => *instrument == pending.instrument,
+            _ => false,
+        };
+        if !has_instrument_leg && !(event.account == pending.account && names_instrument) {
+            continue;
+        }
+        *counts.entry(event.kind.discriminant()).or_default() += 1;
+        if let Some(date) = event.dates.effective_date() {
+            first = Some(first.map_or(date, |first: Date| first.min(date)));
+            last = Some(last.map_or(date, |last: Date| last.max(date)));
+        }
+        match event.kind {
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                ..
+            } => buys += 1,
+            EventKind::Trade {
+                side: TradeSide::Sell,
+                ..
+            } => sells += 1,
+            EventKind::SecuritiesTransferOut { .. } => transfers_out += 1,
+            _ => {}
+        }
+    }
+    tracing::debug!(
+        phase = "map",
+        operation_id = %pending.source_operation_id,
+        instrument = %pending.instrument.inner(),
+        account = %pending.account.inner(),
+        ticker = ?raw.get("ticker").and_then(serde_json::Value::as_str),
+        figi = ?raw.get("figi").and_then(serde_json::Value::as_str),
+        instrument_uid = ?raw.get("instrumentUid").and_then(serde_json::Value::as_str),
+        position_uid = ?raw.get("positionUid").and_then(serde_json::Value::as_str),
+        catalogue_ticker = ?ticker.as_ref().ok().and_then(|instrument| instrument.as_ref()).map(|instrument| instrument.symbol.as_str()),
+        isin = ?isin.map(|alias| alias.value.as_str()),
+        catalogue_lookup_failed = ticker.is_err() || aliases.is_err(),
+        history_through = %pending.effective_date,
+        facts_by_kind = ?counts,
+        first_fact_date = ?first,
+        last_fact_date = ?last,
+        buys,
+        sells,
+        transfers_in,
+        transfers_out,
+        "full redemption has no positive journal position"
+    );
 }
 
 fn known_records(events: &[Event]) -> Vec<KnownRecord> {

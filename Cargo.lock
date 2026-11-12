@@ -1045,6 +1045,7 @@ dependencies = [
  "iaam-http",
  "iaam-server",
  "iaam-store",
+ "rusqlite",
  "rustix",
  "serde_json",
  "thiserror",
@@ -1070,6 +1071,8 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

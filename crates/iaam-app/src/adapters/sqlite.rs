@@ -74,6 +74,51 @@ use time::Date;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+/// Refresh embedded contract knowledge after opening a database.
+///
+/// Runs independently of broker credentials and network access. Owner-origin
+/// entries are preserved by the store, including overrides of embedded codes.
+pub fn refresh_broker_operation_dictionaries(
+    store: &mut SqliteStore,
+) -> Result<(), iaam_store::StoreError> {
+    for broker in ["tinkoff", "finam"] {
+        let code =
+            BrokerCode::parse(broker).ok_or_else(|| iaam_store::StoreError::InvalidValue {
+                field: "broker",
+                value: broker.to_owned(),
+            })?;
+        refresh_broker_operation_dictionary(store, &code)?;
+    }
+    Ok(())
+}
+
+fn refresh_broker_operation_dictionary(
+    store: &mut SqliteStore,
+    broker: &BrokerCode,
+) -> Result<(), iaam_store::StoreError> {
+    let Some((dictionary, entries)) = iaam_broker::operation_kind::seed_for(broker.as_str()) else {
+        return Ok(());
+    };
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|(source_kind, kind)| BrokerOperationKind {
+            source_kind: (*source_kind).to_owned(),
+            kind: (*kind).to_owned(),
+        })
+        .collect();
+    let outcome = store.extend_broker_operation_kinds(broker, dictionary, &entries)?;
+    tracing::info!(
+        phase = "refresh_operation_dictionary",
+        broker = broker.as_str(),
+        dictionary,
+        added = outcome.added,
+        changed = outcome.changed,
+        already_known = outcome.already_known,
+        "broker operation dictionary refreshed"
+    );
+    Ok(())
+}
+
 /// Connection behind a mutex: `rusqlite::Connection` is not `Sync`, and a
 /// single-user database has only one writer. A pool will be added when there is
 /// a second writer, not before.
@@ -2067,30 +2112,7 @@ impl BrokerChannelFactory for SqliteAdapter {
         let code = code.clone();
         let rows = self
             .blocking(move |store| {
-                if code.as_str() == "tinkoff" {
-                    let outcome = store
-                        .extend_broker_operation_kinds(
-                            &code,
-                            "embedded T-Invest full redemption",
-                            &iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
-                                .iter()
-                                .filter(|(source, _)| {
-                                    *source == "OPERATION_TYPE_BOND_REPAYMENT_FULL"
-                                })
-                                .map(|(source, kind)| BrokerOperationKind {
-                                    source_kind: (*source).to_owned(),
-                                    kind: (*kind).to_owned(),
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                        .map_err(store_error)?;
-                    tracing::info!(
-                        phase = "extend_operation_dictionary",
-                        added = outcome.added,
-                        already_known = outcome.already_known,
-                        "broker dictionary updated"
-                    );
-                }
+                refresh_broker_operation_dictionary(store, &code).map_err(store_error)?;
                 store.broker_operation_kinds(&code).map_err(store_error)
             })
             .await?;

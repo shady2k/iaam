@@ -18,7 +18,7 @@ use iaam_broker::tinkoff::{
     TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError, parse_account_ids, parse_operations,
     parse_portfolio, parse_portfolio_positions,
 };
-use iaam_core::event::kind::{FeeOrigin, IncomeKind};
+use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
@@ -26,7 +26,7 @@ use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::{Dimension, evidence::SourceChannel};
 use iaam_core::rules::trade_allocation::{
-    allocate_minor as core_allocate_minor, check_order_completeness,
+    allocate_gross_minor, allocate_minor as core_allocate_minor,
 };
 use iaam_ingest::SubmittedOperation;
 use iaam_ingest::dedup::IdentityScope;
@@ -41,10 +41,31 @@ use crate::ports::{
     PortfolioAsOf, PortfolioSnapshot, Quarantined,
 };
 
+#[path = "tinkoff_report.rs"]
+mod report;
+
+#[path = "tinkoff_diagnostics.rs"]
+mod diagnostics;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
-type CachedDescription = (Instant, Result<BrokerInstrumentDescription, String>);
+#[derive(Clone, Copy)]
+enum DescriptionMethod {
+    Instrument,
+    Currency,
+}
+
+type DescriptionParser<T> = fn(&str) -> Result<T, String>;
+
+#[derive(Clone)]
+struct CachedDescription<T = BrokerInstrumentDescription> {
+    read_at: Instant,
+    description: Result<T, String>,
+    uid_not_found: bool,
+    probes: HashSet<String>,
+    broker_instrument_type: Option<String>,
+}
 
 /// Broker channel implementation for T-Invest.
 pub struct TinkoffChannel {
@@ -57,6 +78,7 @@ pub struct TinkoffChannel {
     dictionary: OperationKindDictionary,
     instruments: Arc<dyn InstrumentDirectory>,
     descriptions: tokio::sync::Mutex<HashMap<String, CachedDescription>>,
+    diagnostic_operations: tokio::sync::Mutex<Vec<diagnostics::ReceivedOperation>>,
 }
 
 impl TinkoffChannel {
@@ -75,8 +97,197 @@ impl TinkoffChannel {
             dictionary,
             instruments,
             descriptions: tokio::sync::Mutex::new(HashMap::new()),
+            diagnostic_operations: tokio::sync::Mutex::new(Vec::new()),
         }
     }
+    // FindInstrument results are diagnostic only; typed lookups resolve identity.
+    async fn probe_instrument(
+        &self,
+        identifier: &str,
+        id_type: Option<InstrumentIdType>,
+        raw: &serde_json::Value,
+        context: BrokerRequestContext<'_>,
+    ) {
+        let response = match id_type {
+            Some(id_type) => {
+                self.client
+                    .get_instrument(identifier, id_type, context.deadline, context.allowance)
+                    .await
+            }
+            None => {
+                self.client
+                    .find_instrument(identifier, context.deadline, context.allowance)
+                    .await
+            }
+        };
+        trace_instrument_lookup(raw, identifier, id_type, &response);
+    }
+
+    async fn request_description(
+        &self,
+        id: &str,
+        id_type: InstrumentIdType,
+        method: DescriptionMethod,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<String, TinkoffError> {
+        match method {
+            DescriptionMethod::Instrument => {
+                self.client
+                    .get_instrument(id, id_type, context.deadline, context.allowance)
+                    .await
+            }
+            DescriptionMethod::Currency => {
+                self.client
+                    .get_currency(id, id_type, context.deadline, context.allowance)
+                    .await
+            }
+        }
+    }
+
+    async fn resolve_description<T: Clone>(
+        &self,
+        (id, id_type): (&str, InstrumentIdType),
+        raw: &serde_json::Value,
+        context: BrokerRequestContext<'_>,
+        descriptions: &mut HashMap<String, CachedDescription<T>>,
+        (method, parse): (DescriptionMethod, DescriptionParser<T>),
+    ) -> Result<CachedDescription<T>, BrokerError> {
+        let key = match id_type {
+            InstrumentIdType::Uid => format!(
+                "uid:{}",
+                Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string())
+            ),
+            InstrumentIdType::Figi => format!("figi:{id}"),
+            InstrumentIdType::PositionUid => format!("position_uid:{id}"),
+        };
+        if descriptions
+            .get(&key)
+            .is_none_or(|cached| cached.read_at.elapsed() >= std::time::Duration::from_secs(3600))
+        {
+            tracing::info!(
+                phase = "describe_instruments",
+                status = "start",
+                instruments = 1,
+                "reading broker instrument description"
+            );
+            let response = self.request_description(id, id_type, method, context).await;
+            trace_description_lookup(raw, id, Some(id_type), method, &response);
+            let broker_instrument_type = response.as_ref().ok().and_then(|body| {
+                let value: serde_json::Value = serde_json::from_str(body).ok()?;
+                value
+                    .get("instrument")?
+                    .get("instrumentType")?
+                    .as_str()
+                    .map(str::to_owned)
+            });
+            let uid_not_found = id_type == InstrumentIdType::Uid
+                && matches!(
+                    &response,
+                    Err(TinkoffError::UnexpectedStatus { status: 404, .. })
+                );
+            let description = match response.map_err(tinkoff_error) {
+                Ok(body) => parse(&body),
+                Err(
+                    BrokerError::Refused { detail, .. } | BrokerError::Unparsable { detail, .. },
+                ) => Err(detail),
+                Err(error) => return Err(error),
+            };
+            tracing::info!(
+                phase = "describe_instruments",
+                status = "complete",
+                instruments = 1,
+                described = usize::from(description.is_ok()),
+                "broker instrument description read"
+            );
+            descriptions.insert(
+                key.clone(),
+                CachedDescription {
+                    read_at: Instant::now(),
+                    description,
+                    uid_not_found,
+                    probes: HashSet::new(),
+                    broker_instrument_type,
+                },
+            );
+        }
+        let cached = descriptions.get_mut(&key).expect("description inserted");
+        if cached.uid_not_found {
+            let field = |name: &str| {
+                raw.get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+            };
+            for (identifier, fallback_type) in [
+                (field("positionUid"), InstrumentIdType::PositionUid),
+                (field("figi"), InstrumentIdType::Figi),
+            ] {
+                let Some(identifier) = identifier else {
+                    continue;
+                };
+                let probe_key = format!("{fallback_type:?}:{identifier}");
+                if !cached.probes.insert(probe_key) {
+                    continue;
+                }
+                let response = self
+                    .request_description(identifier, fallback_type, method, context)
+                    .await;
+                trace_description_lookup(raw, identifier, Some(fallback_type), method, &response);
+                let not_found = matches!(
+                    &response,
+                    Err(TinkoffError::UnexpectedStatus { status: 404, .. })
+                );
+                match response.map_err(tinkoff_error) {
+                    Ok(body) => {
+                        cached.broker_instrument_type =
+                            serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|value| {
+                                    value
+                                        .get("instrument")?
+                                        .get("instrumentType")?
+                                        .as_str()
+                                        .map(str::to_owned)
+                                });
+                        cached.description = parse(&body);
+                        cached.uid_not_found = false;
+                        tracing::info!(
+                            phase = "resolve_instruments",
+                            lookup_identifier = identifier,
+                            lookup_type = ?fallback_type,
+                            instrument_uid = id,
+                            "broker instrument fallback answered"
+                        );
+                        break;
+                    }
+                    Err(BrokerError::Refused { .. }) if not_found => {}
+                    Err(
+                        BrokerError::Refused { detail, .. }
+                        | BrokerError::Unparsable { detail, .. },
+                    ) => {
+                        cached.description = Err(detail);
+                        cached.uid_not_found = false;
+                        break;
+                    }
+                    Err(error) => {
+                        // A budget or transient failure must remain retryable.
+                        cached
+                            .probes
+                            .remove(&format!("{fallback_type:?}:{identifier}"));
+                        return Err(error);
+                    }
+                }
+            }
+            if cached.uid_not_found && matches!(method, DescriptionMethod::Instrument) {
+                for identifier in [Some(id), field("figi")].into_iter().flatten() {
+                    if cached.probes.insert(format!("search:{identifier}")) {
+                        self.probe_instrument(identifier, None, raw, context).await;
+                    }
+                }
+            }
+        }
+        Ok(cached.clone())
+    }
+
     async fn resolve_instrument(
         &self,
         uid: Option<&str>,
@@ -91,56 +302,28 @@ impl TinkoffChannel {
                 None => return Ok(Err("instrument description cannot be requested: the row supplies neither instrument UID nor FIGI".to_owned())),
             },
         };
-        let key = match id_type {
-            InstrumentIdType::Uid => format!(
-                "uid:{}",
-                Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string())
-            ),
-            InstrumentIdType::Figi => format!("figi:{id}"),
-        };
         let mut descriptions = self.descriptions.lock().await;
-        if descriptions
-            .get(&key)
-            .is_none_or(|(read_at, _)| read_at.elapsed() >= std::time::Duration::from_secs(3600))
-        {
-            tracing::info!(
-                phase = "describe_instruments",
-                status = "start",
-                instruments = 1,
-                "reading broker instrument description"
-            );
-            let description = match self
-                .client
-                .get_instrument(id, id_type, context.deadline, context.allowance)
-                .await
-                .map_err(tinkoff_error)
-            {
-                Ok(body) => {
-                    iaam_broker::tinkoff::parse_instrument(&body).map_err(|error| error.to_string())
-                }
-                Err(
-                    BrokerError::Refused { detail, .. } | BrokerError::Unparsable { detail, .. },
-                ) => Err(detail),
-                Err(error) => return Err(error),
-            };
-            tracing::info!(
-                phase = "describe_instruments",
-                status = "complete",
-                instruments = 1,
-                described = usize::from(description.is_ok()),
-                "broker instrument description read"
-            );
-            descriptions.insert(key.clone(), (Instant::now(), description));
-        }
-        let description = descriptions
-            .get(&key)
-            .expect("description inserted")
-            .1
-            .clone();
+        let cached = self
+            .resolve_description(
+                (id, id_type),
+                raw,
+                context,
+                &mut descriptions,
+                (DescriptionMethod::Instrument, |body| {
+                    iaam_broker::tinkoff::parse_instrument(body).map_err(|error| error.to_string())
+                }),
+            )
+            .await?;
+        let description = cached.description;
+        let uid_not_found = cached.uid_not_found;
+        let broker_instrument_type = cached.broker_instrument_type;
         drop(descriptions);
         let description = match description {
             Ok(description) => description,
             Err(reason) => {
+                if uid_not_found {
+                    trace_instrument_miss(raw, id, id_type, "uid_not_found", None, None);
+                }
                 return Ok(Err(format!(
                     "instrument {id} description refused or unreadable: {reason}"
                 )));
@@ -151,6 +334,14 @@ impl TinkoffChannel {
             .as_deref()
             .is_none_or(|isin| isin.trim().is_empty())
         {
+            trace_instrument_miss(
+                raw,
+                id,
+                id_type,
+                "no_isin",
+                broker_instrument_type.as_deref(),
+                Some(&description),
+            );
             return Ok(Err(format!("instrument {id} description names no ISIN")));
         }
         super::catalogue::resolve_or_record(
@@ -168,8 +359,116 @@ impl TinkoffChannel {
     }
 }
 
+fn trace_instrument_lookup(
+    raw: &serde_json::Value,
+    identifier: &str,
+    id_type: Option<InstrumentIdType>,
+    response: &Result<String, TinkoffError>,
+) {
+    trace_description_lookup(
+        raw,
+        identifier,
+        id_type,
+        DescriptionMethod::Instrument,
+        response,
+    );
+}
+
+fn trace_description_lookup(
+    raw: &serde_json::Value,
+    identifier: &str,
+    id_type: Option<InstrumentIdType>,
+    method: DescriptionMethod,
+    response: &Result<String, TinkoffError>,
+) {
+    let field = |name: &str| raw.get(name).and_then(serde_json::Value::as_str);
+    let status = match response {
+        Ok(_) => "200",
+        Err(TinkoffError::UnexpectedStatus { status: 404, .. }) => "404",
+        Err(_) => "other",
+    };
+    let broker_instrument_type = response.as_ref().ok().and_then(|body| {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        value
+            .get("instrument")?
+            .get("instrumentType")?
+            .as_str()
+            .map(str::to_owned)
+    });
+    macro_rules! trace_lookup {
+        ($level:ident) => {
+            tracing::$level!(
+        phase = "describe_instruments",
+        broker_instrument_type = broker_instrument_type.as_deref(),
+        operation_id = field("id").or_else(|| field("operationId")),
+        instrument_type = field("instrumentType"),
+        instrument_kind = field("instrumentKind"),
+        instrument_uid = field("instrumentUid"),
+        position_uid = field("positionUid"),
+        figi = field("figi"),
+        isin = field("isin"),
+        ticker = field("ticker"),
+        lookup_method = match (method, id_type) {
+            (DescriptionMethod::Currency, _) => "CurrencyBy",
+            (DescriptionMethod::Instrument, Some(_)) => "GetInstrumentBy",
+            (DescriptionMethod::Instrument, None) => "FindInstrument",
+        },
+        lookup_identifier = identifier,
+        lookup_type = ?id_type,
+        lookup_status = status,
+        "broker instrument lookup"
+    );
+        };
+    }
+    if response.is_ok() {
+        trace_lookup!(debug);
+    } else {
+        trace_lookup!(warn);
+    }
+}
+
+fn trace_instrument_miss(
+    raw: &serde_json::Value,
+    lookup_identifier: &str,
+    lookup_type: InstrumentIdType,
+    reason: &str,
+    broker_instrument_type: Option<&str>,
+    description: Option<&BrokerInstrumentDescription>,
+) {
+    let field = |name: &str| raw.get(name).and_then(serde_json::Value::as_str);
+    tracing::warn!(
+        phase = "resolve_instruments",
+        reason,
+        operation_id = field("id").or_else(|| field("operationId")),
+        parent_operation_id = field("parentOperationId"),
+        operation_type = field("type").or_else(|| field("operationType")),
+        instrument_type = field("instrumentType"),
+        instrument_kind = field("instrumentKind"),
+        figi = field("figi"),
+        instrument_uid = field("instrumentUid"),
+        position_uid = field("positionUid"),
+        ticker = field("ticker").or_else(|| description.map(|description| description.ticker.as_str())),
+        name = field("name").or_else(|| description.map(|description| description.name.as_str())),
+        lookup_identifier,
+        lookup_type = ?lookup_type,
+        broker_instrument_type,
+        "broker instrument resolution miss"
+    );
+}
+
 #[async_trait]
 impl BrokerChannel for TinkoffChannel {
+    async fn diagnose_instruments(
+        &self,
+        instruments: &[InstrumentId],
+        broker_account: &str,
+        period: (Date, Date),
+        context: BrokerRequestContext<'_>,
+    ) {
+        self.trace_instrument_history(instruments, broker_account, period, context)
+            .await;
+    }
+
     async fn fetch_account_numbers(
         &self,
         context: BrokerRequestContext<'_>,
@@ -203,12 +502,15 @@ impl BrokerChannel for TinkoffChannel {
         request.from = Some(rfc3339_midnight(from));
         request.to = Some(rfc3339_operation_end(to));
         request.limit = Some(OPERATIONS_PAGE_LIMIT);
-        let operations = fetch_operation_pages(request, |request| async move {
+        let mut operations = fetch_operation_pages(request, |request| async move {
             self.client
                 .get_operations_by_cursor(&request, deadline, allowance)
                 .await
         })
         .await?;
+        let mut diagnostic_operations = diagnostics::capture(&operations);
+        self.resolve_report_payments(&mut operations, broker_account, from, to, context)
+            .await?;
         let received = operations.len();
         tracing::info!(
             phase = "resolve_instruments",
@@ -219,7 +521,9 @@ impl BrokerChannel for TinkoffChannel {
         );
         let mut checked = Vec::new();
         let mut refused = Vec::new();
-        for mut operation in operations {
+        let mut currency_cache = HashMap::new();
+        let mut currency_rows = HashMap::new();
+        for (operation_index, mut operation) in operations.into_iter().enumerate() {
             let has_identity = operation.instrument_uid.is_some()
                 || ["figi", "ticker", "isin"].into_iter().any(|key| {
                     operation
@@ -228,7 +532,66 @@ impl BrokerChannel for TinkoffChannel {
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|value| !value.is_empty())
                 });
-            if has_identity && operation.rejection.is_none() {
+            let kind = self.dictionary.kind_of(&operation.source_kind);
+            let is_currency = operation
+                .raw
+                .get("instrumentKind")
+                .and_then(serde_json::Value::as_str)
+                == Some("INSTRUMENT_TYPE_CURRENCY")
+                || operation
+                    .raw
+                    .get("instrumentType")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("currency");
+            let currency_trade = is_currency
+                && matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell);
+            if currency_trade && operation.rejection.is_none() {
+                let identity = operation
+                    .instrument_uid
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| (id, InstrumentIdType::Uid))
+                    .or_else(|| {
+                        operation
+                            .figi
+                            .as_deref()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| (id, InstrumentIdType::Figi))
+                    });
+                let result = if let Some((id, id_type)) = identity {
+                    self.resolve_description(
+                        (id, id_type),
+                        &operation.raw,
+                        context,
+                        &mut currency_cache,
+                        (DescriptionMethod::Currency, |body| {
+                            iaam_broker::tinkoff::parse::parse_currency_description(body)
+                                .map_err(|error| error.to_string())
+                        }),
+                    )
+                    .await?
+                    .description
+                } else {
+                    Err("currency description requires instrument UID or FIGI".to_owned())
+                };
+                match result {
+                    Ok(description) => {
+                        tracing::debug!(phase = "describe_currency", iso_currency = description.nominal.currency().code(), settlement = description.settlement.code(), lot = description.lot, nominal = ?description.nominal.value(), "currency description read");
+                        currency_rows.insert(operation.deduplication_key.clone(), description);
+                    }
+                    Err(reason) => {
+                        refused.push(Quarantined {
+                            reason: format!("currency description refused: {reason}"),
+                            dimensions: [Dimension::Cash].into_iter().collect(),
+                            raw: operation.raw,
+                        });
+                        continue;
+                    }
+                }
+            } else if has_identity
+                && operation.rejection.is_none()
+                && !(is_currency && matches!(kind, ChannelOperationKind::Commission))
+            {
                 match self
                     .resolve_instrument(
                         operation.instrument_uid.as_deref(),
@@ -239,6 +602,9 @@ impl BrokerChannel for TinkoffChannel {
                     .await?
                 {
                     Ok(instrument) => {
+                        if let Some(row) = diagnostic_operations.get_mut(operation_index) {
+                            row.instrument = Some(instrument);
+                        }
                         operation.instrument_uid = Some(instrument.inner().to_string())
                     }
                     Err(reason) => {
@@ -273,8 +639,9 @@ impl BrokerChannel for TinkoffChannel {
             strategy = "broker_description_isin",
             "broker sync phase complete"
         );
+        *self.diagnostic_operations.lock().await = diagnostic_operations;
         let (mut parsed, accounting) =
-            adapt_operations_accounted(account, checked, &self.dictionary)?;
+            adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
         let quarantined_instrument_resolution = refused.len();
         parsed.quarantined.extend(refused);
         tracing::info!(
@@ -285,6 +652,7 @@ impl BrokerChannel for TinkoffChannel {
             quarantined = parsed.quarantined.len(),
             quarantined_instrument_resolution,
             quarantined_parse = accounting.quarantined_parse,
+            quarantined_kind_not_in_dictionary = accounting.quarantined_kind_not_in_dictionary,
             quarantined_securities_transfer = accounting.quarantined_securities_transfer,
             quarantined_order_state = accounting.quarantined_order_state,
             quarantined_trade = accounting.quarantined_trade,
@@ -700,6 +1068,7 @@ struct OperationAccounting {
     source_rows_accepted: usize,
     reduced_no_execution_trades: usize,
     quarantined_parse: usize,
+    quarantined_kind_not_in_dictionary: usize,
     quarantined_securities_transfer: usize,
     quarantined_order_state: usize,
     quarantined_trade: usize,
@@ -715,10 +1084,20 @@ fn adapt_operations(
     adapt_operations_accounted(account, operations, dictionary).map(|(parsed, _)| parsed)
 }
 
+#[cfg(test)]
 fn adapt_operations_accounted(
     account: AccountId,
     operations: Vec<ChannelOperation>,
     dictionary: &OperationKindDictionary,
+) -> Result<(ParsedOperations, OperationAccounting), BrokerError> {
+    adapt_operations_with_currencies(account, operations, dictionary, &HashMap::new())
+}
+
+fn adapt_operations_with_currencies(
+    account: AccountId,
+    operations: Vec<ChannelOperation>,
+    dictionary: &OperationKindDictionary,
+    currency_rows: &HashMap<String, iaam_broker::tinkoff::parse::CurrencyDescription>,
 ) -> Result<(ParsedOperations, OperationAccounting), BrokerError> {
     // An empty dictionary means an unconfigured channel, not an unknown broker.
     // Without this check, the owner would receive a rejection for every code
@@ -756,6 +1135,7 @@ fn adapt_operations_accounted(
             operation.source_kind.clone()
         };
         // Take the payload before moving the operation into conversion; no later stage reads it.
+        let currency_description = currency_rows.get(&operation.deduplication_key);
         let raw = std::mem::take(&mut operation.raw);
         let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(rejection) = operation.rejection.as_ref() {
@@ -774,6 +1154,39 @@ fn adapt_operations_accounted(
             continue;
         }
 
+        if matches!(kind, ChannelOperationKind::Other(_)) {
+            accounting.quarantined_kind_not_in_dictionary += 1;
+            let dictionary = iaam_broker::tinkoff::dictionary_seed::TINKOFF_SEED_NAME;
+            tracing::debug!(
+                phase = "map_operations",
+                operation_id,
+                source_kind,
+                dictionary,
+                reason = "kind_not_in_dictionary",
+                "T-Invest operation quarantined"
+            );
+            quarantined.push(Quarantined {
+                raw,
+                reason: format!(
+                    "kind_not_in_dictionary: {source_kind} is absent from {dictionary}"
+                ),
+                dimensions: dimensions_for_kind(&kind),
+            });
+            continue;
+        }
+        if matches!(kind, ChannelOperationKind::SecuritiesTransferOut) {
+            tracing::debug!(
+                phase = "map_operations",
+                operation_id,
+                description = ?raw.get("description"),
+                child_operation_ids = ?raw.get("childOperations").and_then(serde_json::Value::as_array).map(|children| children.iter().filter_map(|child| child.get("id").and_then(serde_json::Value::as_str)).collect::<Vec<_>>()),
+                child_descriptions = ?raw.get("childOperations").and_then(serde_json::Value::as_array).map(|children| children.iter().filter_map(|child| child.get("description").and_then(serde_json::Value::as_str)).collect::<Vec<_>>()),
+                destination_account = ?raw.get("destinationAccountId"),
+                recipient_account = ?raw.get("recipientAccountId"),
+                destination = "unpaired",
+                "T-Invest outbound securities evidence; no receiving account inferred"
+            );
+        }
         if let Some(reason) = securities_transfer_reason(&kind) {
             accounting.quarantined_securities_transfer += 1;
             trace_quarantined_operation(&operation_id, &source_kind, "securities_transfer");
@@ -799,6 +1212,25 @@ fn adapt_operations_accounted(
                     dimensions_for_kind(&kind)
                 },
             });
+            continue;
+        }
+        if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell)
+            && operation.trades.is_empty()
+            && (currency_description.is_none()
+                || (operation.quantity_done == iaam_core::money::Quantity::zero()
+                    && matches!(
+                        operation.state,
+                        ChannelOrderState::Cancelled | ChannelOrderState::InProgress
+                    )))
+        {
+            accounting.reduced_no_execution_trades += 1;
+            tracing::debug!(
+                phase = "map_operations",
+                operation_id,
+                source_kind,
+                reason = "no_execution_trades",
+                "T-Invest operation reduced"
+            );
             continue;
         }
         if matches!(kind, ChannelOperationKind::BondRedemption) {
@@ -833,6 +1265,15 @@ fn adapt_operations_accounted(
                     return Err(error.into_broker_error());
                 }
             }
+        } else if let Some(description) = currency_description {
+            match currency_exchange_operations(account, operation, kind, description, &raw) {
+                Ok(exchange) => accepted.extend(exchange),
+                Err(error) => quarantined.push(Quarantined {
+                    raw,
+                    reason: format!("currency exchange: {error:?}"),
+                    dimensions: [Dimension::Cash].into_iter().collect(),
+                }),
+            }
         } else if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
             if let Some(reason) = trade_row_reason(&operation, &kind) {
                 accounting.quarantined_trade += 1;
@@ -848,19 +1289,7 @@ fn adapt_operations_accounted(
             match trade_operations(account, operation, kind)
                 .map_err(|error| error.with_dimensions(dimensions))
             {
-                Ok(operations) => {
-                    if operations.is_empty() {
-                        accounting.reduced_no_execution_trades += 1;
-                        tracing::debug!(
-                            phase = "map_operations",
-                            operation_id,
-                            source_kind,
-                            reason = "no_execution_trades",
-                            "T-Invest operation reduced"
-                        );
-                    }
-                    accepted.extend(operations);
-                }
+                Ok(operations) => accepted.extend(operations),
                 Err(RowRefusal::Row { reason, dimensions }) => {
                     trace_quarantined_operation(&operation_id, &source_kind, "conversion");
                     quarantined.push(Quarantined {
@@ -878,7 +1307,20 @@ fn adapt_operations_accounted(
             match operation_to_submitted(account, operation, kind)
                 .map_err(|error| error.with_dimensions(dimensions))
             {
-                Ok(operation) => accepted.push(operation),
+                Ok(operation) => {
+                    tracing::debug!(
+                        phase = "map_operations",
+                        operation_id,
+                        source_kind,
+                        mapped_kind = match &operation.kind {
+                            OperationKind::Tax { .. } => "tax",
+                            OperationKind::Fee { .. } => "fee",
+                            _ => "operation",
+                        },
+                        "T-Invest operation mapped"
+                    );
+                    accepted.push(operation);
+                }
                 Err(RowRefusal::Row { reason, dimensions }) => {
                     trace_quarantined_operation(&operation_id, &source_kind, "conversion");
                     quarantined.push(Quarantined {
@@ -897,6 +1339,7 @@ fn adapt_operations_accounted(
         source_rows - quarantined.len() - accounting.reduced_no_execution_trades;
     accounting.quarantined_conversion = quarantined.len()
         - accounting.quarantined_parse
+        - accounting.quarantined_kind_not_in_dictionary
         - accounting.quarantined_securities_transfer
         - accounting.quarantined_order_state
         - accounting.quarantined_trade;
@@ -938,6 +1381,7 @@ fn dimensions_for_kind(kind: &ChannelOperationKind) -> BTreeSet<Dimension> {
             [Dimension::Cash, Dimension::Income].into_iter().collect()
         }
         ChannelOperationKind::Commission
+        | ChannelOperationKind::Tax
         | ChannelOperationKind::Deposit
         | ChannelOperationKind::Withdrawal
         | ChannelOperationKind::Transfer
@@ -958,9 +1402,7 @@ fn securities_transfer_reason(kind: &ChannelOperationKind) -> Option<&'static st
         ChannelOperationKind::SecuritiesTransferIn => {
             Some("inbound securities transfer: securities moved without a cash movement")
         }
-        ChannelOperationKind::SecuritiesTransferOut => {
-            Some("outbound securities transfer: securities moved without a cash movement")
-        }
+        ChannelOperationKind::SecuritiesTransferOut => None,
         _ => None,
     }
 }
@@ -1020,7 +1462,7 @@ fn redemption_to_journal(
     operation: ChannelOperation,
 ) -> Result<iaam_ingest::journal_event::SubmittedJournalEvent, RowRefusal> {
     use iaam_core::event::corporate_action::CorporateAction;
-    use iaam_core::money::{Money, returned_principal_per_unit};
+    use iaam_core::money::Money;
     use iaam_ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 
     let instrument = optional_instrument(&operation)?
@@ -1037,15 +1479,13 @@ fn redemption_to_journal(
         .filter(|payment| payment.amount.raw() > 0)
         .ok_or_else(|| row_unparsable("bond redemption requires positive payment"))?;
     let compensation = Money::new(payment.amount, payment.currency);
-    let principal_returned_per_unit = returned_principal_per_unit(compensation, quantity)
-        .map_err(|error| row_unparsable(format!("bond redemption principal per unit: {error}")))?;
     Ok(SubmittedJournalEvent {
         account,
         fact: JournalFact::CorporateAction(CorporateAction::Redemption {
             instrument,
             custody: None,
             quantity,
-            principal_returned_per_unit,
+            principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::Posted(compensation),
             compensation,
             effective_date,
             record_date: None,
@@ -1054,6 +1494,130 @@ fn redemption_to_journal(
         idempotency_key: Some(operation.deduplication_key),
         source_operation_id: Some(operation.operation_id),
     })
+}
+
+fn currency_exchange_operations(
+    account: AccountId,
+    operation: ChannelOperation,
+    kind: ChannelOperationKind,
+    description: &iaam_broker::tinkoff::parse::CurrencyDescription,
+    raw: &serde_json::Value,
+) -> Result<Vec<SubmittedOperation>, RowRefusal> {
+    let date = operation
+        .date
+        .ok_or_else(|| row_unparsable("currency exchange lacks date"))?;
+    let quantity = operation
+        .quantity
+        .ok_or_else(|| row_unparsable("currency exchange lacks quantity"))?;
+    let foreign = iaam_core::money::currency_amount_from_nominal(description.nominal, quantity)
+        .map_err(|error| row_unparsable(format!("currency quantity: {error}")))?;
+    let payment = operation
+        .payment
+        .ok_or_else(|| row_unparsable("currency exchange lacks payment"))?;
+    if payment.currency != description.settlement || payment.currency == foreign.currency() {
+        return Err(row_unparsable(
+            "currency exchange payment does not match distinct settlement currency",
+        ));
+    }
+    let cash = iaam_core::money::Money::new(
+        payment
+            .magnitude()
+            .ok_or_else(|| row_unparsable("invalid payment"))?,
+        payment.currency,
+    );
+    let (sold, bought) = match kind {
+        ChannelOperationKind::Buy if payment.amount.raw() < 0 => (cash, foreign),
+        ChannelOperationKind::Sell if payment.amount.raw() > 0 => (foreign, cash),
+        _ => {
+            tracing::debug!(
+                phase = "currency_exchange",
+                operation_id = operation.operation_id,
+                operation_type = operation.source_kind,
+                state = ?raw.get("state"),
+                description = ?raw.get("description"),
+                parent_operation_id = ?operation.parent_operation_id,
+                cancel_reason = ?operation.cancel_reason,
+                cancel_date_time = ?raw.get("cancelDateTime"),
+                trades_count = operation.trades.len(),
+                trades_quantities = ?operation.trades.iter().map(|trade| trade.quantity.0.inner().to_string()).collect::<Vec<_>>(),
+                date = ?raw.get("date"),
+                instrument_type = ?raw.get("instrumentType"),
+                instrument_kind = ?raw.get("instrumentKind"),
+                ticker = ?raw.get("ticker"),
+                instrument_uid = ?operation.instrument_uid,
+                payment_units = ?raw.pointer("/payment/units"),
+                payment_nano = ?raw.pointer("/payment/nano"),
+                payment_currency = payment.currency.code(),
+                quantity = %quantity.0.inner(),
+                quantity_sign = if quantity.0 > Dec::zero() { "positive" } else if quantity.0 < Dec::zero() { "negative" } else { "zero" },
+                payment_sign = if payment.amount.raw() < 0 { "negative" } else if payment.amount.raw() > 0 { "positive" } else { "zero" },
+                expected_payment_sign = match kind { ChannelOperationKind::Buy => "negative", ChannelOperationKind::Sell => "positive", _ => "unsupported operation" },
+                "currency exchange payment sign disagreement"
+            );
+            return Err(row_unparsable(
+                "currency exchange payment sign disagrees with operation",
+            ));
+        }
+    };
+    let fee = if let Some(commission) = operation
+        .commission
+        .filter(|value| value.value() != Dec::zero())
+    {
+        let magnitude = CalcMoney::new(
+            Dec::new(commission.value().inner().abs()),
+            commission.currency(),
+        );
+        let amount = iaam_core::money::currency_amount_from_nominal(
+            magnitude,
+            iaam_core::money::Quantity(Dec::new(Decimal::ONE)),
+        )
+        .map_err(|error| row_unparsable(format!("currency exchange commission: {error}")))?;
+        Some(amount)
+    } else {
+        None
+    };
+    let submitted = |kind, key: String, source_id: String| SubmittedOperation {
+        account,
+        kind,
+        dates: OperationDates {
+            trade: Some(date),
+            ..OperationDates::default()
+        },
+        source_time: operation.source_time,
+        idempotency_key: Some(key),
+        source_operation_id: Some(source_id),
+        source_position_id: None,
+        source_category: None,
+        owner_category: None,
+        source_code: None,
+        source_kind: None,
+        description: None,
+        counterparty: None,
+    };
+    let mut result = vec![submitted(
+        OperationKind::CurrencyExchange { sold, bought },
+        operation.deduplication_key.clone(),
+        operation.operation_id.clone(),
+    )];
+    if let Some(fee) = fee {
+        result.push(submitted(
+            OperationKind::Fee {
+                amount_minor: fee.amount().raw(),
+                currency: fee.currency(),
+                origin: FeeOrigin::Brokerage,
+            },
+            composite_identity(
+                &operation.broker_account_id,
+                &operation.operation_id,
+                "currency-exchange-fee",
+            ),
+            format!(
+                "{}#currency-exchange-fee",
+                escape_component(&operation.operation_id)
+            ),
+        ));
+    }
+    Ok(result)
 }
 
 fn operation_to_submitted(
@@ -1093,6 +1657,22 @@ fn operation_to_submitted(
                 kind: Some(income_kind),
             }
         }
+        ChannelOperationKind::Tax => {
+            let payment = operation
+                .payment
+                .ok_or_else(|| row_unparsable("operation does not contain payment"))?;
+            let amount_minor = payment
+                .amount
+                .checked_neg()
+                .ok_or_else(|| row_unparsable("tax payment opposite sign is not representable"))?
+                .raw();
+            OperationKind::Tax {
+                amount_minor,
+                currency: payment.currency,
+                origin: TaxOrigin::WithheldAtSource,
+                instrument: optional_instrument(&operation)?,
+            }
+        }
         ChannelOperationKind::Commission => {
             let (amount_minor, currency) = required_money(operation.payment, "payment")?;
             OperationKind::Fee {
@@ -1121,9 +1701,24 @@ fn operation_to_submitted(
             ));
         }
         ChannelOperationKind::SecuritiesTransferOut => {
-            return Err(row_unparsable(
-                "outbound securities transfer: securities moved without a cash movement",
-            ));
+            let instrument = optional_instrument(&operation)?.ok_or_else(|| {
+                row_unparsable("outbound securities transfer does not contain instrumentUid")
+            })?;
+            let quantity = operation
+                .quantity
+                .filter(|quantity| quantity.0 > Dec::zero())
+                .ok_or_else(|| {
+                    row_unparsable("outbound securities transfer requires positive quantity")
+                })?;
+            if operation.date.is_none() {
+                return Err(row_unparsable(
+                    "outbound securities transfer does not contain date",
+                ));
+            }
+            OperationKind::SecuritiesTransferOut {
+                instrument,
+                quantity: quantity.0,
+            }
         }
         ChannelOperationKind::Transfer => {
             return Err(RowRefusal::Row {
@@ -1283,30 +1878,7 @@ fn trade_row_reason(operation: &ChannelOperation, kind: &ChannelOperationKind) -
         }
         _ => {}
     }
-    let grosses = operation
-        .trades
-        .iter()
-        .map(|trade| iaam_core::money::gross_for_fill(trade.price, trade.quantity))
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(grosses) = grosses else {
-        return Some("trade gross total is not representable".to_owned());
-    };
-    let Some(payment_minor) = payment.magnitude() else {
-        return Some("payment magnitude is not representable".to_owned());
-    };
-    let accrued_money = Some(CalcMoney::new(
-        Dec::new(Decimal::new(accrued, currency.minor_units())),
-        currency,
-    ));
-    match check_order_completeness(&grosses, accrued_money, payment_minor, currency) {
-        Ok(None) => None,
-        Ok(Some(mismatch)) => Some(format!(
-            "order payment {} does not equal trade total {}",
-            mismatch.reported.raw(),
-            mismatch.expected.raw()
-        )),
-        Err(_) => Some("trade money total is not representable".to_owned()),
-    }
+    trade_gross_allocations(payment, accrued, &operation.trades, currency).err()
 }
 
 fn trade_operations(
@@ -1331,6 +1903,25 @@ fn trade_operations(
             .then_with(|| left.num.as_bytes().cmp(right.num.as_bytes()))
     });
     let currency = trades[0].price.currency();
+    let payment = operation
+        .payment
+        .ok_or_else(|| row_unparsable("trading order does not report payment"))?;
+    let accrued = operation
+        .accrued_interest
+        .map_or(0, |value| value.amount.raw());
+    let gross_allocation =
+        trade_gross_allocations(payment, accrued, &trades, currency).map_err(row_unparsable)?;
+    if let Some(reconciliation) = gross_allocation.reconciliation {
+        tracing::debug!(
+            phase = "map_operations",
+            reason = "cash_authoritative",
+            operation_id = operation.operation_id,
+            payment_minor = reconciliation.payment.raw(),
+            trade_total_minor = reconciliation.trade_total.raw(),
+            delta_minor = reconciliation.delta.raw(),
+            "broker payment overrides calculated trade total"
+        );
+    }
     let commission_minor = posted_commission(operation.commission, currency)?;
     let commission_allocations = commission_minor
         .map(|total| allocate_minor(total, &trades))
@@ -1347,24 +1938,9 @@ fn trade_operations(
         .into_iter()
         .zip(commission_allocations)
         .zip(accrued_allocations)
-        .map(|((trade, commission), accrued)| {
-            let gross_exact = iaam_core::money::gross_for_fill(trade.price, trade.quantity)
-                .map_err(|error| {
-                    row_unparsable(format!("trade {} gross overflow: {error}", trade.num))
-                })?;
-            let gross = CalcMoney::new(
-                Dec::new(gross_exact.value().inner().abs()),
-                trade.price.currency(),
-            );
-            let gross_minor = gross
-                .rounded_minor()
-                .map_err(|error| {
-                    row_unparsable(format!(
-                        "trade {} gross cannot be rounded: {error}",
-                        trade.num
-                    ))
-                })?
-                .raw();
+        .zip(gross_allocation.amounts)
+        .map(|(((trade, commission), accrued), gross)| {
+            let gross_minor = gross.raw();
             let basis_fee = calc_money_from_minor(commission, currency);
             let accrued_interest_minor = accrued_known.then_some(accrued);
             // No custody here: the channel names no place of storage for a
@@ -1428,6 +2004,40 @@ fn trade_operations(
             })
         })
         .collect()
+}
+
+fn trade_gross_allocations(
+    payment: ChannelMoney,
+    accrued: i64,
+    trades: &[iaam_broker::tinkoff::ChannelTrade],
+    currency: CurrencyCode,
+) -> Result<iaam_core::rules::trade_allocation::GrossAllocation, String> {
+    let payment = payment
+        .magnitude()
+        .ok_or_else(|| "payment magnitude is not representable".to_owned())?;
+    let mut order = (0..trades.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        trades[*left]
+            .num
+            .as_bytes()
+            .cmp(trades[*right].num.as_bytes())
+    });
+    let grosses = order
+        .iter()
+        .map(|index| {
+            iaam_core::money::gross_for_fill(trades[*index].price, trades[*index].quantity)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("trade gross total is not representable: {error}"))?;
+    let mut allocation =
+        allocate_gross_minor(payment, PostedMinor::new(accrued), &grosses, currency)
+            .map_err(|error| error.to_string())?;
+    let mut amounts = vec![PostedMinor::new(0); trades.len()];
+    for (position, index) in order.into_iter().enumerate() {
+        amounts[index] = allocation.amounts[position];
+    }
+    allocation.amounts = amounts;
+    Ok(allocation)
 }
 
 fn posted_commission(
@@ -1679,6 +2289,7 @@ pub(crate) mod fake {
         /// Answered once the script has run out.
         otherwise: Option<Answer>,
         log: Log,
+        scripted_instruments: bool,
     }
 
     impl Transport for FakeTinvest {
@@ -1687,9 +2298,10 @@ pub(crate) mod fake {
                 Some(iaam_http::RequestBody::Json(body)) => body.clone(),
                 _ => String::new(),
             };
-            if request
-                .path()
-                .ends_with("InstrumentsService/GetInstrumentBy")
+            if !self.scripted_instruments
+                && request
+                    .path()
+                    .ends_with("InstrumentsService/GetInstrumentBy")
             {
                 let value: serde_json::Value =
                     serde_json::from_str(&body).expect("instrument request");
@@ -1748,6 +2360,14 @@ pub(crate) mod fake {
         script: Vec<Answer>,
         otherwise: Option<Answer>,
     ) -> (Arc<Gateway<FakeTinvest>>, Log, Arc<FakeTime>) {
+        gateway_with_instruments(script, otherwise, false)
+    }
+
+    pub(crate) fn gateway_with_instruments(
+        script: Vec<Answer>,
+        otherwise: Option<Answer>,
+        scripted_instruments: bool,
+    ) -> (Arc<Gateway<FakeTinvest>>, Log, Arc<FakeTime>) {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
@@ -1760,6 +2380,7 @@ pub(crate) mod fake {
                 script: Mutex::new(script.into()),
                 otherwise,
                 log: Arc::clone(&log),
+                scripted_instruments,
             },
             BUDGETS,
             Arc::clone(&time) as Arc<dyn Clock>,
@@ -1799,6 +2420,258 @@ mod tests {
         order_state_reason, rfc3339_operation_end, trade_operations,
     };
     use iaam_broker::operation_kind::OperationKindDictionary;
+
+    #[tokio::test]
+    async fn currency_descriptions_produce_cash_exchanges_and_separate_fee() {
+        use iaam_core::money::CurrencyCode;
+        for (
+            code,
+            operation_type,
+            payment,
+            nominal_units,
+            nominal_nano,
+            foreign_minor,
+            rub_minor,
+        ) in [
+            ("usd", "OPERATION_TYPE_BUY", "-100", "1", 0, 200, -10000),
+            ("usd", "OPERATION_TYPE_SELL", "100", "1", 0, -200, 10000),
+            (
+                "xau",
+                "OPERATION_TYPE_BUY",
+                "-100",
+                "0",
+                500000000,
+                10000,
+                -10000,
+            ),
+            (
+                "xau",
+                "OPERATION_TYPE_SELL",
+                "100",
+                "0",
+                500000000,
+                -10000,
+                10000,
+            ),
+        ] {
+            let row = serde_json::json!({"hasNext":false,"items":[{
+                "cursor":"invented", "brokerAccountId":"invented", "id":"currency-trade",
+                "date":"2026-08-20T10:11:12Z", "type":operation_type,
+                "state":"OPERATION_STATE_EXECUTED", "instrumentKind":"INSTRUMENT_TYPE_CURRENCY",
+                "instrumentUid":"aaaaaaaa-0000-0000-0000-000000000001", "quantity":"2",
+                "payment":{"units":payment,"nano":0,"currency":"rub"},
+                "commission":{"units":"1","nano":0,"currency":"rub"}
+            }]});
+            let description = serde_json::json!({"instrument":{
+                "isoCurrencyName":code,"currency":"rub","lot":1,
+                "nominal":{"currency":code,"units":nominal_units,"nano":nominal_nano}
+            }});
+            let (gateway, requests, _) = fake::gateway_with_instruments(
+                vec![
+                    Answer::status(200, &row.to_string()),
+                    Answer::status(200, &description.to_string()),
+                ],
+                None,
+                true,
+            );
+            let parsed = fetch(&channel(gateway))
+                .await
+                .expect("fetch currency trade");
+            assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+            assert_eq!(parsed.accepted.len(), 2);
+            assert_eq!(requests.lock().expect("requests").len(), 2);
+            let context = NormalizationContext {
+                owner: OwnerId::new_random(),
+                source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
+            };
+            let events: Vec<_> = parsed
+                .accepted
+                .iter()
+                .map(|item| normalize(item, &context).expect("normalize").event)
+                .collect();
+            assert!(matches!(events[0].kind, EventKind::CurrencyExchange { .. }));
+            assert!(matches!(events[1].kind, EventKind::Fee { .. }));
+            let foreign = if code == "usd" {
+                CurrencyCode::Usd
+            } else {
+                CurrencyCode::Xau
+            };
+            assert_eq!(
+                events[0]
+                    .cash_effect(foreign)
+                    .expect("foreign")
+                    .amount()
+                    .raw(),
+                foreign_minor
+            );
+            assert_eq!(
+                events[0]
+                    .cash_effect(CurrencyCode::Rub)
+                    .expect("rub")
+                    .amount()
+                    .raw(),
+                rub_minor
+            );
+            assert_eq!(
+                events[1]
+                    .cash_effect(CurrencyCode::Rub)
+                    .expect("fee")
+                    .amount()
+                    .raw(),
+                -100
+            );
+            let contour = ContourDefinition::new(
+                ContourId::new_random(),
+                ContourVersion(1),
+                [AccountId(Uuid::from_u128(1))],
+            );
+            let rules = RuleRegistry::with_defaults();
+            let snapshot = project(
+                &events,
+                &ProjectionContext {
+                    contour: &contour,
+                    rules: &rules,
+                    lot_rule: LotRuleVersion(1),
+                },
+            )
+            .expect("project");
+            assert_eq!(snapshot.state().book().iter().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn currency_sign_disagreement_keeps_refusal_and_logs_source_fields() {
+        let row = serde_json::json!({"hasNext":false,"items":[{
+            "cursor":"invented", "brokerAccountId":"invented", "id":"sign-proof",
+            "date":"2026-08-20T10:11:12Z", "type":"OPERATION_TYPE_BUY",
+            "state":"OPERATION_STATE_EXECUTED", "instrumentType":"currency",
+            "instrumentUid":"invented-usd-uid", "ticker":"INVENTED-USD", "quantity":"2",
+            "description":"Invented correction evidence", "parentOperationId":"invented-parent",
+            "cancelReason":"Invented cancellation explanation", "cancelDateTime":"2026-08-21T09:00:00Z",
+            "tradesInfo":{"trades":[{"num":"invented-trade", "date":"2026-08-20T10:11:12Z", "quantity":"2", "price":{"units":"50","nano":0,"currency":"rub"}}]},
+            "payment":{"units":"100","nano":120000000,"currency":"rub"}
+        }]});
+        let description = serde_json::json!({"instrument":{
+            "isoCurrencyName":"usd","currency":"rub","lot":1,
+            "nominal":{"currency":"usd","units":"1","nano":0}
+        }});
+        let (gateway, _, _) = fake::gateway_with_instruments(
+            vec![
+                Answer::status(200, &row.to_string()),
+                Answer::status(200, &description.to_string()),
+            ],
+            None,
+            true,
+        );
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let parsed = fetch(&channel(gateway))
+            .await
+            .expect("fetch sign disagreement");
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert!(
+            parsed.quarantined[0]
+                .reason
+                .contains("payment sign disagrees")
+        );
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for evidence in [
+            "sign-proof",
+            "INVENTED-USD",
+            "invented-usd-uid",
+            "payment_units",
+            "payment_nano",
+            "120000000",
+            "payment_currency",
+            "quantity_sign",
+            "expected_payment_sign",
+            "negative",
+            "OPERATION_STATE_EXECUTED",
+            "Invented correction evidence",
+            "invented-parent",
+            "Invented cancellation explanation",
+            "2026-08-21T09:00:00Z",
+            "trades_count=1",
+            "trades_quantities=[\"2\"]",
+            "2026-08-20T10:11:12Z",
+        ] {
+            assert!(log.contains(evidence), "missing {evidence} in {log}");
+        }
+    }
+
+    #[test]
+    fn tax_codes_map_to_signed_tax_facts_with_optional_instruments() {
+        let (dictionary, unreadable) = OperationKindDictionary::build(
+            iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                .iter()
+                .copied(),
+        );
+        assert!(unreadable.is_empty());
+        let instrument = InstrumentId(Uuid::from_u128(71));
+        for (source_kind, units, expected_cash, named) in [
+            (
+                "OPERATION_TYPE_DIVIDEND_TAX",
+                "-11",
+                -1100,
+                Some(instrument),
+            ),
+            ("OPERATION_TYPE_TAX", "-8", -800, None),
+            ("OPERATION_TYPE_TAX_CORRECTION", "-3", -300, None),
+            ("OPERATION_TYPE_TAX_CORRECTION", "3", 300, Some(instrument)),
+        ] {
+            let body = serde_json::json!({
+                "hasNext": false,
+                "items": [{
+                    "cursor": "invented-tax-cursor",
+                    "brokerAccountId": "invented-tax-account",
+                    "id": "invented-tax-row",
+                    "date": "2026-08-20T10:11:12Z",
+                    "type": source_kind,
+                    "state": "OPERATION_STATE_EXECUTED",
+                    "instrumentUid": named.map(|id| id.inner().to_string()),
+                    "payment": {"units": units, "nano": 0, "currency": "rub"}
+                }]
+            });
+            let parsed = adapt_operations(
+                AccountId::new_random(),
+                parse_operations(&body.to_string()).expect("parse"),
+                &dictionary,
+            )
+            .expect("adapt");
+            assert!(parsed.quarantined.is_empty(), "{source_kind}");
+            assert_eq!(parsed.accepted.len(), 1);
+            let context = NormalizationContext {
+                owner: OwnerId::new_random(),
+                source: SourceId::new_random(),
+                parser_version: ParserVersion(super::TINKOFF_PARSER_VERSION.to_owned()),
+            };
+            let event = normalize(&parsed.accepted[0], &context)
+                .expect("normalize tax")
+                .event;
+            event.validate_structure().expect("tax structure");
+            assert!(
+                matches!(&event.kind, EventKind::Tax { instrument, origin: iaam_core::event::kind::TaxOrigin::WithheldAtSource, .. } if *instrument == named)
+            );
+            assert_eq!(
+                event
+                    .cash_effect(iaam_core::money::CurrencyCode::Rub)
+                    .expect("cash")
+                    .amount()
+                    .raw(),
+                expected_cash
+            );
+        }
+    }
+
     fn broker_context(
         deadline: Option<std::time::Instant>,
     ) -> crate::ports::BrokerRequestContext<'static> {
@@ -1808,6 +2681,631 @@ mod tests {
             deadline,
             allowance: &ALLOWANCE,
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct InstrumentLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for InstrumentLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("instrument log")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn report_operation() -> iaam_broker::tinkoff::ChannelOperation {
+        let body = serde_json::json!({"hasNext": false, "items": [{
+            "cursor":"c", "brokerAccountId":"account", "id":"operation", "figi":"FIGI1",
+            "date":"2026-08-20T10:00:00Z", "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+            "quantity":"92", "payment":{"currency":"rub", "units":"-173", "nano":-926000000},
+            "tradesInfo":{"trades":[{"num":"trade-1", "date":"2026-08-20T10:00:00Z", "quantity":"92",
+                "price":{"currency":"rub", "units":"1", "nano":890500000}}]}
+        }]});
+        parse_operations(&body.to_string()).unwrap().remove(0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_refusal_diagnostics_skip_near_and_elapsed_deadlines_without_requests() {
+        let (gateway, requests, _) = fake::gateway(Vec::new(), None);
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let started = tokio::time::Instant::now();
+        for deadline in [
+            started.into_std() - std::time::Duration::from_secs(1),
+            started.into_std(),
+            started.into_std() + crate::ports::BROKER_DIAGNOSTIC_RESERVE,
+        ] {
+            channel
+                .trace_instrument_history(
+                    &[InstrumentId::new_random()],
+                    "account",
+                    (
+                        time::macros::date!(2026 - 08 - 01),
+                        time::macros::date!(2026 - 08 - 31),
+                    ),
+                    broker_context(Some(deadline)),
+                )
+                .await;
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(tokio::time::Instant::now(), started);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("status=\"skipped\"").count(), 3, "{log}");
+        assert!(log.contains("phase=\"position_refusal_history\""), "{log}");
+        assert!(
+            log.contains("reason=\"sync_deadline_near_or_elapsed\""),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_refusal_diagnostics_cancel_a_local_mutex_wait_at_the_sync_deadline() {
+        let (gateway, requests, _) = fake::gateway(Vec::new(), None);
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let _held = channel.diagnostic_operations.lock().await;
+        let started = tokio::time::Instant::now();
+        let bound = std::time::Duration::from_secs(5);
+        channel
+            .trace_instrument_history(
+                &[InstrumentId::new_random()],
+                "account",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(Some((started + bound).into_std())),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= bound,
+            "diagnostic did not wait for its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= bound + std::time::Duration::from_millis(1),
+            "diagnostic outlived its deadline: {elapsed:?}"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("phase=\"position_refusal_history\""), "{log}");
+        assert!(log.contains("status=\"deadline_elapsed\""), "{log}");
+    }
+
+    #[tokio::test]
+    async fn position_refusal_diagnostics_read_report_and_log_only_related_selected_rows() {
+        let affected = InstrumentId::new_random();
+        let page = serde_json::json!({"getBrokerReportResponse":{"brokerReport":[
+            {"figi":"FIGI1", "ticker":"INVENTED", "direction":"Buy", "quantity":"7", "tradeDatetime":"2026-08-20T10:00:00Z", "party":"hidden-report-party"},
+            {"figi":"UNRELATED", "ticker":"OTHER", "direction":"hidden-direction"}
+        ], "itemsCount":2,"pagesCount":1,"page":0}});
+        let (gateway, requests, _) = fake::gateway(
+            vec![
+                Answer::status(
+                    200,
+                    r#"{"generateBrokerReportResponse":{"taskId":"diagnostic-task"}}"#,
+                ),
+                Answer::status(200, &page.to_string()),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let mut operation = report_operation();
+        operation.raw = serde_json::json!({"id":"source-proof", "figi":"FIGI1", "description":"invented-history", "payment":{"units":"-1","nano":0}, "brokerAccountId":"hidden-account"});
+        let mut rows = super::diagnostics::capture(&[operation]);
+        rows[0].instrument = Some(affected);
+        *channel.diagnostic_operations.lock().await = rows;
+        channel
+            .trace_instrument_history(
+                &[affected],
+                "account",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+            )
+            .await;
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("invented-history"));
+        assert!(log.contains("FIGI1"));
+        assert!(log.contains("matching_rows=1"));
+        for excluded in ["hidden-report-party", "hidden-direction", "hidden-account"] {
+            assert!(
+                !log.contains(excluded),
+                "unselected evidence leaked: {excluded}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn report_generation_polls_pending_then_reads_every_page() {
+        let report_row = serde_json::json!({"tradeId":"trade-1", "figi":"FIGI1", "quantity":"92",
+            "tradeDatetime":"2026-08-20T10:00:00Z", "clearValueDate":"2026-08-21T00:00:00Z",
+            "totalOrderAmount":{"currency":"rub", "units":"173", "nano":930000000}});
+        let page0 = serde_json::json!({"getBrokerReportResponse":{"brokerReport":[{"tradeId":"unrelated"}], "itemsCount":2,"pagesCount":2,"page":0}}).to_string();
+        let page1 = serde_json::json!({"getBrokerReportResponse":{"brokerReport":[report_row.clone()], "itemsCount":2,"pagesCount":2,"page":1}}).to_string();
+        let (gateway, requests, time) = fake::gateway(
+            vec![
+                Answer::status(
+                    200,
+                    r#"{"generateBrokerReportResponse":{"taskId":"task-1"}}"#,
+                ),
+                Answer::status(400, r#"{"code":30058}"#),
+                Answer::status(400, r#"{"code":30058}"#),
+                Answer::status(200, &page0),
+                Answer::status(200, &page1),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        let mut operations = vec![report_operation()];
+        assert!(iaam_broker::tinkoff::needs_report_payment(&operations[0]));
+        iaam_broker::tinkoff::resolve_report_payment(&operations[0], &[report_row])
+            .expect("fixture report resolves");
+        channel
+            .resolve_report_payments(
+                &mut operations,
+                "account",
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                broker_context(None),
+            )
+            .await
+            .unwrap();
+        assert!(
+            operations[0].rejection.is_none(),
+            "remaining refusal: {:?}",
+            operations[0].rejection
+        );
+        assert_eq!(operations[0].payment.unwrap().amount.raw(), -17393);
+        let requests = requests.lock().unwrap();
+        let calls: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|v| serde_json::from_str(v).unwrap())
+            .collect();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(
+            calls[0]["generateBrokerReportRequest"]["accountId"],
+            "account"
+        );
+        for call in &calls[1..4] {
+            assert_eq!(call["getBrokerReportRequest"]["taskId"], "task-1");
+            assert_eq!(call["getBrokerReportRequest"]["page"], 0);
+        }
+        assert_eq!(calls[4]["getBrokerReportRequest"]["page"], 1);
+        assert!(!time.slept().is_empty(), "gateway spaces report polls");
+    }
+
+    #[tokio::test]
+    async fn incomplete_report_keeps_subminor_operation_refused() {
+        let (gateway, _, _) = fake::gateway(
+            vec![
+                Answer::status(200, r#"{"generateBrokerReportResponse":{"taskId":"task"}}"#),
+                Answer::status(
+                    200,
+                    r#"{"getBrokerReportResponse":{"brokerReport":[],"itemsCount":1,"pagesCount":2,"page":0}}"#,
+                ),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        let mut operations = vec![report_operation()];
+        channel
+            .resolve_report_payments(
+                &mut operations,
+                "account",
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                broker_context(None),
+            )
+            .await
+            .unwrap();
+        assert!(iaam_broker::tinkoff::needs_report_payment(&operations[0]));
+    }
+
+    #[tokio::test]
+    async fn currency_lookup_uses_first_success_and_caches_stale_uid_fallbacks() {
+        let description = serde_json::json!({"instrument":{
+            "isoCurrencyName":"usd", "currency":"rub", "lot":1,
+            "nominal":{"currency":"usd","units":"1","nano":0}
+        }})
+        .to_string();
+        for missing in 0..=2 {
+            let mut row = serde_json::json!({
+                "cursor":"invented", "brokerAccountId":"invented", "id":"currency-trade",
+                "date":"2026-08-20T10:11:12Z", "type":"OPERATION_TYPE_BUY",
+                "state":"OPERATION_STATE_EXECUTED", "instrumentKind":"INSTRUMENT_TYPE_CURRENCY",
+                "instrumentUid":"invented-currency-uid", "positionUid":"invented-currency-position",
+                "figi":"INVENTEDFIGI", "quantity":"2",
+                "payment":{"units":"-100","nano":0,"currency":"rub"}
+            });
+            let mut rows = Vec::new();
+            for index in 0..14 {
+                row["id"] = format!("currency-trade-{index}").into();
+                row["cursor"] = format!("cursor-{index}").into();
+                rows.push(row.clone());
+            }
+            let page = serde_json::json!({"hasNext":false,"items":rows});
+            let mut answers = vec![Answer::status(200, &page.to_string())];
+            for _ in 0..missing {
+                answers.push(Answer::status(404, "{}"));
+            }
+            answers.push(Answer::status(200, &description));
+            let (gateway, requests, _) = fake::gateway_with_instruments(answers, None, true);
+            let writer = InstrumentLog::default();
+            let captured = writer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _subscriber = tracing::subscriber::set_default(subscriber);
+            let parsed = fetch(&channel(gateway))
+                .await
+                .expect("currency fallback fetch");
+            assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+            assert_eq!(parsed.accepted.len(), 14);
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                missing + 2,
+                "first 200 stops; repeated rows use cache"
+            );
+            let expected = [
+                ("invented-currency-uid", "INSTRUMENT_ID_TYPE_UID"),
+                (
+                    "invented-currency-position",
+                    "INSTRUMENT_ID_TYPE_POSITION_UID",
+                ),
+                ("INVENTEDFIGI", "INSTRUMENT_ID_TYPE_FIGI"),
+            ];
+            for (request, (id, id_type)) in requests[1..].iter().zip(expected) {
+                let call: serde_json::Value = serde_json::from_str(request).unwrap();
+                assert_eq!(call["id"], id);
+                assert_eq!(call["idType"], id_type);
+            }
+            let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            if missing > 0 {
+                let miss = logs
+                    .lines()
+                    .find(|line| line.contains("lookup_status=\"404\""))
+                    .expect("404 diagnostic");
+                assert!(miss.contains("lookup_method=\"CurrencyBy\""), "{miss}");
+                assert!(
+                    miss.contains("lookup_identifier=\"invented-currency-uid\""),
+                    "{miss}"
+                );
+                assert!(miss.contains("Uid"), "{miss}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn currency_lookup_does_not_fall_back_after_non_404_or_unreadable_200() {
+        for statuses in [
+            vec![400],
+            vec![404, 400],
+            vec![200],
+            vec![404, 200],
+            vec![404, 404, 404],
+        ] {
+            let answers = statuses
+                .iter()
+                .map(|status| Answer::status(*status, "{}"))
+                .collect();
+            let (gateway, requests, _) = fake::gateway_with_instruments(answers, None, true);
+            let channel = channel(gateway);
+            let mut cache = std::collections::HashMap::new();
+            let row = serde_json::json!({"positionUid":"invented-position", "figi":"INVENTEDFIGI"});
+            for _ in 0..2 {
+                let result = channel
+                    .resolve_description(
+                        ("invented-uid", iaam_broker::tinkoff::InstrumentIdType::Uid),
+                        &row,
+                        broker_context(None),
+                        &mut cache,
+                        (super::DescriptionMethod::Currency, |body| {
+                            iaam_broker::tinkoff::parse::parse_currency_description(body)
+                                .map_err(|error| error.to_string())
+                        }),
+                    )
+                    .await
+                    .expect("row-local refusal");
+                assert!(result.description.is_err());
+            }
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), statuses.len());
+            for request in requests.iter() {
+                let call: serde_json::Value = serde_json::from_str(request).unwrap();
+                assert!(
+                    call.get("query").is_none(),
+                    "currency must not use FindInstrument"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn uid_miss_uses_the_first_typed_fallback_and_caches_it() {
+        let body = r#"{"instrument":{"isin":"XX0000000042","ticker":"FALLBACK","name":"Invented fallback","instrumentType":"share","currency":"rub"}}"#;
+        for position_found in [true, false] {
+            let mut answers = vec![Answer::status(404, "{}")];
+            if !position_found {
+                answers.push(Answer::status(404, "{}"));
+            }
+            answers.push(Answer::status(200, body));
+            let (gateway, requests, _) = fake::gateway_with_instruments(answers, None, true);
+            let channel = channel(gateway);
+            let row = serde_json::json!({
+                "id":"invented-operation", "instrumentUid":"invented-uid",
+                "positionUid":"invented-position", "figi":"TESTFIGI"
+            });
+            let writer = InstrumentLog::default();
+            let captured = writer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _subscriber = tracing::subscriber::set_default(subscriber);
+            for _ in 0..2 {
+                let resolved = channel
+                    .resolve_instrument(
+                        Some("invented-uid"),
+                        &row,
+                        time::macros::date!(2026 - 01 - 01),
+                        broker_context(None),
+                    )
+                    .await
+                    .expect("fallback request")
+                    .expect("fallback resolves");
+                assert_eq!(
+                    resolved,
+                    channel
+                        .instruments
+                        .resolve("isin", "XX0000000042", time::macros::date!(2026 - 01 - 01),)
+                        .await
+                        .expect("ISIN identity recorded")
+                );
+            }
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), if position_found { 2 } else { 3 });
+            let calls: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|request| serde_json::from_str(request).unwrap())
+                .collect();
+            assert_eq!(calls[0]["idType"], "INSTRUMENT_ID_TYPE_UID");
+            assert_eq!(calls[1]["idType"], "INSTRUMENT_ID_TYPE_POSITION_UID");
+            assert_eq!(calls[1]["id"], "invented-position");
+            if !position_found {
+                assert_eq!(calls[2]["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+                assert_eq!(calls[2]["id"], "TESTFIGI");
+            }
+            let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(log.contains("broker instrument fallback answered"), "{log}");
+            assert!(
+                log.contains(if position_found {
+                    "PositionUid"
+                } else {
+                    "Figi"
+                }),
+                "{log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn all_typed_lookups_missing_stays_set_aside_and_searches_are_diagnostic() {
+        let body = r#"{"instruments":[{"isin":"XX0000000042","ticker":"SEARCH"}]}"#;
+        let (gateway, requests, _) = fake::gateway_with_instruments(
+            vec![
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(200, body),
+                Answer::status(200, body),
+            ],
+            None,
+            true,
+        );
+        let channel = channel(gateway);
+        let row = serde_json::json!({"positionUid":"invented-position", "figi":"TESTFIGI"});
+        for _ in 0..2 {
+            let result = channel
+                .resolve_instrument(
+                    Some("invented-uid"),
+                    &row,
+                    time::macros::date!(2026 - 01 - 01),
+                    broker_context(None),
+                )
+                .await
+                .expect("404 is local");
+            assert!(result.unwrap_err().contains("404"));
+        }
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            let calls: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|request| serde_json::from_str(request).unwrap())
+                .collect();
+            assert_eq!(calls[2]["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+            assert_eq!(calls[3]["query"], "invented-uid");
+            assert_eq!(calls[4]["query"], "TESTFIGI");
+        }
+        assert!(
+            channel
+                .instruments
+                .resolve("isin", "XX0000000042", time::macros::date!(2026 - 01 - 01))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_uid_miss_tries_figi_once_when_a_later_row_supplies_it() {
+        let (gateway, requests, _) = fake::gateway_with_instruments(
+            vec![
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+            ],
+            None,
+            true,
+        );
+        let channel = channel(gateway);
+        for row in [
+            serde_json::json!({}),
+            serde_json::json!({"figi":"TESTFIGI"}),
+            serde_json::json!({"figi":"TESTFIGI"}),
+        ] {
+            let result = channel
+                .resolve_instrument(
+                    Some("invented-uid"),
+                    &row,
+                    time::macros::date!(2026 - 01 - 01),
+                    broker_context(None),
+                )
+                .await
+                .unwrap();
+            assert!(result.unwrap_err().contains("404"));
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "UID lookup and search, then later FIGI lookup and search"
+        );
+        let uid: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let figi: serde_json::Value = serde_json::from_str(&requests[2]).unwrap();
+        assert_eq!(uid["idType"], "INSTRUMENT_ID_TYPE_UID");
+        assert_eq!(figi["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+    }
+
+    #[tokio::test]
+    async fn uid_404_figi_fallback_uses_the_same_request_allowance() {
+        let (gateway, requests, _) =
+            fake::gateway_with_instruments(vec![Answer::status(404, "{}")], None, true);
+        let channel = channel(gateway);
+        let allowance = iaam_http::RequestAllowance::new(1);
+        let context = crate::ports::BrokerRequestContext {
+            deadline: None,
+            allowance: &allowance,
+        };
+        let result = channel
+            .resolve_instrument(
+                Some("invented-uid"),
+                &serde_json::json!({"figi":"TESTFIGI"}),
+                time::macros::date!(2026 - 01 - 01),
+                context,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(BrokerError::RequestCeiling { ceiling: 1, .. })
+        ));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "probe cannot exceed sync budget"
+        );
+        let next = channel
+            .resolve_instrument(
+                Some("another-invented-uid"),
+                &serde_json::json!({}),
+                time::macros::date!(2026 - 01 - 01),
+                context,
+            )
+            .await;
+        assert!(matches!(
+            next,
+            Err(BrokerError::RequestCeiling { ceiling: 1, .. })
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn description_without_isin_logs_metadata_without_amounts_and_stays_quarantined() {
+        let (gateway, requests, _) = fake::gateway_with_instruments(
+            vec![Answer::status(
+                200,
+                r#"{"instrument":{"ticker":"NOISIN","name":"Invented derivative","instrumentType":"futures","currency":"rub"}}"#,
+            )],
+            None,
+            true,
+        );
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let row = serde_json::json!({"id":"no-isin-operation", "instrumentUid":"no-isin-uid", "quantity":"123456789"});
+        let result = channel
+            .resolve_instrument(
+                Some("no-isin-uid"),
+                &row,
+                time::macros::date!(2026 - 01 - 01),
+                broker_context(None),
+            )
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().contains("names no ISIN"));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no FIGI probe for no-ISIN descriptions"
+        );
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "no_isin",
+            "NOISIN",
+            "Invented derivative",
+            "no-isin-operation",
+            "no-isin-uid",
+            "futures",
+        ] {
+            assert!(log.contains(expected), "missing {expected}: {log}");
+        }
+        assert!(!log.contains("123456789"));
     }
 
     /// A future that marks itself the first time it is polled and then never
@@ -1999,6 +3497,26 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_dictionary_kind_has_its_own_quarantine_accounting_and_names_the_dictionary() {
+        let operations = parse_operations(&income_operation("OPERATION_TYPE_UNKNOWN")).unwrap();
+        let (parsed, accounting) = super::adapt_operations_accounted(
+            AccountId(Uuid::from_u128(1)),
+            operations,
+            &dictionary(),
+        )
+        .unwrap();
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(accounting.quarantined_kind_not_in_dictionary, 1);
+        assert_eq!(accounting.quarantined_conversion, 0);
+        assert_eq!(
+            parsed.quarantined[0].reason,
+            "kind_not_in_dictionary: OPERATION_TYPE_UNKNOWN is absent from embedded T-Invest dictionary"
+        );
+        assert_eq!(parsed.quarantined[0].dimensions, super::all_dimensions());
+    }
+
+    #[test]
     fn a_row_refusal_is_quarantined_without_aborting_other_operations() {
         for source_kind in [
             "OPERATION_TYPE_TRANSFER",
@@ -2017,7 +3535,7 @@ mod tests {
                 parsed.quarantined[0].reason.contains(match source_kind {
                     "OPERATION_TYPE_TRANSFER" => "transfer does not contain a recipient account",
                     "OPERATION_TYPE_BOND_AMORTISATION" => "returned face value per unit",
-                    _ => "unsupported operation kind: OPERATION_TYPE_UNKNOWN",
+                    _ => "kind_not_in_dictionary: OPERATION_TYPE_UNKNOWN is absent from embedded T-Invest dictionary",
                 }),
                 "row refusal reason: {}",
                 parsed.quarantined[0].reason
@@ -2255,22 +3773,25 @@ mod tests {
     }
 
     #[test]
-    fn a_securities_transfer_out_is_quarantined_as_an_outbound_securities_transfer() {
-        let operations = parse_operations(&income_operation("OPERATION_TYPE_OUTPUT_SECURITIES"))
-            .expect("parsing");
+    fn an_outbound_securities_transfer_records_quantity_without_cash_or_destination() {
+        let mut body: serde_json::Value =
+            serde_json::from_str(&income_operation("OPERATION_TYPE_OUTPUT_SECURITIES")).unwrap();
+        body["items"][0].as_object_mut().unwrap().remove("payment");
+        body["items"][0]["description"] = serde_json::json!("Transfer to another depository");
+        body["items"][0]["childOperations"] = serde_json::json!([]);
+        let operations = parse_operations(&body.to_string()).expect("parsing");
         let parsed =
             adapt_operations(trading_account(), operations, &dictionary()).expect("adaptation");
-
-        assert!(parsed.accepted.is_empty());
-        assert_eq!(parsed.quarantined.len(), 1);
-        assert!(parsed.quarantined[0].reason.contains("securities"));
-        assert!(parsed.quarantined[0].reason.contains("outbound"));
-        assert_eq!(
-            parsed.quarantined[0].dimensions,
-            [Dimension::Positions, Dimension::TaxBasis]
-                .into_iter()
-                .collect()
+        assert!(parsed.quarantined.is_empty());
+        assert_eq!(parsed.accepted.len(), 1);
+        assert!(
+            matches!(parsed.accepted[0].kind, OperationKind::SecuritiesTransferOut { quantity, .. } if quantity == iaam_core::numeric::decimal::Dec::one())
         );
+        assert_eq!(
+            parsed.accepted[0].dates.trade,
+            Some(time::macros::date!(2026 - 08 - 20))
+        );
+        assert!(parsed.accepted[0].source_operation_id.is_some());
     }
 
     #[test]
@@ -2313,6 +3834,58 @@ mod tests {
 
         assert!(parsed.accepted.is_empty());
         assert!(parsed.quarantined.is_empty());
+    }
+
+    #[test]
+    fn cancelled_currency_and_security_buys_share_no_execution_accounting() {
+        use super::adapt_operations_with_currencies;
+        use std::collections::HashMap;
+        for is_currency in [false, true] {
+            let body = serde_json::json!({"hasNext": false, "items": [{
+                "cursor": "invented-cancelled-cursor",
+                "brokerAccountId": "invented-account",
+                "id": "invented-cancelled-buy",
+                "date": "2026-08-20T10:11:12Z",
+                "type": "OPERATION_TYPE_BUY",
+                "state": "OPERATION_STATE_CANCELED",
+                "instrumentType": if is_currency { "currency" } else { "share" },
+                "instrumentUid": "aaaaaaaa-0000-0000-0000-000000000001",
+                "quantity": "2",
+                "quantityDone": "0",
+                "payment": {"units": "100", "nano": 0, "currency": "rub"},
+                "tradesInfo": {"trades": []}
+            }]});
+            let operations = parse_operations(&body.to_string()).expect("parse invented buy");
+            let mut currency_rows = HashMap::new();
+            if is_currency {
+                let description = serde_json::json!({"instrument": {
+                    "isoCurrencyName": "usd", "currency": "rub", "lot": 1,
+                    "nominal": {"currency": "usd", "units": "1", "nano": 0}
+                }});
+                currency_rows.insert(
+                    operations[0].deduplication_key.clone(),
+                    iaam_broker::tinkoff::parse::parse_currency_description(
+                        &description.to_string(),
+                    )
+                    .expect("parse invented currency description"),
+                );
+            }
+            let (parsed, accounting) = adapt_operations_with_currencies(
+                trading_account(),
+                operations,
+                &dictionary(),
+                &currency_rows,
+            )
+            .expect("adapt cancelled buy");
+
+            assert!(parsed.accepted.is_empty());
+            assert!(parsed.journal.is_empty());
+            assert!(parsed.pending_redemptions.is_empty());
+            assert!(parsed.quarantined.is_empty());
+            assert_eq!(accounting.reduced_no_execution_trades, 1);
+            assert_eq!(accounting.source_rows_accepted, 0);
+            assert_eq!(accounting.quarantined_conversion, 0);
+        }
     }
 
     #[test]
@@ -3262,7 +4835,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_order_money_quarantines_with_both_amounts() {
+    fn mismatched_order_money_uses_broker_cash_instead_of_refusing() {
         let body = trading_operation_with_fields(TradingOperationFields {
             operation_type: "OPERATION_TYPE_BUY",
             state: "OPERATION_STATE_EXECUTED",
@@ -3278,14 +4851,21 @@ mod tests {
         });
         let (accepted, quarantined) = accepted_trade_operations(&body);
 
-        assert!(accepted.is_empty());
-        assert_eq!(quarantined.len(), 1);
-        assert!(quarantined[0].reason.contains("25"));
-        assert!(quarantined[0].reason.contains("24"));
+        assert!(quarantined.is_empty());
+        assert_eq!(accepted.len(), 2);
+        for operation in accepted {
+            assert!(matches!(
+                operation.kind,
+                OperationKind::Buy {
+                    gross_minor: 1_250,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
-    fn accrued_interest_is_part_of_order_completeness() {
+    fn accrued_interest_is_removed_from_authoritative_order_cash() {
         let trade = trade("bond-fill", "2026-08-21T10:00:00Z", "1", "120", 0);
         let matching = trading_operation_with_fields(TradingOperationFields {
             operation_type: "OPERATION_TYPE_BUY",
@@ -3310,8 +4890,72 @@ mod tests {
         assert_eq!(accepted.len(), 1);
         assert!(quarantined.is_empty());
         let (accepted, quarantined) = accepted_trade_operations(&mismatching);
-        assert!(accepted.is_empty());
-        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined.is_empty());
+        assert!(matches!(
+            accepted[0].kind,
+            OperationKind::Buy {
+                gross_minor: 11_700,
+                accrued_interest_minor: Some(300),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mismatched_cash_is_allocated_by_exact_gross_and_reconciles_after_accrued() {
+        for operation_type in ["OPERATION_TYPE_BUY", "OPERATION_TYPE_SELL"] {
+            let payment = if operation_type == "OPERATION_TYPE_BUY" {
+                r#"{"units":"-13","nano":-10000000,"currency":"rub"}"#
+            } else {
+                r#"{"units":"13","nano":10000000,"currency":"rub"}"#
+            };
+            let fills = [
+                trade("b", "2026-08-21T10:00:00Z", "1", "20", 2_000_000),
+                trade("a", "2026-08-21T10:00:00Z", "1", "10", 1_000_000),
+            ];
+            let adapt = |trades: &str| {
+                let body = trading_operation_with_fields(TradingOperationFields {
+                    operation_type,
+                    state: "OPERATION_STATE_EXECUTED",
+                    operation_id: "cash-authoritative",
+                    quantity_done: "2",
+                    payment,
+                    fields: r#","accruedInt":{"units":"3","nano":0,"currency":"rub"}"#,
+                    trades,
+                });
+                let (accepted, quarantined) = accepted_trade_operations(&body);
+                assert!(quarantined.is_empty());
+                accepted
+                    .into_iter()
+                    .map(|operation| match operation.kind {
+                        OperationKind::Buy {
+                            gross_minor,
+                            accrued_interest_minor,
+                            ..
+                        }
+                        | OperationKind::Sell {
+                            gross_minor,
+                            accrued_interest_minor,
+                            ..
+                        } => (gross_minor, accrued_interest_minor.unwrap()),
+                        other => panic!("expected trade, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let amounts = adapt(&fills.join(","));
+            assert_eq!(amounts, vec![(334, 150), (667, 150)]);
+            assert_eq!(
+                amounts
+                    .iter()
+                    .map(|(gross, accrued)| gross + accrued)
+                    .sum::<i64>(),
+                1_301
+            );
+            assert_eq!(
+                amounts,
+                adapt(&[fills[1].clone(), fills[0].clone()].join(","))
+            );
+        }
     }
 
     #[test]
@@ -4194,8 +5838,10 @@ mod full_redemption_tests {
         assert_eq!(*custody, None, "positionUid is not a custody place");
         assert_eq!(quantity.0.inner().to_string(), "3");
         assert_eq!(
-            principal_returned_per_unit.value(),
-            Dec::new(Decimal::from(800))
+            principal_returned_per_unit
+                .per_unit_exact(*quantity)
+                .unwrap(),
+            iaam_core::numeric::exact::Exact::from_int(800)
         );
         assert_eq!(principal_returned_per_unit.currency(), CurrencyCode::Rub);
         assert_eq!(compensation.amount().raw(), 240_000);
@@ -4239,6 +5885,38 @@ mod full_redemption_tests {
             "-3"
         );
         assert_eq!(security.custody, None);
+    }
+
+    #[test]
+    fn full_repayment_keeps_one_ruble_for_three_securities_exactly() {
+        use iaam_core::event::corporate_action::CorporateAction;
+        use iaam_core::money::ReturnedPrincipal;
+        use iaam_core::numeric::exact::Exact;
+        use iaam_ingest::journal_event::JournalFact;
+
+        let mut row = full_repayment_row();
+        row["payment"] = serde_json::json!({"units": "1", "nano": 0, "currency": "rub"});
+        let parsed = adapt_row(row);
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        let JournalFact::CorporateAction(CorporateAction::Redemption {
+            quantity,
+            principal_returned_per_unit,
+            compensation,
+            ..
+        }) = &parsed.journal[0].fact
+        else {
+            panic!("expected a redemption");
+        };
+        assert!(
+            matches!(principal_returned_per_unit, ReturnedPrincipal::Posted(amount) if amount.amount().raw() == 100)
+        );
+        assert_eq!(compensation.amount().raw(), 100);
+        assert_eq!(
+            principal_returned_per_unit
+                .per_unit_exact(*quantity)
+                .unwrap(),
+            Exact::new(1, 3).unwrap()
+        );
     }
 
     #[test]

@@ -62,15 +62,12 @@ pub struct BrokerOperationKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DictionaryOutcome {
     pub added: usize,
+    pub changed: usize,
     pub already_known: usize,
 }
 
 impl SqliteStore {
-    /// Populate the channel dictionary within an existing transaction.
-    ///
-    /// Existing entries are **not** touched, and the owner's decision
-    /// also means: the update adds what was missing rather than
-    /// overwriting what exists.
+    /// Refresh contract entries within an existing transaction, preserving owner decisions.
     pub(crate) fn extend_broker_operation_kinds_in_transaction(
         transaction: &Transaction<'_>,
         broker: &BrokerCode,
@@ -78,14 +75,20 @@ impl SqliteStore {
         entries: &[BrokerOperationKind],
     ) -> Result<DictionaryOutcome, StoreError> {
         let mut outcome = DictionaryOutcome::default();
-        let mut statement = transaction.prepare(
+        let mut insert = transaction.prepare(
             "INSERT INTO broker_operation_kinds
                  (broker, source_kind, kind, origin, dictionary, recorded_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (broker, source_kind) DO NOTHING",
         )?;
+        let mut update = transaction.prepare(
+            "UPDATE broker_operation_kinds
+             SET kind = ?3, dictionary = ?4, recorded_at = ?5
+             WHERE broker = ?1 AND source_kind = ?2
+               AND origin = 'contract' AND kind != ?3",
+        )?;
         for entry in entries {
-            let inserted = statement.execute(params![
+            let inserted = insert.execute(params![
                 broker.as_str(),
                 entry.source_kind,
                 entry.kind,
@@ -93,21 +96,38 @@ impl SqliteStore {
                 dictionary,
                 now(),
             ])?;
-            if inserted == 0 {
-                outcome.already_known += 1;
-            } else {
+            let action = if inserted != 0 {
                 outcome.added += 1;
-            }
+                "added"
+            } else if update.execute(params![
+                broker.as_str(),
+                entry.source_kind,
+                entry.kind,
+                dictionary,
+                now(),
+            ])? != 0
+            {
+                outcome.changed += 1;
+                "changed"
+            } else {
+                outcome.already_known += 1;
+                continue;
+            };
+            tracing::debug!(
+                broker = broker.as_str(),
+                dictionary,
+                source_kind = entry.source_kind,
+                kind = entry.kind,
+                action,
+                "broker operation dictionary entry refreshed"
+            );
         }
         Ok(outcome)
     }
 
-    /// Populate the channel dictionary from the contract.
+    /// Add missing contract entries and update changed contract kinds.
     ///
-    /// Existing entries are **not** touched, and the owner's decision
-    /// also means: the update adds what was missing rather than
-    /// overwriting what exists. Otherwise the nightly run would silently
-    /// cancel a manually configured interpretation.
+    /// Owner-origin entries are never overwritten, even when their kind differs.
     pub fn extend_broker_operation_kinds(
         &mut self,
         broker: &BrokerCode,

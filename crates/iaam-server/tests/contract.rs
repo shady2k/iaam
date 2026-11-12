@@ -1223,7 +1223,7 @@ async fn health_is_public_and_reports_the_projection_version() {
     assert_eq!(body["status"], "ok");
     // Version 9 retains income totals by account, kind and currency.
     // Earlier snapshots must rebuild rather than omit historical income.
-    assert_eq!(body["projection_version"], 9);
+    assert_eq!(body["projection_version"], 11);
 }
 
 #[tokio::test]
@@ -8392,6 +8392,83 @@ async fn a_redemption_is_recorded_through_the_journal_route() {
 }
 
 #[tokio::test]
+async fn a_posted_redemption_preserves_exact_cash_through_the_journal_route() {
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_id(&path, harness.instrument, "POSTED-REDEMPTION");
+    let body = json!({
+        "source_label": "test",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "redemption",
+                "instrument": harness.instrument.inner(),
+                "quantity": "3",
+                "posted_principal": { "amount": "1.00", "currency": "RUB" },
+                "compensation": { "amount": "1.00", "currency": "RUB" },
+                "effective_date": "2026-06-01"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events
+        .iter()
+        .find(|event| matches!(&event.kind, EventKind::CorporateAction { .. }))
+        .expect("stored redemption");
+    let EventKind::CorporateAction {
+        action:
+            iaam_core::event::corporate_action::CorporateAction::Redemption {
+                instrument,
+                custody,
+                quantity,
+                principal_returned_per_unit,
+                compensation,
+                ..
+            },
+    } = &event.kind
+    else {
+        panic!("expected redemption");
+    };
+    assert_eq!(*instrument, harness.instrument);
+    assert_eq!(*custody, None);
+    assert_eq!(quantity.0.inner().to_string(), "3");
+    let iaam_core::money::ReturnedPrincipal::Posted(principal) = principal_returned_per_unit else {
+        panic!("expected source-posted principal, not a rounded per-unit value");
+    };
+    assert_eq!(principal.amount().raw(), 100);
+    assert_eq!(principal.currency(), CurrencyCode::Rub);
+    assert_eq!(compensation, principal);
+    let principal_legs: Vec<_> = event
+        .legs
+        .iter()
+        .filter(|leg| leg.kind == iaam_core::event::leg::LegKind::Principal)
+        .collect();
+    assert_eq!(principal_legs.len(), 1);
+    let leg = principal_legs[0];
+    assert_eq!(leg.account, harness.account);
+    assert_eq!(leg.instrument, Some(harness.instrument));
+    assert_eq!(leg.money, Some(*principal));
+    assert_eq!(
+        event.cash_effect(CurrencyCode::Rub).expect("cash effect"),
+        *principal
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn a_conversion_is_recorded_through_the_journal_route() {
     let (harness, path) = harness_on_disk().await;
     seed_instrument_and_custody(&path, &harness).await;
@@ -10119,7 +10196,7 @@ async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
         .expect("stored tax event");
 
     match &event.kind {
-        EventKind::Tax { amount, origin } => {
+        EventKind::Tax { amount, origin, .. } => {
             assert_eq!(amount.amount().raw(), -130_000);
             assert_eq!(*origin, iaam_core::event::kind::TaxOrigin::SelfPaid);
         }
@@ -10143,9 +10220,73 @@ async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
 }
 
 #[tokio::test]
-async fn tax_amounts_are_rejected_per_row_when_not_positive() {
+async fn a_tax_refund_retains_the_named_instrument_and_positive_cash_effect() {
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_id(&path, harness.instrument, "TAX");
+    let body = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "tax",
+            "amount": "-7.30",
+            "instrument": harness.instrument.inner(),
+            "currency": "RUB",
+            "origin": "self_paid",
+            "dates": { "cash_posted": "2026-08-25" },
+            "idempotency_key": "tax-refund",
+        }],
+    });
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events
+        .into_iter()
+        .find(|event| matches!(&event.kind, EventKind::Tax { .. }))
+        .expect("stored tax event");
+
+    match &event.kind {
+        EventKind::Tax {
+            amount,
+            origin,
+            instrument,
+        } => {
+            assert_eq!(*instrument, Some(harness.instrument));
+            assert_eq!(amount.amount().raw(), 730);
+            assert_eq!(*origin, iaam_core::event::kind::TaxOrigin::SelfPaid);
+        }
+        other => panic!("expected a tax event, got {other:?}"),
+    }
+
+    let tax_legs: Vec<_> = event
+        .legs
+        .iter()
+        .filter(|leg| leg.kind == iaam_core::event::leg::LegKind::Tax)
+        .collect();
+    assert_eq!(tax_legs.len(), 1);
+    let leg = tax_legs[0];
+    assert_eq!(leg.account, harness.account);
+    let money = leg.money.expect("tax leg amount");
+    assert_eq!(money.amount().raw(), 730);
+    assert_eq!(money.currency(), CurrencyCode::Rub);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn zero_tax_amount_is_rejected_per_row() {
     let harness = harness().await;
-    for (row, amount) in ["0.00", "-1.00"].into_iter().enumerate() {
+    for (row, amount) in ["0.00"].into_iter().enumerate() {
         let body = json!({
             "source_label": "manual entry",
             "operations": [{
@@ -13926,6 +14067,92 @@ async fn ingest_deposit(
         .and_then(|id| Uuid::parse_str(id).ok())
         .expect("the ingest verdict names the event it recorded")
 }
+#[tokio::test]
+async fn a_securities_transfer_out_round_trips_through_the_journal() {
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
+    let account = harness.account.inner();
+    let instrument = harness.instrument.inner();
+    let body = json!({
+        "source_label": "contract test",
+        "operations": [{
+            "account": account,
+            "type": "securities_transfer_out",
+            "instrument": instrument,
+            "quantity": "2.5",
+            "dates": { "cash_posted": "2026-03-01" },
+            "idempotency_key": "securities-out"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    let rows = journal_events(&harness).await;
+    let row = rows
+        .iter()
+        .find(|row| row["idempotency_key"] == "securities-out")
+        .expect("recorded event");
+    assert_eq!(row["event"], verdicts[0]["event_id"]);
+    assert_eq!(row["account"], account.to_string());
+    assert_eq!(row["kind"], "securities_transfer_out");
+    let legs = row["legs"].as_array().expect("legs");
+    assert_eq!(legs.len(), 1, "{row}");
+    assert_eq!(legs[0]["kind"], "security_quantity");
+    assert_eq!(legs[0]["account"], account.to_string());
+    assert_eq!(legs[0]["instrument"], instrument.to_string());
+    assert_eq!(legs[0]["quantity"], "-2.5");
+    assert!(legs[0].get("custody").is_none());
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_currency_exchange_round_trips_through_the_journal() {
+    let harness = harness().await;
+    let account = harness.account.inner();
+    let body = json!({
+        "source_label": "contract test",
+        "operations": [{
+            "account": account,
+            "type": "currency_exchange",
+            "sold": { "amount": "100.00", "currency": "RUB" },
+            "bought": { "amount": "1.25", "currency": "USD" },
+            "dates": { "cash_posted": "2026-03-01" },
+            "idempotency_key": "currency-exchange"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    let rows = journal_events(&harness).await;
+    let row = rows
+        .iter()
+        .find(|row| row["idempotency_key"] == "currency-exchange")
+        .expect("recorded event");
+    assert_eq!(row["event"], verdicts[0]["event_id"]);
+    assert_eq!(row["account"], account.to_string());
+    assert_eq!(row["kind"], "currency_exchange");
+    let legs = row["legs"].as_array().expect("legs");
+    assert_eq!(legs.len(), 2, "{row}");
+    for (currency, amount) in [("RUB", "-100.00"), ("USD", "1.25")] {
+        let leg = legs
+            .iter()
+            .find(|leg| leg["currency"] == currency)
+            .expect("currency leg");
+        assert_eq!(leg["kind"], "cash");
+        assert_eq!(leg["account"], account.to_string());
+        assert_eq!(leg["amount"], amount);
+    }
+}
+
 async fn create_account(harness: &Harness, title: &str) -> AccountId {
     let (status, body) = call(
         &harness.router,

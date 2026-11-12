@@ -157,9 +157,13 @@ impl HttpClient {
         let rate_limit = numeric_header(headers, "x-ratelimit-limit");
         let rate_remaining = numeric_header(headers, "x-ratelimit-remaining");
         let rate_reset = numeric_header(headers, "x-ratelimit-reset");
-        // The status line with its headers, before the body is read: what
-        // the answer said survives a body that stalls or fails.
-        observe(HttpResponse {
+        // A report 400 needs its code to distinguish an asynchronous pending
+        // task from a refusal. If its body stalls, the durable handoff remains
+        // unresolved and the gateway fails closed instead of guessing.
+        let defer_observation =
+            crate::gateway::is_tinkoff_report_400(request.destination(), request.path(), status);
+        let mut observe = Some(observe);
+        let line = HttpResponse {
             status,
             body: Vec::new(),
             retry_after,
@@ -171,7 +175,10 @@ impl HttpClient {
             rate_remaining,
             rate_reset,
             observed_at: Some(observed_at),
-        });
+        };
+        if !defer_observation {
+            observe.take().expect("observer present")(line.clone());
+        }
         // A status line that arrived is never lost: after a non-2xx status a
         // body that fails or stalls ends the read with what arrived.
         let mut body = Vec::new();
@@ -182,6 +189,11 @@ impl HttpClient {
                 Err(error) if successful => return Err(classify_transport_error(error)),
                 Err(_) => break,
             }
+        }
+        if let Some(observe) = observe {
+            let mut observed = line;
+            observed.body.clone_from(&body);
+            observe(observed);
         }
         Ok(HttpResponse {
             status,

@@ -145,6 +145,7 @@ impl GetOperationsByCursorRequest {
 pub enum InstrumentIdType {
     Uid,
     Figi,
+    PositionUid,
 }
 
 impl InstrumentIdType {
@@ -152,6 +153,7 @@ impl InstrumentIdType {
         match self {
             Self::Uid => "INSTRUMENT_ID_TYPE_UID",
             Self::Figi => "INSTRUMENT_ID_TYPE_FIGI",
+            Self::PositionUid => "INSTRUMENT_ID_TYPE_POSITION_UID",
         }
     }
 }
@@ -202,6 +204,48 @@ impl TinkoffClient {
         .map(|(body, _)| body)
     }
 
+    /// Read currency-specific nominal and settlement reference data.
+    pub async fn get_currency(
+        &self,
+        id: &str,
+        id_type: InstrumentIdType,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            ReadCall {
+                method: Method::Instrument,
+                path: "InstrumentsService/CurrencyBy",
+            },
+            json!({ "idType": id_type.code(), "id": id }),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
+    }
+
+    /// Search broker reference data by a known identifier or name.
+    /// Uses the same service budget, deadline and allowance as instrument reads.
+    pub async fn find_instrument(
+        &self,
+        query: &str,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            ReadCall {
+                method: Method::Instrument,
+                path: "InstrumentsService/FindInstrument",
+            },
+            json!({ "query": query }),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
+    }
+
     /// Return the raw portfolio body from `OperationsService/GetPortfolio`,
     /// beside the moment the answer was observed: the transport's own stamp
     /// for a live answer, and the stored stamp of the first fetch for one
@@ -245,6 +289,47 @@ impl TinkoffClient {
             .await?;
         validate_cursor_page(&body)?;
         Ok(body)
+    }
+
+    /// Start asynchronous report generation for one account and UTC period.
+    pub async fn generate_broker_report(
+        &self,
+        account_id: &str,
+        from: &str,
+        to: &str,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            BROKER_REPORT,
+            json!({"generateBrokerReportRequest": {
+                "accountId": account_id, "from": from, "to": to
+            }}),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
+    }
+
+    /// Read a generated report page through the same bounded gateway.
+    pub async fn get_broker_report(
+        &self,
+        task_id: &str,
+        page: i32,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            BROKER_REPORT,
+            json!({"getBrokerReportRequest": {
+                "taskId": task_id, "page": page
+            }}),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
     }
 
     /// The request path identifies the service budget at the gateway.
@@ -321,6 +406,11 @@ const PORTFOLIO: ReadCall = ReadCall {
 const INSTRUMENT: ReadCall = ReadCall {
     method: Method::Instrument,
     path: "InstrumentsService/GetInstrumentBy",
+};
+
+const BROKER_REPORT: ReadCall = ReadCall {
+    method: Method::BrokerReport,
+    path: "OperationsService/GetBrokerReport",
 };
 
 const OPERATIONS: ReadCall = ReadCall {
@@ -596,6 +686,29 @@ mod tests {
         }
         assert_eq!(InstrumentIdType::Uid.code(), "INSTRUMENT_ID_TYPE_UID");
         assert_eq!(InstrumentIdType::Figi.code(), "INSTRUMENT_ID_TYPE_FIGI");
+        assert_eq!(
+            InstrumentIdType::PositionUid.code(),
+            "INSTRUMENT_ID_TYPE_POSITION_UID"
+        );
+    }
+
+    #[tokio::test]
+    async fn instrument_search_uses_the_selected_environment_and_shared_gateway() {
+        for environment in [Environment::Prod, Environment::Sandbox] {
+            let (client, paths, _) =
+                client_in(environment, vec![answer(200, r#"{"instruments":[]}"#)]);
+            client
+                .find_instrument("invented-uid", None, &RequestAllowance::new(1))
+                .await
+                .expect("instrument search succeeds");
+            assert_eq!(
+                *paths.lock().expect("paths"),
+                [format!(
+                    "{}/{PACKAGE}.InstrumentsService/FindInstrument",
+                    environment.base_url()
+                )]
+            );
+        }
     }
 
     #[tokio::test]

@@ -1043,6 +1043,11 @@ fn kind_aspects(kind: &EventKind) -> KindAspects {
             ]),
             confidence: Vec::new(),
         },
+        EventKind::CurrencyExchange { sold, bought } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Money(*sold), KindFigure::Money(*bought)],
+            confidence: Vec::new(),
+        },
         // Seven families whose whole claim is one sum. The unresolved
         // own-account movement and the stated securities value are the two
         // that post no leg to repeat it — the second because it names no
@@ -1088,9 +1093,27 @@ fn kind_aspects(kind: &EventKind) -> KindAspects {
             moved: vec![KindFigure::Money(*amount)],
             confidence: Vec::new(),
         },
-        EventKind::Tax { amount, origin } => KindAspects {
+        EventKind::Tax {
+            amount,
+            origin,
+            instrument,
+        } => KindAspects {
             word: vec![KindWord::Tax(*origin)],
-            moved: vec![KindFigure::Money(*amount)],
+            moved: figures([
+                instrument.map(KindFigure::Instrument),
+                Some(KindFigure::Money(*amount)),
+            ]),
+            confidence: Vec::new(),
+        },
+        EventKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: vec![
+                KindFigure::Instrument(*instrument),
+                KindFigure::Quantity(*quantity),
+            ],
             confidence: Vec::new(),
         },
         EventKind::OpeningPosition {
@@ -2237,7 +2260,11 @@ mod tests {
             ..ctx.deposit(1, -1_200, ctx.main)
         };
         let tax = |origin| iaam_core::event::Event {
-            kind: EventKind::Tax { amount, origin },
+            kind: EventKind::Tax {
+                amount,
+                origin,
+                instrument: None,
+            },
             ..ctx.deposit(2, -1_200, ctx.main)
         };
 

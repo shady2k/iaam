@@ -78,6 +78,8 @@ impl OperationDates {
 /// written by `build`, not by the caller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OperationKind {
+    /// Exchange two currencies within the operation account.
+    CurrencyExchange { sold: Money, bought: Money },
     /// Money the account received from **outside** the owner's own accounts.
     ///
     /// Becomes `CashIn`, whose flow endpoints say the other side is a
@@ -226,6 +228,11 @@ pub enum OperationKind {
         accrued_interest_minor: Option<i64>,
         currency: CurrencyCode,
     },
+    /// Securities left the account without cash; the destination is unknown.
+    SecuritiesTransferOut {
+        instrument: InstrumentId,
+        quantity: Dec,
+    },
     /// A coupon, dividend or interest payment actually received.
     ///
     /// `instrument` is optional because interest on a cash balance belongs to no
@@ -253,14 +260,14 @@ pub enum OperationKind {
     },
     /// Tax, whether a broker withheld it or the owner paid it himself.
     ///
-    /// Submitted positive and recorded negative, on a tax leg. `origin` is the
-    /// distinction that matters afterwards, and it is stated rather than
-    /// inferred: withheld tax has already left the account, and self-paid tax is
-    /// a payment the owner made.
+    /// A positive amount is a charge; a negative amount is a refund.
+    /// The journal records the opposite sign as the cash effect on a tax leg.
     Tax {
         amount_minor: i64,
         currency: CurrencyCode,
         origin: TaxOrigin,
+        #[serde(default)]
+        instrument: Option<InstrumentId>,
     },
     /// The cash a reconstructed account already held before the journal begins.
     ///
@@ -636,6 +643,29 @@ fn build(
 ) -> Result<(EventKind, Vec<Leg>), Rejection> {
     let account = operation.account;
     match kind {
+        OperationKind::CurrencyExchange { sold, bought } => {
+            positive(sold.amount().raw(), "sold", sold.currency())?;
+            positive(bought.amount().raw(), "bought", bought.currency())?;
+            if sold.currency() == bought.currency() {
+                return Err(Rejection {
+                    field: "bought".into(),
+                    expected: "a currency different from sold".into(),
+                    actual: format!("{:?}", bought.currency()),
+                });
+            }
+            let outgoing = sold.checked_negate().map_err(|error| Rejection {
+                field: "sold".into(),
+                expected: "representable amount".into(),
+                actual: error.to_string(),
+            })?;
+            Ok((
+                EventKind::CurrencyExchange {
+                    sold: *sold,
+                    bought: *bought,
+                },
+                vec![Leg::cash(account, outgoing), Leg::cash(account, *bought)],
+            ))
+        }
         OperationKind::Deposit {
             amount_minor,
             currency,
@@ -839,12 +869,23 @@ fn build(
             amount_minor,
             currency,
             origin,
+            instrument,
         } => {
-            let amount = money(-positive(*amount_minor, "amount", *currency)?, *currency);
+            let signed = amount_minor
+                .checked_neg()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| Rejection {
+                    field: "amount".to_owned(),
+                    expected: "nonzero tax charge or refund with representable opposite sign"
+                        .to_owned(),
+                    actual: amount_minor.to_string(),
+                })?;
+            let amount = money(signed, *currency);
             Ok((
                 EventKind::Tax {
                     amount,
                     origin: *origin,
+                    instrument: *instrument,
                 },
                 vec![Leg::tax(account, amount)],
             ))
@@ -867,6 +908,30 @@ fn build(
         } => {
             let amount = money(positive(*amount_minor, "amount", *currency)?, *currency);
             Ok((EventKind::StatedSecuritiesValue { amount }, Vec::new()))
+        }
+        OperationKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        } => {
+            if !quantity.is_positive() {
+                return Err(Rejection {
+                    field: "quantity".into(),
+                    expected: "positive quantity".into(),
+                    actual: quantity.inner().to_string(),
+                });
+            }
+            let outgoing = quantity.checked_neg().map_err(|error| Rejection {
+                field: "quantity".into(),
+                expected: "representable quantity".into(),
+                actual: error.to_string(),
+            })?;
+            Ok((
+                EventKind::SecuritiesTransferOut {
+                    instrument: *instrument,
+                    quantity: Quantity(*quantity),
+                },
+                vec![security_leg(account, None, *instrument, Quantity(outgoing))],
+            ))
         }
         OperationKind::OpeningPosition {
             instrument,

@@ -62,6 +62,8 @@ pub(crate) fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> 
                 .into_iter()
                 .collect()
         }
+        OperationKind::CurrencyExchange { .. } => [Dimension::Cash].into_iter().collect(),
+        OperationKind::SecuritiesTransferOut { .. } => [Dimension::Positions, Dimension::TaxBasis].into_iter().collect(),
         OperationKind::Income { .. } => [Dimension::Cash, Dimension::Income].into_iter().collect(),
         // Tax payments move cash without changing any position's basis; use Cash, not TaxBasis.
         OperationKind::Deposit { .. }

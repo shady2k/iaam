@@ -35,9 +35,10 @@ use super::category_index;
 use super::kind::to_rows;
 use super::read::hydrate_one;
 use super::rows::{
-    CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail, DetailRows,
-    EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow,
-    StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow, ValuationRow,
+    CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
+    CurrencyExchangeRow, DetailRows, EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow,
+    OpeningPositionRow, SecuritiesTransferOutRow, StatedSecuritiesValueRow, TaxRow, TradeRow,
+    UnresolvedMovementRow, ValuationRow,
 };
 use crate::StoreError;
 
@@ -294,7 +295,9 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
     match detail {
         DetailRows::None => Ok(()),
         DetailRows::Trade(row) => insert_trade(tx, row),
+        DetailRows::SecuritiesTransferOut(row) => insert_securities_transfer_out(tx, row),
         DetailRows::CashTransfer(row) => insert_cash_transfer(tx, row),
+        DetailRows::CurrencyExchange(row) => insert_currency_exchange(tx, row),
         DetailRows::UnresolvedMovement(row) => insert_unresolved_movement(tx, row),
         DetailRows::Income(row) => insert_income(tx, row),
         DetailRows::Fee(row) => insert_fee(tx, row),
@@ -307,6 +310,22 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
         DetailRows::CorporateAction(row) => insert_corporate_action(tx, row),
         DetailRows::OfferExercise(row) => insert_offer_exercise(tx, row),
     }
+}
+
+fn insert_securities_transfer_out(
+    tx: &Transaction<'_>,
+    row: &SecuritiesTransferOutRow,
+) -> Result<(), StoreError> {
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_securities_transfer_out (event, instrument, quantity) VALUES (?1, ?2, ?3)",
+            params![row.event, row.instrument, row.quantity],
+        ),
+        "insert_securities_transfer_out_detail",
+        "event_securities_transfer_out",
+        event_id = row.event
+    )?;
+    Ok(())
 }
 
 fn insert_trade(tx: &Transaction<'_>, row: &TradeRow) -> Result<(), StoreError> {
@@ -339,6 +358,17 @@ fn insert_trade(tx: &Transaction<'_>, row: &TradeRow) -> Result<(), StoreError> 
         "event_trade",
         event_id = row.event,
         instrument_id = row.instrument
+    )?;
+    Ok(())
+}
+
+fn insert_currency_exchange(
+    tx: &Transaction<'_>,
+    row: &CurrencyExchangeRow,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO event_currency_exchange (event, sold_amount, sold_currency, bought_amount, bought_currency) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![row.event, row.sold_amount, row.sold_currency, row.bought_amount, row.bought_currency],
     )?;
     Ok(())
 }
@@ -406,8 +436,8 @@ fn insert_fee(tx: &Transaction<'_>, row: &FeeRow) -> Result<(), StoreError> {
 fn insert_tax(tx: &Transaction<'_>, row: &TaxRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
-            "INSERT INTO event_tax (event, origin) VALUES (?1,?2)",
-            params![row.event, row.origin],
+            "INSERT INTO event_tax (event, origin, instrument) VALUES (?1,?2,?3)",
+            params![row.event, row.origin, row.instrument],
         ),
         "insert_tax_detail",
         "event_tax",
@@ -585,8 +615,9 @@ fn insert_corporate_action(
             principal_returned_per_unit_value, principal_returned_per_unit_currency,
             fractional, basis_transfer, effective_date, record_date, grounds,
             allocation_kind, allocation_gap, allocation_share,
-            allocation_inputs_hash, allocation_known_as_of, allocation_algorithm
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+            allocation_inputs_hash, allocation_known_as_of, allocation_algorithm,
+            posted_principal_minor, posted_principal_currency
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
         params![
             row.event,
             row.action_kind,
@@ -611,6 +642,8 @@ fn insert_corporate_action(
             row.allocation_inputs_hash,
             row.allocation_known_as_of,
             row.allocation_algorithm,
+            row.posted_principal_minor,
+            row.posted_principal_currency,
         ],
     ), "insert_corporate_action_detail", "event_corporate_action", event_id = row.event, instrument_id = row.instrument, predecessor = row.predecessor, successor = row.successor, custody = row.custody)?;
     Ok(())
@@ -686,6 +719,7 @@ mod tests {
         "event_legs",
         "event_trade",
         "event_cash_transfer",
+        "event_currency_exchange",
         "event_unresolved_movement",
         "event_income",
         "event_fee",
@@ -1337,6 +1371,33 @@ mod tests {
     }
 
     // --- Digest stability (spec §9) --------------------------------------
+
+    #[test]
+    fn tax_instrument_and_signed_cash_round_trip_through_sql() {
+        let mut store = open_store();
+        let fixture = Fixture::new(&store);
+        for instrument in [None, Some(fixture.instrument)] {
+            for raw in [-1_300, 1_300] {
+                let amount = Money::new(PostedMinor::new(raw), CurrencyCode::Rub);
+                let event = fixture.base_event(
+                    1,
+                    EventKind::Tax {
+                        amount,
+                        origin: iaam_core::event::kind::TaxOrigin::WithheldAtSource,
+                        instrument,
+                    },
+                    vec![Leg::tax(fixture.account, amount)],
+                );
+                let tx = store.connection_mut().transaction().expect("open tx");
+                insert_event_in(&tx, &event).expect("insert tax");
+                let reconstructed = hydrate_one(&tx, event.id)
+                    .expect("hydrate tax")
+                    .expect("tax exists");
+                assert_eq!(reconstructed, event);
+                tx.rollback().expect("rollback fixture");
+            }
+        }
+    }
 
     #[test]
     fn a_round_tripped_event_encodes_to_identical_cbor() {

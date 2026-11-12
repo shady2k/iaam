@@ -126,6 +126,44 @@ fn an_event_survives_a_write_and_a_read() {
 }
 
 #[test]
+fn outbound_securities_transfer_round_trips() {
+    use iaam_core::ids::InstrumentId;
+    use iaam_core::money::Quantity;
+    use iaam_core::numeric::decimal::Dec;
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    insert_account(&store, &ctx);
+    let instrument = InstrumentId::new_random();
+    store
+        .upsert_instrument(&iaam_store::reference::InstrumentRecord {
+            id: instrument,
+            kind: None,
+            symbol: "TRANSFER-FIXTURE".into(),
+            title: "Invented transferred security".into(),
+            currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+            metadata: None,
+        })
+        .unwrap();
+    let quantity = Quantity(Dec::one());
+    let mut event = bookkeeping_event(
+        &ctx,
+        1,
+        EventKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        },
+    );
+    event.legs = vec![Leg::security_without_custody(
+        ctx.account,
+        instrument,
+        Quantity(Dec::one().checked_neg().unwrap()),
+    )];
+    store.append_event(&event, IdentityScope::Source).unwrap();
+    assert_eq!(store.load_events(ctx.owner).unwrap(), vec![event]);
+}
+
+#[test]
 fn journal_relation_projection_does_not_decode_event_payloads() {
     let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();

@@ -366,7 +366,9 @@ pub trait Transport: Send + Sync {
             handoff()?;
             let response = self.send(request).await?;
             let mut observed = response.clone();
-            observed.body = Vec::new();
+            if !is_tinkoff_report_400(request.destination(), request.path(), response.status) {
+                observed.body = Vec::new();
+            }
             observe(observed);
             Ok(response)
         }
@@ -979,6 +981,30 @@ impl BudgetTable {
     }
 }
 
+pub(crate) fn is_tinkoff_report_400(destination: Destination, path: &str, status: u16) -> bool {
+    matches!(
+        destination,
+        Destination::TinkoffProd | Destination::TinkoffSandbox
+    ) && matches!(
+        path.trim_start_matches('/'),
+        "OperationsService/GetBrokerReport"
+            | "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
+    ) && status == 400
+}
+
+fn is_tinkoff_report_pending(
+    destination: Destination,
+    path: &str,
+    status: u16,
+    body: &[u8],
+) -> bool {
+    is_tinkoff_report_400(destination, path, status)
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("code").cloned())
+            .is_some_and(|code| code.as_str() == Some("30058") || code.as_u64() == Some(30058))
+}
+
 fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static str> {
     match destination {
         Destination::TinkoffProd | Destination::TinkoffSandbox => {
@@ -988,9 +1014,15 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
                 "tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio"
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor"
                 | "OperationsService/GetPortfolio"
-                | "OperationsService/GetOperationsByCursor" => Some("OperationsService"),
+                | "OperationsService/GetOperationsByCursor"
+                | "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
+                | "OperationsService/GetBrokerReport" => Some("OperationsService"),
                 "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
-                | "InstrumentsService/GetInstrumentBy" => Some("InstrumentsService"),
+                | "InstrumentsService/GetInstrumentBy"
+                | "tinkoff.public.invest.api.contract.v1.InstrumentsService/CurrencyBy"
+                | "InstrumentsService/CurrencyBy"
+                | "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
+                | "InstrumentsService/FindInstrument" => Some("InstrumentsService"),
                 _ => None,
             }
         }
@@ -2093,6 +2125,12 @@ impl<T: Transport + 'static> Gateway<T> {
                                 rate_reset = observed.rate_reset,
                                 "outbound broker response"
                             );
+                            let report_pending = is_tinkoff_report_pending(
+                                destination,
+                                observed_request.path(),
+                                observed.status,
+                                &observed.body,
+                            );
                             if !crate::tally::is_instrument_lookup_miss(
                                 destination.base_url(),
                                 observed_request.path(),
@@ -2108,10 +2146,10 @@ impl<T: Transport + 'static> Gateway<T> {
                             let retry_after =
                                 observed.retry_after.map(|delay| delay.min(TALLY_RETENTION));
                             let recorded = callback_tally
-                                .record_response_for_request(
+                                .record_response_with_pending(
                                     destination.base_url(),
                                     observed_request.path(),
-                                    observed.status,
+                                    (observed.status, report_pending),
                                     retry_after,
                                     callback_clock.as_ref(),
                                 )
@@ -3014,6 +3052,10 @@ mod tests {
             for path in [
                 "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
                 "/InstrumentsService/GetInstrumentBy",
+                "/tinkoff.public.invest.api.contract.v1.InstrumentsService/CurrencyBy",
+                "/InstrumentsService/CurrencyBy",
+                "/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
+                "/InstrumentsService/FindInstrument",
             ] {
                 assert_eq!(
                     broker_budget_key(destination, path),
@@ -3523,6 +3565,49 @@ mod tests {
             Err(GatewayError::BrokerHostClosed { attempts: 0, .. })
         ));
         assert_eq!(gateway.transport.sent_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_broker_report_does_not_close_host() {
+        let time = FakeTime::new();
+        let pending = HttpResponse {
+            body: br#"{"code":30058}"#.to_vec(),
+            ..status(400)
+        };
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(pending.clone()))
+                .then(Ok(pending.clone()))
+                .then(Ok(pending)),
+        );
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(10))
+        .idempotent();
+        for _ in 0..3 {
+            assert!(matches!(
+                gateway.send(&request, None).await,
+                Err(GatewayError::Rejected { status: 400, .. })
+            ));
+            time.advance(Duration::from_secs(1));
+        }
+        assert_eq!(gateway.send(&request, None).await.unwrap().status, 200);
+        assert!(!super::is_tinkoff_report_pending(
+            Destination::TinkoffProd,
+            "/OperationsService/GetBrokerReport",
+            400,
+            br#"{"code":123}"#
+        ));
+        assert!(!super::is_tinkoff_report_pending(
+            Destination::TinkoffProd,
+            "/OperationsService/GetPortfolio",
+            400,
+            br#"{"code":30058}"#
+        ));
     }
 
     #[tokio::test(start_paused = true)]

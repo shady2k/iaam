@@ -93,6 +93,8 @@ pub enum EventValidationError {
         kind: &'static str,
         field: &'static str,
     },
+    #[error("invalid redemption principal: {0}")]
+    RedemptionPrincipal(#[from] crate::money::ReturnedPrincipalError),
     #[error("for {kind} basis_fee and basis_fee_exact must be present together")]
     BasisFeePresenceMismatch { kind: &'static str },
     #[error(
@@ -282,6 +284,8 @@ impl Event {
                 OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {}
             },
             EventKind::Trade { .. }
+            | EventKind::CurrencyExchange { .. }
+            | EventKind::SecuritiesTransferOut { .. }
             | EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
             | EventKind::Refund { .. }
@@ -325,6 +329,9 @@ impl Event {
     pub fn validate_structure(&self) -> Result<(), EventValidationError> {
         let name = self.kind.discriminant();
         match &self.kind {
+            EventKind::CurrencyExchange { sold, bought } => {
+                self.validate_currency_exchange(name, *sold, *bought)
+            }
             EventKind::CashIn { amount } => self.expect_single_cash(name, *amount, Sign::Positive),
             EventKind::CashOut { amount } => self.expect_single_cash(name, *amount, Sign::Negative),
             EventKind::Refund { amount } => self.expect_single_cash(name, *amount, Sign::Positive),
@@ -374,6 +381,19 @@ impl Event {
                 quantity,
                 ..
             } => self.validate_opening_position(name, *instrument, *quantity),
+            EventKind::SecuritiesTransferOut {
+                instrument,
+                quantity,
+            } => {
+                require_positive_quantity(name, "quantity", *quantity)?;
+                let outgoing = Quantity(quantity.0.checked_neg().map_err(|_| {
+                    EventValidationError::LegDoesNotMatchEvent {
+                        kind: name,
+                        field: "quantity",
+                    }
+                })?);
+                self.validate_opening_position_leg(name, *instrument, outgoing)
+            }
             EventKind::Valuation { price, .. } => self.validate_valuation(name, *price),
             EventKind::ControlAssertion { period, claim } => {
                 self.validate_control_assertion(name, *period, *claim)
@@ -387,6 +407,49 @@ impl Event {
             EventKind::CorporateAction { action } => self.validate_corporate_action(name, action),
             EventKind::OfferExercise { action } => self.validate_offer_exercise(name, action),
         }
+    }
+
+    fn validate_currency_exchange(
+        &self,
+        name: &'static str,
+        sold: Money,
+        bought: Money,
+    ) -> Result<(), EventValidationError> {
+        require_positive(name, "sold", sold.amount().raw())?;
+        require_positive(name, "bought", bought.amount().raw())?;
+        if sold.currency() == bought.currency() {
+            return Err(EventValidationError::LegDoesNotMatchEvent {
+                kind: name,
+                field: "currencies",
+            });
+        }
+        if self.legs.len() != 2 {
+            return Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "exactly two cash legs",
+                found: self.legs.len(),
+            });
+        }
+        let outgoing = Money::new(
+            sold.amount().checked_neg().ok_or(MoneyError::Overflow)?,
+            sold.currency(),
+        );
+        for expected in [outgoing, bought] {
+            if !self.legs.iter().any(|leg| {
+                leg.kind == LegKind::Cash
+                    && leg.account == self.account
+                    && leg.money == Some(expected)
+                    && leg.custody.is_none()
+                    && leg.instrument.is_none()
+                    && leg.quantity.is_none()
+            }) {
+                return Err(EventValidationError::LegDoesNotMatchEvent {
+                    kind: name,
+                    field: "cash legs",
+                });
+            }
+        }
+        Ok(())
     }
 
     fn expect_single_cash(
@@ -432,7 +495,7 @@ impl Event {
         require_equal(name, money, declared)
     }
 
-    /// Tax: exactly one negative tax leg, equal to the declared amount.
+    /// Tax: exactly one nonzero tax leg, equal to the declared cash effect.
     ///
     /// Deliberately a separate function from `validate_fee` rather than a
     /// shared one parameterised by leg kind: the two shapes are equal today by
@@ -445,7 +508,7 @@ impl Event {
     ) -> Result<(), EventValidationError> {
         let tax_legs = self.legs_of_kind(LegKind::Tax);
         let money = single_leg_money(name, &tax_legs, "exactly one tax leg")?;
-        if money.amount().raw() >= 0 {
+        if money.amount().raw() == 0 {
             return Err(EventValidationError::WrongSign {
                 kind: name,
                 amount: money.amount().raw(),
@@ -770,10 +833,19 @@ impl Event {
                 custody,
                 quantity,
                 compensation,
+                principal_returned_per_unit,
                 ..
             } => {
                 require_positive(name, "compensation", compensation.amount().raw())?;
                 require_positive_quantity(name, "quantity", *quantity)?;
+                principal_returned_per_unit.per_unit_exact(*quantity)?;
+                if principal_returned_per_unit.currency() != compensation.currency() {
+                    return Err(MoneyError::CurrencyMismatch {
+                        left: principal_returned_per_unit.currency(),
+                        right: compensation.currency(),
+                    }
+                    .into());
+                }
                 self.expect_legs(
                     name,
                     &[
@@ -876,6 +948,15 @@ impl Event {
         quantity: Quantity,
     ) -> Result<(), EventValidationError> {
         require_positive_quantity(name, "quantity", quantity)?;
+        self.validate_opening_position_leg(name, instrument, quantity)
+    }
+
+    fn validate_opening_position_leg(
+        &self,
+        name: &'static str,
+        instrument: InstrumentId,
+        quantity: Quantity,
+    ) -> Result<(), EventValidationError> {
         let cash = self.cash_legs();
         if !cash.is_empty() {
             return Err(EventValidationError::LegCount {
@@ -1421,6 +1502,64 @@ mod tests {
     use crate::reconciliation::Dimension;
     use time::macros::date;
 
+    #[test]
+    fn exchange_changes_cash_balances_without_creating_lots() {
+        use crate::projection::balances::Balances;
+        use crate::projection::lots::LotBook;
+        use crate::rules::{LotRuleVersion, RuleRegistry};
+        let account = AccountId::new_random();
+        let gold = Money::new(PostedMinor::new(2_000), CurrencyCode::Xau);
+        let exchange = event(
+            EventKind::CurrencyExchange {
+                sold: rub(100_000),
+                bought: gold,
+            },
+            vec![Leg::cash(account, rub(-100_000)), Leg::cash(account, gold)],
+            account,
+        );
+        let mut balances = Balances::new();
+        balances.apply(&exchange).unwrap();
+        assert_eq!(
+            balances.cash(account, CurrencyCode::Rub),
+            Some(rub(-100_000))
+        );
+        assert_eq!(balances.cash(account, CurrencyCode::Xau), Some(gold));
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&exchange, &RuleRegistry::with_defaults())
+            .unwrap();
+        assert_eq!(book.iter().count(), 0);
+    }
+
+    #[test]
+    fn currency_exchange_requires_two_opposite_cash_legs_on_one_account() {
+        let account = AccountId::new_random();
+        let kind = EventKind::CurrencyExchange {
+            sold: rub(100),
+            bought: usd(2),
+        };
+        let good = vec![Leg::cash(account, rub(-100)), Leg::cash(account, usd(2))];
+        assert!(
+            event(kind.clone(), good.clone(), account)
+                .validate_structure()
+                .is_ok()
+        );
+        let mut wrong = good.clone();
+        wrong[1].account = AccountId::new_random();
+        assert!(
+            event(kind.clone(), wrong, account)
+                .validate_structure()
+                .is_err()
+        );
+        let mut extra = good.clone();
+        extra.push(Leg::fee(account, rub(-1)));
+        assert!(event(kind, extra, account).validate_structure().is_err());
+        let same = EventKind::CurrencyExchange {
+            sold: rub(100),
+            bought: rub(2),
+        };
+        assert!(event(same, good, account).validate_structure().is_err());
+    }
+
     // Amounts are written in minimal units as one number: grouping
     // like `50_000_00` does not compile (`clippy::inconsistent_digit_grouping`
     // is included in `all`, and `all = deny`).
@@ -1562,7 +1701,9 @@ mod tests {
                         instrument: self.instrument,
                         custody: Some(self.custody),
                         quantity: qty(10),
-                        principal_returned_per_unit: Self::per_unit("800"),
+                        principal_returned_per_unit: crate::money::ReturnedPrincipal::PerUnit(
+                            Self::per_unit("800"),
+                        ),
                         compensation: rub(1_000_000),
                         effective_date: date!(2026 - 12 - 15),
                         record_date: None,
@@ -2103,6 +2244,7 @@ mod tests {
         let account = AccountId::new_random();
         event(
             EventKind::Tax {
+                instrument: None,
                 amount,
                 origin: TaxOrigin::SelfPaid,
             },
@@ -2118,10 +2260,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tax_positive_leg_is_rejected() {
-        // A tax that increases the balance is not a tax. Taking the absolute
-        // value here is how a refund silently becomes a charge.
+    fn a_tax_refund_has_a_positive_tax_leg() {
         let event = tax_event(rub(130_000), rub(130_000));
+        assert!(event.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn a_zero_tax_leg_is_rejected() {
+        let event = tax_event(rub(0), rub(0));
         assert!(matches!(
             event.validate_structure(),
             Err(EventValidationError::WrongSign { .. })
@@ -2133,6 +2279,7 @@ mod tests {
         let account = AccountId::new_random();
         let event = event(
             EventKind::Tax {
+                instrument: None,
                 amount: rub(-130_000),
                 origin: TaxOrigin::WithheldAtSource,
             },
@@ -2150,6 +2297,7 @@ mod tests {
         let account = AccountId::new_random();
         let event = event(
             EventKind::Tax {
+                instrument: None,
                 amount: rub(-130_000),
                 origin: TaxOrigin::SelfPaid,
             },
@@ -2168,6 +2316,7 @@ mod tests {
     #[test]
     fn a_tax_names_itself_and_stays_within_the_account() {
         let kind = EventKind::Tax {
+            instrument: None,
             amount: rub(-1),
             origin: TaxOrigin::SelfPaid,
         };

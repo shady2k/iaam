@@ -101,6 +101,23 @@ fn every_kind() -> Vec<Event> {
             ],
         ),
         envelope(
+            EventKind::SecuritiesTransferOut {
+                instrument,
+                quantity: qty(3),
+            },
+            vec![Leg::security(account, custody, instrument, qty(-3))],
+        ),
+        envelope(
+            EventKind::CurrencyExchange {
+                sold: rub(100),
+                bought: Money::new(PostedMinor::new(2), CurrencyCode::Usd),
+            },
+            vec![
+                Leg::cash(account, rub(-100)),
+                Leg::cash(account, Money::new(PostedMinor::new(2), CurrencyCode::Usd)),
+            ],
+        ),
+        envelope(
             EventKind::CashIn { amount: rub(1) },
             vec![Leg::cash(account, rub(1))],
         ),
@@ -150,6 +167,7 @@ fn every_kind() -> Vec<Event> {
         ),
         envelope(
             EventKind::Tax {
+                instrument: None,
                 amount: rub(-17),
                 origin: TaxOrigin::WithheldAtSource,
             },
@@ -249,7 +267,9 @@ fn every_kind() -> Vec<Event> {
                     instrument,
                     custody: Some(custody),
                     quantity: qty(10),
-                    principal_returned_per_unit: per_unit("800.0000"),
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                        per_unit("800.0000"),
+                    ),
                     compensation: rub(800_000),
                     effective_date: date!(2026 - 12 - 15),
                     record_date: None,
@@ -339,7 +359,9 @@ fn is_known(kind: &EventKind) -> bool {
         | EventKind::Income { .. }
         | EventKind::Fee { .. }
         | EventKind::Tax { .. }
+        | EventKind::SecuritiesTransferOut { .. }
         | EventKind::OpeningPosition { .. }
+        | EventKind::CurrencyExchange { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::StatedSecuritiesValue { .. }
         | EventKind::Valuation { .. }

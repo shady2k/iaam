@@ -27,9 +27,10 @@ use rusqlite::{Connection, params_from_iter};
 use super::kind::from_rows;
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
-    CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow, FeeRow,
-    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, StatedSecuritiesValueRow, TaxRow,
-    TradeRow, UnresolvedMovementRow, ValuationRow,
+    CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, CurrencyExchangeRow, DetailRows,
+    EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow,
+    SecuritiesTransferOutRow, StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow,
+    ValuationRow,
 };
 use crate::StoreError;
 
@@ -202,6 +203,28 @@ fn load_trade(conn: &Connection, ids: &[String]) -> Result<Vec<TradeRow>, StoreE
         .map_err(StoreError::from)
 }
 
+fn load_currency_exchange(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<CurrencyExchangeRow>, StoreError> {
+    let sql = format!(
+        "SELECT * FROM event_currency_exchange WHERE event IN ({})",
+        placeholders(ids.len())
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(ids), |row| {
+        Ok(CurrencyExchangeRow {
+            event: row.get("event")?,
+            sold_amount: row.get("sold_amount")?,
+            sold_currency: row.get("sold_currency")?,
+            bought_amount: row.get("bought_amount")?,
+            bought_currency: row.get("bought_currency")?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
 fn load_cash_transfer(
     conn: &Connection,
     ids: &[String],
@@ -286,6 +309,7 @@ fn load_tax(conn: &Connection, ids: &[String]) -> Result<Vec<TaxRow>, StoreError
         Ok(TaxRow {
             event: row.get("event")?,
             origin: row.get("origin")?,
+            instrument: row.get("instrument")?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -336,6 +360,26 @@ fn load_valuation(conn: &Connection, ids: &[String]) -> Result<Vec<ValuationRow>
             price: row.get("price")?,
             currency: row.get("currency")?,
             quality: row.get("quality")?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
+fn load_securities_transfer_out(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<SecuritiesTransferOutRow>, StoreError> {
+    let sql = format!(
+        "SELECT * FROM event_securities_transfer_out WHERE event IN ({})",
+        placeholders(ids.len())
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(ids), |row| {
+        Ok(SecuritiesTransferOutRow {
+            event: row.get("event")?,
+            instrument: row.get("instrument")?,
+            quantity: row.get("quantity")?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -476,6 +520,8 @@ fn load_corporate_action(
             principal_returned_per_unit_value: row.get("principal_returned_per_unit_value")?,
             principal_returned_per_unit_currency: row
                 .get("principal_returned_per_unit_currency")?,
+            posted_principal_minor: row.get("posted_principal_minor")?,
+            posted_principal_currency: row.get("posted_principal_currency")?,
             fractional: row.get("fractional")?,
             basis_transfer: row.get("basis_transfer")?,
             effective_date: row.get("effective_date")?,
@@ -538,6 +584,9 @@ fn load_details(
     for row in load_trade(conn, ids)? {
         map.insert(row.event.clone(), DetailRows::Trade(row));
     }
+    for row in load_currency_exchange(conn, ids)? {
+        map.insert(row.event.clone(), DetailRows::CurrencyExchange(row));
+    }
     for row in load_cash_transfer(conn, ids)? {
         map.insert(row.event.clone(), DetailRows::CashTransfer(row));
     }
@@ -558,6 +607,9 @@ fn load_details(
             row.event.clone(),
             DetailRows::OpeningPosition(Box::new(row)),
         );
+    }
+    for row in load_securities_transfer_out(conn, ids)? {
+        map.insert(row.event.clone(), DetailRows::SecuritiesTransferOut(row));
     }
     for row in load_stated_securities_value(conn, ids)? {
         map.insert(row.event.clone(), DetailRows::StatedSecuritiesValue(row));
@@ -847,7 +899,16 @@ mod tests {
         match detail {
             DetailRows::None => {}
             DetailRows::Trade(row) => insert_trade(conn, &row),
+            DetailRows::SecuritiesTransferOut(row) => {
+                conn.execute(
+                    "INSERT INTO event_securities_transfer_out (event, instrument, quantity) VALUES (?1, ?2, ?3)",
+                    params![row.event, row.instrument, row.quantity],
+                ).expect("insert securities transfer out detail");
+            }
             DetailRows::CashTransfer(row) => insert_cash_transfer(conn, &row),
+            DetailRows::CurrencyExchange(row) => {
+                conn.execute("INSERT INTO event_currency_exchange (event, sold_amount, sold_currency, bought_amount, bought_currency) VALUES (?1, ?2, ?3, ?4, ?5)", params![row.event, row.sold_amount, row.sold_currency, row.bought_amount, row.bought_currency]).expect("insert currency exchange");
+            }
             DetailRows::UnresolvedMovement(row) => insert_unresolved_movement(conn, &row),
             DetailRows::Income(row) => insert_income(conn, &row),
             DetailRows::Fee(row) => insert_fee(conn, &row),
@@ -925,8 +986,8 @@ mod tests {
 
     fn insert_tax(conn: &rusqlite::Connection, row: &TaxRow) {
         conn.execute(
-            "INSERT INTO event_tax (event, origin) VALUES (?1,?2)",
-            params![row.event, row.origin],
+            "INSERT INTO event_tax (event, origin, instrument) VALUES (?1,?2,?3)",
+            params![row.event, row.origin, row.instrument],
         )
         .expect("insert tax detail");
     }
@@ -1057,8 +1118,9 @@ mod tests {
                 principal_returned_per_unit_value, principal_returned_per_unit_currency,
                 fractional, basis_transfer, effective_date, record_date, grounds,
                 allocation_kind, allocation_gap, allocation_share,
-                allocation_inputs_hash, allocation_known_as_of, allocation_algorithm
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                allocation_inputs_hash, allocation_known_as_of, allocation_algorithm,
+                posted_principal_minor, posted_principal_currency
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
             params![
                 row.event,
                 row.action_kind,
@@ -1083,6 +1145,8 @@ mod tests {
                 row.allocation_inputs_hash,
                 row.allocation_known_as_of,
                 row.allocation_algorithm,
+                row.posted_principal_minor,
+                row.posted_principal_currency,
             ],
         )
         .expect("insert corporate action detail");

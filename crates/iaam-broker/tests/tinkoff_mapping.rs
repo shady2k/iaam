@@ -24,6 +24,71 @@ fn dec(text: &str) -> Dec {
 }
 
 #[test]
+fn tax_rows_preserve_signed_payment_and_named_instrument() -> Result<(), Box<dyn Error>> {
+    use iaam_broker::operation_kind::{ChannelOperationKind, OperationKindDictionary};
+    use iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS;
+
+    let (dictionary, unreadable) =
+        OperationKindDictionary::build(TINKOFF_OPERATION_KINDS.iter().copied());
+    assert!(unreadable.is_empty());
+    for (source_kind, units, nano, expected_minor, instrument) in [
+        (
+            "OPERATION_TYPE_DIVIDEND_TAX",
+            "-11",
+            -250_000_000,
+            -1125,
+            Some("00000000-0000-4000-8000-000000000071"),
+        ),
+        ("OPERATION_TYPE_TAX", "-8", 0, -800, None),
+        (
+            "OPERATION_TYPE_TAX_CORRECTION",
+            "-3",
+            -500_000_000,
+            -350,
+            None,
+        ),
+        (
+            "OPERATION_TYPE_TAX_CORRECTION",
+            "3",
+            500_000_000,
+            350,
+            Some("00000000-0000-4000-8000-000000000072"),
+        ),
+    ] {
+        let body = serde_json::json!({
+            "hasNext": false,
+            "items": [{
+                "cursor": "invented-tax-cursor",
+                "brokerAccountId": "invented-tax-account",
+                "id": "invented-tax-row",
+                "date": "2026-08-20T10:11:12Z",
+                "type": source_kind,
+                "state": "OPERATION_STATE_EXECUTED",
+                "instrumentUid": instrument,
+                "payment": {"units": units, "nano": nano, "currency": "rub"}
+            }]
+        });
+        let operations = parse_operations(&body.to_string())?;
+        let operation = &operations[0];
+        assert_eq!(operation.rejection, None, "{source_kind}");
+        assert_eq!(
+            dictionary.kind_of(&operation.source_kind),
+            ChannelOperationKind::Tax
+        );
+        assert_eq!(
+            operation.payment.expect("payment").amount,
+            PostedMinor::new(expected_minor)
+        );
+        assert_eq!(operation.instrument_uid.as_deref(), instrument);
+        assert_eq!(
+            operation.parser_version,
+            ParserVersion(TINKOFF_PARSER_VERSION.to_owned())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn tinkoff_commission_is_exact_and_does_not_reject_the_trade() -> Result<(), Box<dyn Error>> {
     let body = include_str!("../../../tests/fixtures/api/tinkoff-operations.json");
     let operations = parse_operations(body)?;
@@ -260,33 +325,116 @@ fn maps_each_currency_position_without_aggregate_totals() -> Result<(), Box<dyn 
 
 #[test]
 fn refuses_money_that_cannot_be_represented_in_minor_units() -> Result<(), Box<dyn Error>> {
-    let operations = parse_operations(
-        r#"{
-            "hasNext": false,
-            "items": [{
-                "cursor": "c",
-                "brokerAccountId": "a",
-                "id": "op",
-                "date": "2026-08-20T10:11:12Z",
-                "type": "OPERATION_TYPE_BUY",
-                "state": "OPERATION_STATE_EXECUTED",
-                "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
-                "quantity": "1",
-                "payment": {"units": "1", "nano": 1, "currency": "rub"}
-            }]
-        }"#,
-    )?;
-    assert!(matches!(
-        operations[0].rejection.as_ref(),
-        Some(ParseError::NonRepresentableFraction {
-            field: "payment",
-            currency: CurrencyCode::Rub,
-        })
-    ));
-    assert_eq!(
-        operations[0].raw["id"],
-        serde_json::Value::String("op".to_owned())
-    );
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for level in [tracing::Level::DEBUG, tracing::Level::INFO] {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(level)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || -> Result<(), Box<dyn Error>> {
+            tracing::callsite::rebuild_interest_cache();
+            for (units, nano) in [("0001", 1), ("-1", -1)] {
+                let source_payment = serde_json::json!({
+                    "units": units, "nano": nano, "currency": "rub"
+                });
+                let body = serde_json::json!({
+                    "hasNext": false,
+                    "items": [{
+                        "cursor": "c",
+                        "brokerAccountId": "a",
+                        "id": "op",
+                        "date": "2026-08-20T10:11:12Z",
+                        "type": "OPERATION_TYPE_BUY",
+                        "state": "OPERATION_STATE_EXECUTED",
+                        "instrumentType": "bond",
+                        "instrumentKind": "INSTRUMENT_TYPE_BOND",
+                        "ticker": "INVENTED-BOND",
+                        "figi": "INVENTED-FIGI",
+                        "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
+                        "positionUid": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "quantity": "0007",
+                        "price": {"units": "0002", "nano": 123456789, "currency": "rub"},
+                        "payment": source_payment
+                    }]
+                });
+                let operations = parse_operations(&body.to_string())?;
+                assert!(matches!(
+                    operations[0].rejection.as_ref(),
+                    Some(ParseError::NonRepresentableFraction {
+                        field: "payment",
+                        currency: CurrencyCode::Rub,
+                    })
+                ));
+                assert_eq!(operations[0].payment, None);
+                assert_eq!(operations[0].raw["payment"], source_payment);
+                assert_eq!(operations[0].raw["quantity"], "0007");
+                assert_eq!(operations[0].raw["price"], body["items"][0]["price"]);
+                assert_eq!(operations[0].quantity_as_decimal().as_deref(), Some("7"));
+                assert_eq!(
+                    operations[0].price,
+                    Some(CalcMoney::new(dec("2.123456789"), CurrencyCode::Rub))
+                );
+            }
+            Ok(())
+        })?;
+        let text = String::from_utf8(capture.0.lock().expect("capture lock").clone())?;
+        if level == tracing::Level::DEBUG {
+            for expected in [
+                "DEBUG",
+                "subminor_payment_unrepresentable",
+                "field=\"payment\"",
+                "source_units=\"0001\"",
+                "source_currency=\"rub\"",
+                "source_nano=1",
+                "source_units=\"-1\"",
+                "source_nano=-1",
+                "currency=\"RUB\"",
+                "minor_units=2",
+                "nano_per_minor=10000000",
+                "remainder_nano=1",
+                "remainder_nano=-1",
+                "operation_id=\"op\"",
+                "source_kind=\"OPERATION_TYPE_BUY\"",
+                "source_instrument_type=\"bond\"",
+                "source_instrument_kind=\"INSTRUMENT_TYPE_BOND\"",
+                "source_ticker=\"INVENTED-BOND\"",
+                "source_figi=\"INVENTED-FIGI\"",
+                "source_instrument_uid=\"01234567-89ab-cdef-0123-456789abcdef\"",
+                "source_position_uid=\"fedcba98-7654-3210-fedc-ba9876543210\"",
+                "source_quantity=\"0007\"",
+                "source_price_units=\"0002\"",
+                "source_price_nano=123456789",
+                "source_price_currency=\"rub\"",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+        } else {
+            assert!(
+                text.is_empty(),
+                "source figures must not appear at INFO: {text}"
+            );
+        }
+    }
     Ok(())
 }
 

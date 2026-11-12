@@ -165,6 +165,14 @@ pub enum EventKind {
         /// Accrued coupon interest paid to the seller or received from the buyer (§7.2).
         accrued_interest: Option<Money>,
     },
+    /// Securities left this account without a cash payment. The receiving
+    /// account is not identified; this unpaired leg can be replaced when paired.
+    SecuritiesTransferOut {
+        instrument: InstrumentId,
+        quantity: Quantity,
+    },
+    /// Exchange of two cash currencies within the account.
+    CurrencyExchange { sold: Money, bought: Money },
     /// Money entered the contour from outside (§4.10).
     CashIn { amount: Money },
     /// Money left the contour.
@@ -256,13 +264,18 @@ pub enum EventKind {
     },
     /// Fee not tied to a trade.
     Fee { amount: Money, origin: FeeOrigin },
-    /// Tax, whether withheld at source or paid by the owner.
+    /// Tax charge (negative cash effect) or refund (positive cash effect).
     ///
     /// Modelled on `Fee`: a cost borne by the contour rather than money
     /// crossing its boundary. Without a fact of its own, a self-paid tax is
     /// indistinguishable from ordinary spending, and discretionary spending is
     /// overstated by exactly the tax bill (spec §2).
-    Tax { amount: Money, origin: TaxOrigin },
+    Tax {
+        amount: Money,
+        origin: TaxOrigin,
+        #[serde(default)]
+        instrument: Option<InstrumentId>,
+    },
     /// Reconstructed position for an account with no history (§10.7).
     OpeningPosition {
         instrument: InstrumentId,
@@ -429,9 +442,11 @@ impl EventKind {
     /// This is kept beside [`Self::discriminant`] so a route cannot accept a
     /// name the event model does not publish.
     #[must_use]
-    pub const fn discriminants() -> &'static [&'static str; 18] {
+    pub const fn discriminants() -> &'static [&'static str; 20] {
         &[
             "trade",
+            "securities_transfer_out",
+            "currency_exchange",
             "cash_in",
             "cash_out",
             "refund",
@@ -460,6 +475,8 @@ impl EventKind {
     pub const fn discriminant(&self) -> &'static str {
         match self {
             Self::Trade { .. } => "trade",
+            Self::SecuritiesTransferOut { .. } => "securities_transfer_out",
+            Self::CurrencyExchange { .. } => "currency_exchange",
             Self::CashIn { .. } => "cash_in",
             Self::CashOut { .. } => "cash_out",
             Self::Refund { .. } => "refund",
@@ -509,7 +526,9 @@ impl EventKind {
             Self::OwnAccountMovement { .. } | Self::UnresolvedOwnAccountMovement { .. } => {
                 FlowEndpoints::OwnAccountUnnamed
             }
+            Self::SecuritiesTransferOut { .. } => FlowEndpoints::OwnAccountUnnamed,
             Self::Trade { .. }
+            | Self::CurrencyExchange { .. }
             | Self::Income { .. }
             | Self::Fee { .. }
             | Self::Tax { .. }

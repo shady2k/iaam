@@ -1263,7 +1263,9 @@ pub const fn classification_of(event: &Event) -> Option<Classification> {
         EventKind::Tax { .. } => None,
         EventKind::Income { kind, .. } => Some(Classification::Income { kind }),
         EventKind::Trade { .. }
+        | EventKind::SecuritiesTransferOut { .. }
         | EventKind::OpeningPosition { .. }
+        | EventKind::CurrencyExchange { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::StatedSecuritiesValue { .. }
         | EventKind::Valuation { .. }

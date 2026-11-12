@@ -25,6 +25,8 @@ pub enum ChannelOperationKind {
     Dividend,
     /// Coupon payment.
     Coupon,
+    /// Broker tax charge or refund, preserving the signed cash effect.
+    Tax,
     /// Broker or service fee.
     Commission,
     /// Account deposit.
@@ -68,6 +70,7 @@ impl ChannelOperationKind {
             Self::Sell => Some("sell"),
             Self::Dividend => Some("dividend"),
             Self::Coupon => Some("coupon"),
+            Self::Tax => Some("tax"),
             Self::Commission => Some("commission"),
             Self::Deposit => Some("deposit"),
             Self::Withdrawal => Some("withdrawal"),
@@ -93,6 +96,7 @@ impl ChannelOperationKind {
             "sell" => Some(Self::Sell),
             "dividend" => Some(Self::Dividend),
             "coupon" => Some(Self::Coupon),
+            "tax" => Some(Self::Tax),
             "commission" => Some(Self::Commission),
             "deposit" => Some(Self::Deposit),
             "withdrawal" => Some(Self::Withdrawal),
@@ -207,6 +211,15 @@ pub fn seed_for(broker: &str) -> Option<(&'static str, &'static [(&'static str, 
 #[cfg(test)]
 mod tests {
     use super::ChannelOperationKind;
+
+    #[test]
+    fn tax_kind_round_trips_through_dictionary_name() {
+        assert_eq!(ChannelOperationKind::Tax.code(), Some("tax"));
+        assert_eq!(
+            ChannelOperationKind::parse("tax"),
+            Some(ChannelOperationKind::Tax)
+        );
+    }
 
     #[test]
     fn securities_transfer_kinds_round_trip_through_dictionary_names() {

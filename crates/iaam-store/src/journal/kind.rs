@@ -38,7 +38,9 @@ use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId, InstrumentId,
     OwnerId, PrincipalId, SourceId, TransferId,
 };
-use iaam_core::money::{CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+use iaam_core::money::{
+    CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity, ReturnedPrincipal,
+};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -51,9 +53,10 @@ use time::{Date, OffsetDateTime, Time};
 
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
-    CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow, FeeRow,
-    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, StatedSecuritiesValueRow, TaxRow,
-    TradeRow, UnresolvedMovementRow, ValuationRow,
+    CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, CurrencyExchangeRow, DetailRows,
+    EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow,
+    SecuritiesTransferOutRow, StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow,
+    ValuationRow,
 };
 use crate::StoreError;
 
@@ -211,6 +214,25 @@ fn kind_to_detail(event: &str, kind: &EventKind) -> Result<DetailRows, StoreErro
         | EventKind::Refund { amount: _ }
         | EventKind::OpeningCash { amount: _ }
         | EventKind::OwnAccountMovement { amount: _ } => Ok(DetailRows::None),
+        EventKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        } => Ok(DetailRows::SecuritiesTransferOut(
+            SecuritiesTransferOutRow {
+                event: event.to_owned(),
+                instrument: instrument.inner().to_string(),
+                quantity: quantity.0.inner().to_string(),
+            },
+        )),
+        EventKind::CurrencyExchange { sold, bought } => {
+            Ok(DetailRows::CurrencyExchange(CurrencyExchangeRow {
+                event: event.to_owned(),
+                sold_amount: sold.amount().raw(),
+                sold_currency: sold.currency().code().to_owned(),
+                bought_amount: bought.amount().raw(),
+                bought_currency: bought.currency().code().to_owned(),
+            }))
+        }
         EventKind::CashTransfer {
             transfer_id,
             from,
@@ -252,9 +274,11 @@ fn kind_to_detail(event: &str, kind: &EventKind) -> Result<DetailRows, StoreErro
             // Reconstructed from the single tax leg (spec §4.5).
             amount: _,
             origin,
+            instrument,
         } => Ok(DetailRows::Tax(TaxRow {
             event: event.to_owned(),
             origin: tax_origin_code(*origin).to_owned(),
+            instrument: instrument.map(|id| id.inner().to_string()),
         })),
         EventKind::OpeningPosition {
             instrument,
@@ -454,6 +478,8 @@ fn corporate_action_to_row(
         ratio: None,
         principal_returned_per_unit_value: None,
         principal_returned_per_unit_currency: None,
+        posted_principal_minor: None,
+        posted_principal_currency: None,
         fractional: None,
         basis_transfer: None,
         effective_date: String::new(),
@@ -515,27 +541,32 @@ fn corporate_action_to_row(
             custody,
             quantity,
             principal_returned_per_unit,
-            // Reconstructed from the `Principal` leg (spec §4.5).
             compensation: _,
             effective_date,
             record_date,
             grounds,
-        } => Ok(CorporateActionRow {
-            action_kind: "redemption".to_owned(),
-            instrument: Some(instrument.inner().to_string()),
-            custody: custody.map(|id| id.inner().to_string()),
-            quantity: Some(dec_to_text(quantity.0)),
-            principal_returned_per_unit_value: Some(dec_to_text(
-                principal_returned_per_unit.value(),
-            )),
-            principal_returned_per_unit_currency: Some(
-                principal_returned_per_unit.currency().code().to_owned(),
-            ),
-            effective_date: date_to_text(*effective_date),
-            record_date: record_date.map(date_to_text),
-            grounds: grounds.clone(),
-            ..base
-        }),
+        } => {
+            let (per_unit, posted) = match principal_returned_per_unit {
+                ReturnedPrincipal::PerUnit(amount) => (Some(*amount), None),
+                ReturnedPrincipal::Posted(amount) => (None, Some(*amount)),
+            };
+            Ok(CorporateActionRow {
+                action_kind: "redemption".to_owned(),
+                instrument: Some(instrument.inner().to_string()),
+                custody: custody.map(|id| id.inner().to_string()),
+                quantity: Some(dec_to_text(quantity.0)),
+                principal_returned_per_unit_value: per_unit
+                    .map(|amount| dec_to_text(amount.value())),
+                principal_returned_per_unit_currency: per_unit
+                    .map(|amount| amount.currency().code().to_owned()),
+                posted_principal_minor: posted.map(|amount| amount.amount().raw()),
+                posted_principal_currency: posted.map(|amount| amount.currency().code().to_owned()),
+                effective_date: date_to_text(*effective_date),
+                record_date: record_date.map(date_to_text),
+                grounds: grounds.clone(),
+                ..base
+            })
+        }
         CorporateAction::Conversion {
             predecessor,
             successor,
@@ -760,6 +791,18 @@ fn detail_to_kind(kind: &str, detail: DetailRows, legs: &[Leg]) -> Result<EventK
     match detail {
         DetailRows::Trade(row) => trade_from_row(row),
         DetailRows::CashTransfer(row) => cash_transfer_from_row(row, legs),
+        DetailRows::CurrencyExchange(row) => Ok(EventKind::CurrencyExchange {
+            sold: require_money(
+                "event_currency_exchange.sold",
+                Some(row.sold_amount),
+                Some(&row.sold_currency),
+            )?,
+            bought: require_money(
+                "event_currency_exchange.bought",
+                Some(row.bought_amount),
+                Some(&row.bought_currency),
+            )?,
+        }),
         DetailRows::UnresolvedMovement(row) => Ok(EventKind::UnresolvedOwnAccountMovement {
             amount: require_money(
                 "event_unresolved_movement",
@@ -775,6 +818,11 @@ fn detail_to_kind(kind: &str, detail: DetailRows, legs: &[Leg]) -> Result<EventK
         DetailRows::Tax(row) => Ok(EventKind::Tax {
             amount: single_leg_money(legs, LegKind::Tax)?,
             origin: parse_tax_origin(&row.origin)?,
+            instrument: row
+                .instrument
+                .as_deref()
+                .map(|id| parse_uuid("event_tax.instrument", id).map(InstrumentId))
+                .transpose()?,
         }),
         DetailRows::OpeningPosition(row) => opening_position_from_row(*row),
         DetailRows::StatedSecuritiesValue(row) => stated_securities_value_from_row(row),
@@ -783,6 +831,16 @@ fn detail_to_kind(kind: &str, detail: DetailRows, legs: &[Leg]) -> Result<EventK
         DetailRows::CoverageGap(detail) => coverage_gap_from_detail(detail),
         DetailRows::CorporateAction(row) => corporate_action_from_row(*row, legs),
         DetailRows::OfferExercise(row) => offer_exercise_from_row(row),
+        DetailRows::SecuritiesTransferOut(row) => Ok(EventKind::SecuritiesTransferOut {
+            instrument: InstrumentId(parse_uuid(
+                "event_securities_transfer_out.instrument",
+                &row.instrument,
+            )?),
+            quantity: Quantity(dec_from_text(
+                "event_securities_transfer_out.quantity",
+                &row.quantity,
+            )?),
+        }),
         DetailRows::None => none_detail_from_kind(kind, legs),
     }
 }
@@ -1106,16 +1164,29 @@ fn corporate_action_from_row(
                 field,
                 &require_str(field, row.quantity.as_deref())?,
             )?),
-            principal_returned_per_unit: PerUnitAmount::new(
-                dec_from_text(
+            principal_returned_per_unit: match (
+                row.principal_returned_per_unit_value.as_deref(),
+                row.posted_principal_minor,
+            ) {
+                (Some(value), None) => ReturnedPrincipal::PerUnit(PerUnitAmount::new(
+                    dec_from_text(field, value)?,
+                    parse_currency(
+                        field,
+                        &require_str(field, row.principal_returned_per_unit_currency.as_deref())?,
+                    )?,
+                )),
+                (None, Some(minor)) => ReturnedPrincipal::Posted(require_money(
                     field,
-                    &require_str(field, row.principal_returned_per_unit_value.as_deref())?,
-                )?,
-                parse_currency(
-                    field,
-                    &require_str(field, row.principal_returned_per_unit_currency.as_deref())?,
-                )?,
-            ),
+                    Some(minor),
+                    row.posted_principal_currency.as_deref(),
+                )?),
+                _ => {
+                    return Err(StoreError::InvalidValue {
+                        field,
+                        value: "expected exactly one principal representation".to_owned(),
+                    });
+                }
+            },
             compensation: single_leg_money(legs, LegKind::Principal)?,
             effective_date,
             record_date,
@@ -2019,7 +2090,9 @@ mod tests {
         AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId,
         InstrumentId, OwnerId, PrincipalId, SourceId, TransferId,
     };
-    use iaam_core::money::{CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use iaam_core::money::{
+        CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity, ReturnedPrincipal,
+    };
     use iaam_core::numeric::decimal::Dec;
     use iaam_core::reconciliation::Dimension;
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -2114,6 +2187,28 @@ mod tests {
     fn every_event_shape() -> Vec<Event> {
         let f = Fixture::new();
         let mut events = Vec::new();
+        events.push(f.event(
+            EventKind::SecuritiesTransferOut {
+                instrument: f.instrument,
+                quantity: qty("2"),
+            },
+            vec![Leg::security_without_custody(
+                f.account,
+                f.instrument,
+                qty("-2"),
+            )],
+        ));
+        let bought = Money::new(PostedMinor::new(10_000), CurrencyCode::Usd);
+        events.push(f.event(
+            EventKind::CurrencyExchange {
+                sold: rub(900_000),
+                bought,
+            },
+            vec![
+                Leg::cash(f.account, rub(-900_000)),
+                Leg::cash(f.account, bought),
+            ],
+        ));
 
         // --- The five leg-only kinds -------------------------------------
         events.push(f.event(
@@ -2256,15 +2351,20 @@ mod tests {
             ));
         }
 
-        // --- Tax: every origin ------------------------------------------------
+        // --- Tax: origin, instrument and withholding/refund signs ------------
         for origin in [TaxOrigin::WithheldAtSource, TaxOrigin::SelfPaid] {
-            events.push(f.event(
-                EventKind::Tax {
-                    amount: rub(-1_300),
-                    origin,
-                },
-                vec![Leg::tax(f.account, rub(-1_300))],
-            ));
+            for instrument in [None, Some(f.instrument)] {
+                for amount in [rub(-1_300), rub(1_300)] {
+                    events.push(f.event(
+                        EventKind::Tax {
+                            amount,
+                            origin,
+                            instrument,
+                        },
+                        vec![Leg::tax(f.account, amount)],
+                    ));
+                }
+            }
         }
 
         // --- Trade: every Option combination on the extra fields -----------
@@ -2496,7 +2596,9 @@ mod tests {
                     instrument: f.instrument,
                     custody: Some(f.custody),
                     quantity: qty("10"),
-                    principal_returned_per_unit: per_unit("800"),
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                        per_unit("800"),
+                    ),
                     compensation: rub(i64::MIN),
                     effective_date: date!(2026 - 12 - 15),
                     record_date: None,
@@ -2520,6 +2622,27 @@ mod tests {
             leg.custody = None;
         }
         events.push(without_custody);
+
+        let mut posted = events.last().unwrap().clone();
+        if let EventKind::CorporateAction {
+            action:
+                CorporateAction::Redemption {
+                    quantity,
+                    principal_returned_per_unit,
+                    compensation,
+                    ..
+                },
+        } = &mut posted.kind
+        {
+            *quantity = qty("3");
+            *principal_returned_per_unit = ReturnedPrincipal::Posted(rub(100));
+            *compensation = rub(100);
+        }
+        posted.legs = vec![
+            Leg::principal(f.account, f.instrument, rub(100)),
+            Leg::security(f.account, f.custody, f.instrument, qty("-3")),
+        ];
+        events.push(posted);
 
         // --- CorporateAction: Conversion, with and without compensation ------
         let successor = InstrumentId::new_random();

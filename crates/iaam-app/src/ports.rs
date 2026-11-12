@@ -2245,6 +2245,9 @@ pub struct PortfolioSnapshot {
     pub observed_on: Option<Date>,
 }
 
+/// Leave the last second of a sync to its result, not optional diagnostics.
+pub(crate) const BROKER_DIAGNOSTIC_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Limits shared by every broker request made for one synchronization.
 ///
 /// A sync constructs this once: discovery, retries, operation pages and the
@@ -2300,6 +2303,17 @@ pub trait BrokerChannel: Send + Sync {
         to: Date,
         context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError>;
+
+    /// Best-effort diagnostics after a position refusal. No journal or parsing
+    /// decision may depend on this hook; adapters without diagnostics do nothing.
+    async fn diagnose_instruments(
+        &self,
+        _instruments: &[InstrumentId],
+        _broker_account: &str,
+        _period: (Date, Date),
+        _context: BrokerRequestContext<'_>,
+    ) {
+    }
 
     /// Portfolio claims for the requested account and their date semantics.
     ///

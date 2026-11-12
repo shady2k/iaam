@@ -62,6 +62,10 @@ pub(crate) fn is_instrument_lookup_miss(host: &str, path: &str, status: u16) -> 
             path.trim_start_matches('/'),
             "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
                 | "InstrumentsService/GetInstrumentBy"
+                | "tinkoff.public.invest.api.contract.v1.InstrumentsService/CurrencyBy"
+                | "InstrumentsService/CurrencyBy"
+                | "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
+                | "InstrumentsService/FindInstrument"
         )
 }
 
@@ -641,7 +645,19 @@ impl OutboundTally {
         retry_after: Option<Duration>,
         clock: &dyn Clock,
     ) -> Result<TallyResponseDecision, TallyError> {
-        let lookup_miss = is_instrument_lookup_miss(host, path, status);
+        self.record_response_with_pending(host, path, (status, false), retry_after, clock)
+    }
+
+    pub(crate) fn record_response_with_pending(
+        &self,
+        host: &str,
+        path: &str,
+        response: (u16, bool),
+        retry_after: Option<Duration>,
+        clock: &dyn Clock,
+    ) -> Result<TallyResponseDecision, TallyError> {
+        let (status, report_pending) = response;
+        let lookup_miss = is_instrument_lookup_miss(host, path, status) || report_pending;
         self.transact(|state| {
             let boot = read_boot(clock)?;
             let now_nanos = boot.elapsed().as_nanos();
@@ -660,9 +676,10 @@ impl OutboundTally {
             let host_state = state.host_for_boot(host, now_nanos);
             host_state.pending_since = None;
             host_state.pending_budget_key = None;
-            let named_pause = (!lookup_miss && !(200..300).contains(&status))
-                .then(|| retry_after.map(|delay| delay.as_nanos().min(DAY_NANOS)))
-                .flatten();
+            let named_pause = (!is_instrument_lookup_miss(host, path, status)
+                && !(200..300).contains(&status))
+            .then(|| retry_after.map(|delay| delay.as_nanos().min(DAY_NANOS)))
+            .flatten();
             if let Some(pause) = named_pause {
                 let paused_until = now_nanos.saturating_add(pause);
                 if host_state
@@ -1691,6 +1708,16 @@ mod tests {
             Destination::TinkoffSandbox.base_url(),
         ] {
             assert!(is_instrument_lookup_miss(host, path, 404));
+            assert!(is_instrument_lookup_miss(
+                host,
+                "/InstrumentsService/FindInstrument",
+                404
+            ));
+            assert!(is_instrument_lookup_miss(
+                host,
+                "/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
+                404
+            ));
             assert!(!is_instrument_lookup_miss(host, path, 403));
             assert!(!is_instrument_lookup_miss(
                 host,

@@ -59,6 +59,10 @@ pub fn active_instruments(
                     TradeSide::Sell => negated(quantity.0)?,
                 },
             )],
+            EventKind::SecuritiesTransferOut {
+                instrument,
+                quantity,
+            } => vec![(*instrument, negated(quantity.0)?)],
             EventKind::OpeningPosition {
                 instrument,
                 quantity,
@@ -106,6 +110,7 @@ pub fn active_instruments(
             | EventKind::Income { .. }
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }
+            | EventKind::CurrencyExchange { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }

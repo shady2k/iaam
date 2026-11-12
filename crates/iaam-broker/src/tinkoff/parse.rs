@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/6";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/12";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -179,6 +179,60 @@ pub struct OperationsPage {
     pub next_cursor: Option<String>,
 }
 
+/// Currency-specific broker reference data, without inferring identity from a ticker.
+#[derive(Debug, Clone)]
+pub struct CurrencyDescription {
+    pub nominal: CalcMoney,
+    pub settlement: CurrencyCode,
+    pub lot: i64,
+}
+
+/// Parse `CurrencyBy`; nominal carries the foreign currency and exact unit size.
+pub fn parse_currency_description(body: &str) -> Result<CurrencyDescription, ParseError> {
+    let response: Value =
+        serde_json::from_str(body).map_err(|error| ParseError::Json(error.to_string()))?;
+    let instrument = response.get("instrument").ok_or(ParseError::MissingField {
+        field: "instrument",
+    })?;
+    let iso = instrument
+        .get("isoCurrencyName")
+        .and_then(Value::as_str)
+        .ok_or(ParseError::MissingField {
+            field: "isoCurrencyName",
+        })?;
+    let currency = parse_currency(iso)?;
+    let nominal: RawMoneyValue = serde_json::from_value(
+        instrument
+            .get("nominal")
+            .cloned()
+            .ok_or(ParseError::MissingField { field: "nominal" })?,
+    )
+    .map_err(|error| ParseError::Json(error.to_string()))?;
+    let nominal = parse_calc_money(&nominal, "nominal")?;
+    if nominal.currency() != currency {
+        return Err(ParseError::InvalidField {
+            field: "nominal.currency",
+            value: iso.to_owned(),
+        });
+    }
+    let settlement = parse_currency(
+        instrument
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or(ParseError::MissingField { field: "currency" })?,
+    )?;
+    let lot = instrument
+        .get("lot")
+        .and_then(Value::as_i64)
+        .filter(|lot| *lot > 0)
+        .ok_or(ParseError::MissingField { field: "lot" })?;
+    Ok(CurrencyDescription {
+        nominal,
+        settlement,
+        lot,
+    })
+}
+
 /// Parse the reference data returned by `InstrumentsService/GetInstrumentBy`.
 pub fn parse_instrument(body: &str) -> Result<crate::BrokerInstrumentDescription, ParseError> {
     use iaam_core::instrument::InstrumentKind;
@@ -259,6 +313,207 @@ pub fn parse_operations(body: &str) -> Result<OperationsPage, ParseError> {
         has_next,
         next_cursor: response.next_cursor,
     })
+}
+
+/// Rows and completeness metadata from a generated broker report page.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerReportPage {
+    pub broker_report: Vec<Value>,
+    pub items_count: usize,
+    pub pages_count: i32,
+    pub page: i32,
+}
+
+/// Read the task identifier returned when report generation starts.
+pub fn parse_broker_report_task(body: &str) -> Result<String, ParseError> {
+    let response: Value = parse_json(body)?;
+    response
+        .get("generateBrokerReportResponse")
+        .and_then(|v| v.get("taskId"))
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .ok_or(ParseError::MissingField { field: "taskId" })
+}
+
+/// Parse a generated report page without interpreting trade cash.
+pub fn parse_broker_report_page(body: &str) -> Result<BrokerReportPage, ParseError> {
+    let response: Value = parse_json(body)?;
+    serde_json::from_value(response.get("getBrokerReportResponse").cloned().ok_or(
+        ParseError::MissingField {
+            field: "getBrokerReportResponse",
+        },
+    )?)
+    .map_err(|error| ParseError::Json(error.to_string()))
+}
+
+/// Only a trade payment rejected for subminor precision may use report cash.
+pub fn needs_report_payment(operation: &ChannelOperation) -> bool {
+    matches!(
+        operation.rejection,
+        Some(ParseError::NonRepresentableFraction {
+            field: "payment",
+            ..
+        })
+    ) && matches!(
+        operation.source_kind.as_str(),
+        "OPERATION_TYPE_BUY"
+            | "OPERATION_TYPE_BUY_CARD"
+            | "OPERATION_TYPE_BUY_MARGIN"
+            | "OPERATION_TYPE_SELL"
+            | "OPERATION_TYPE_SELL_CARD"
+            | "OPERATION_TYPE_SELL_MARGIN"
+    )
+}
+
+/// Replace unposted operation cash only with exact, settled report trade cash.
+/// Reparse the complete operation so a second parse defect cannot be cleared.
+pub fn resolve_report_payment(
+    operation: &ChannelOperation,
+    rows: &[Value],
+) -> Result<ChannelOperation, String> {
+    use iaam_core::money::Money;
+    if !needs_report_payment(operation) || operation.trades.is_empty() {
+        return Err("no exact source trade IDs for report payment resolution".to_owned());
+    }
+    let buy = operation.source_kind.contains("BUY");
+    let mut amounts = Vec::new();
+    let mut evidence = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    for trade in &operation.trades {
+        if !ids.insert(&trade.num) {
+            return Err("duplicate source trade ID".to_owned());
+        }
+        let matches = rows
+            .iter()
+            .filter(|row| row.get("tradeId").and_then(Value::as_str) == Some(trade.num.as_str()))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!(
+                "report trade {} has {} matches",
+                trade.num,
+                matches.len()
+            ));
+        }
+        let row = matches[0];
+        let figi = operation
+            .figi
+            .as_deref()
+            .filter(|figi| !figi.is_empty())
+            .ok_or_else(|| "operation has no FIGI".to_owned())?;
+        if row.get("figi").and_then(Value::as_str) != Some(figi) {
+            return Err(format!(
+                "report trade {} instrument does not match operation",
+                trade.num
+            ));
+        }
+        let quantity = row
+            .get("quantity")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_i64().map(|n| n.to_string()))
+            })
+            .ok_or_else(|| format!("report trade {} has no quantity", trade.num))?;
+        if parse_integer_quantity(&quantity, "quantity").map_err(|error| error.to_string())?
+            != trade.quantity
+        {
+            return Err(format!("report trade {} quantity mismatch", trade.num));
+        }
+        let trade_date = row
+            .get("tradeDatetime")
+            .and_then(Value::as_str)
+            .and_then(|date| OffsetDateTime::parse(date, &Rfc3339).ok());
+        if trade_date.is_none_or(|date| date.date() != trade.at.date())
+            || operation.date != Some(trade.at.date())
+        {
+            return Err(format!("report trade {} date mismatch", trade.num));
+        }
+        let settled = row
+            .get("clearValueDate")
+            .and_then(Value::as_str)
+            .and_then(|date| OffsetDateTime::parse(date, &Rfc3339).ok());
+        if settled.is_none_or(|date| date > OffsetDateTime::now_utc()) {
+            return Err(format!(
+                "report trade {} has no completed settlement date",
+                trade.num
+            ));
+        }
+        let raw_money = serde_json::from_value::<RawMoneyValue>(
+            row.get("totalOrderAmount")
+                .cloned()
+                .ok_or_else(|| format!("report trade {} has no totalOrderAmount", trade.num))?,
+        )
+        .map_err(|error| error.to_string())?;
+        let cash =
+            parse_money(&raw_money, "totalOrderAmount").map_err(|error| error.to_string())?;
+        let original_currency = operation
+            .raw
+            .get("payment")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str);
+        if original_currency.and_then(|currency| parse_currency(currency).ok())
+            != Some(cash.currency)
+            || cash.currency != trade.price.currency()
+            || cash.amount.raw() <= 0
+        {
+            return Err(format!(
+                "report trade {} has invalid settled cash",
+                trade.num
+            ));
+        }
+        amounts.push(Money::new(cash.amount, cash.currency));
+        evidence.push(row.clone());
+    }
+    let currency = operation.trades[0].price.currency();
+    let total = Money::sum(&amounts, currency).map_err(|error| error.to_string())?;
+    let total = if buy {
+        total.checked_negate().map_err(|error| error.to_string())?
+    } else {
+        total
+    };
+    let mut resolved_raw = operation.raw.clone();
+    // Decimal is exact here: no calculated value is rounded into source cash.
+    let decimal = total.to_calc_dec().inner();
+    let units = decimal.trunc().to_string();
+    fn same_type<T: std::str::FromStr>(_: T, text: &str) -> Result<T, String> {
+        text.parse().map_err(|_| "invalid decimal scale".to_owned())
+    }
+    let scale = same_type(decimal, "1000000000")?;
+    let nano = ((decimal - decimal.trunc()) * scale)
+        .normalize()
+        .to_string()
+        .parse::<i32>()
+        .map_err(|error| error.to_string())?;
+    resolved_raw["payment"] =
+        serde_json::json!({"currency": currency.code(), "units": units, "nano": nano});
+    let parsed: RawOperation =
+        serde_json::from_value(resolved_raw.clone()).map_err(|error| error.to_string())?;
+    let mut resolved = parse_operation(parsed, resolved_raw);
+    if let Some(error) = &resolved.rejection {
+        return Err(error.to_string());
+    }
+    tracing::info!(
+        operation_id = operation.operation_id,
+        source = "broker_report",
+        "trade payment sourced from broker report"
+    );
+    for row in &evidence {
+        let payment = operation.raw.get("payment");
+        let report = row.get("totalOrderAmount");
+        tracing::debug!(operation_id = operation.operation_id, trade_id = ?row.get("tradeId").and_then(serde_json::Value::as_str),
+            operations_currency = ?payment.and_then(|v| v.get("currency")).and_then(serde_json::Value::as_str),
+            operations_units = ?payment.and_then(|v| v.get("units")).and_then(serde_json::Value::as_str),
+            operations_nano = ?payment.and_then(|v| v.get("nano")).and_then(serde_json::Value::as_i64),
+            report_currency = ?report.and_then(|v| v.get("currency")).and_then(serde_json::Value::as_str),
+            report_units = ?report.and_then(|v| v.get("units")).and_then(serde_json::Value::as_str),
+            report_nano = ?report.and_then(|v| v.get("nano")).and_then(serde_json::Value::as_i64), "broker cash evidence");
+    }
+    resolved.raw = operation.raw.clone();
+    resolved.raw["brokerReportSettlement"] = Value::Array(evidence);
+    Ok(resolved)
 }
 
 /// A portfolio answer: the claims read from it, and the position rows that
@@ -607,6 +862,12 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
     let cursor = required_or_reject(item.cursor, "cursor", &mut rejection);
     let date = date_or_reject(item.date, "date", &mut rejection);
     let operation_type = required_or_reject(item.operation_type, "type", &mut rejection);
+    let _operation_span = tracing::debug_span!(
+        "tinkoff_operation",
+        operation_id,
+        source_kind = operation_type
+    )
+    .entered();
     let trades_info = item.trades_info;
     let trades = parse_trades(trades_info)
         .map_err(|error| {
@@ -641,6 +902,48 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         parse_optional_money(item.payment.as_ref(), "payment"),
         &mut rejection,
     );
+    if let Some(ParseError::NonRepresentableFraction { field, .. }) = &rejection {
+        let source = raw.get(*field);
+        tracing::debug!(
+            operation_id,
+            source_kind = operation_type,
+            reason = "subminor_payment_unrepresentable",
+            field,
+            source_instrument_type = raw
+                .get("instrumentType")
+                .and_then(serde_json::Value::as_str),
+            source_instrument_kind = raw
+                .get("instrumentKind")
+                .and_then(serde_json::Value::as_str),
+            source_ticker = raw.get("ticker").and_then(serde_json::Value::as_str),
+            source_figi = raw.get("figi").and_then(serde_json::Value::as_str),
+            source_instrument_uid = raw.get("instrumentUid").and_then(serde_json::Value::as_str),
+            source_position_uid = raw.get("positionUid").and_then(serde_json::Value::as_str),
+            source_quantity = raw.get("quantity").and_then(serde_json::Value::as_str),
+            source_price_units = raw
+                .get("price")
+                .and_then(|price| price.get("units"))
+                .and_then(serde_json::Value::as_str),
+            source_price_nano = raw
+                .get("price")
+                .and_then(|price| price.get("nano"))
+                .and_then(serde_json::Value::as_i64),
+            source_price_currency = raw
+                .get("price")
+                .and_then(|price| price.get("currency"))
+                .and_then(serde_json::Value::as_str),
+            source_units = source
+                .and_then(|v| v.get("units"))
+                .and_then(serde_json::Value::as_str),
+            source_nano = source
+                .and_then(|v| v.get("nano"))
+                .and_then(serde_json::Value::as_i64),
+            source_currency = source
+                .and_then(|v| v.get("currency"))
+                .and_then(serde_json::Value::as_str),
+            "T-Invest row has unrepresentable source cash"
+        );
+    }
     let price = keep_or_reject(
         parse_optional_calc_money(item.price.as_ref(), "price"),
         &mut rejection,
@@ -789,7 +1092,20 @@ fn parse_money(value: &RawMoneyValue, field: &'static str) -> Result<ChannelMone
     let divisor = 10_i128
         .checked_pow(9 - minor_units)
         .ok_or(ParseError::NumericOverflow { field })?;
-    if i128::from(value.nano) % divisor != 0 {
+    let remainder = i128::from(value.nano) % divisor;
+    if remainder != 0 {
+        tracing::debug!(
+            reason = "subminor_payment_unrepresentable",
+            field,
+            source_units = value.units.as_deref().unwrap_or_default(),
+            source_nano = value.nano,
+            source_currency = value.currency.as_deref().unwrap_or_default(),
+            currency = currency.code(),
+            minor_units,
+            nano_per_minor = %divisor,
+            remainder_nano = %remainder,
+            "T-Invest source cash cannot be represented without rounding"
+        );
         return Err(ParseError::NonRepresentableFraction { field, currency });
     }
     let scale = 10_i128
@@ -1137,6 +1453,67 @@ mod tests {
             }}"#
         )
     }
+    #[test]
+    fn report_task_and_pages_keep_completeness_metadata() {
+        assert_eq!(
+            super::parse_broker_report_task(
+                r#"{"generateBrokerReportResponse":{"taskId":"task"}}"#
+            )
+            .unwrap(),
+            "task"
+        );
+        assert!(super::parse_broker_report_task(r#"{"generateBrokerReportResponse":{}}"#).is_err());
+        for page in 0..2 {
+            let body = serde_json::json!({"getBrokerReportResponse": {"brokerReport": [{"tradeId": page.to_string()}],
+                "itemsCount": 2, "pagesCount": 2, "page": page}});
+            let parsed = super::parse_broker_report_page(&body.to_string()).unwrap();
+            assert_eq!(parsed.page, page);
+            assert_eq!(parsed.items_count, 2);
+            assert_eq!(parsed.broker_report.len(), 1);
+        }
+        assert!(super::parse_broker_report_page(r#"{"getBrokerReportResponse":{}}"#).is_err());
+    }
+
+    #[test]
+    fn report_cash_requires_matching_trade_evidence() {
+        let body = serde_json::json!({"hasNext": false, "items": [{
+            "cursor": "c", "brokerAccountId": "a", "id": "o",
+            "date": "2026-08-20T10:00:00Z", "type": "OPERATION_TYPE_BUY",
+            "state": "OPERATION_STATE_EXECUTED", "figi": "FIGI1", "quantity": "92",
+            "payment": {"currency": "rub", "units": "-173", "nano": -926000000},
+            "tradesInfo": {"trades": [{"num":"t1", "date":"2026-08-20T10:00:00Z",
+                "quantity":"92", "price":{"currency":"rub", "units":"1", "nano":890500000}}]}
+        }]});
+        let operation = parse_operations(&body.to_string()).unwrap().remove(0);
+        assert!(super::needs_report_payment(&operation));
+        let row = serde_json::json!({"tradeId":"t1", "figi":"FIGI1", "quantity":"92",
+            "tradeDatetime":"2026-08-20T10:00:00Z", "clearValueDate":"2026-08-21T00:00:00Z",
+            "totalOrderAmount":{"currency":"rub", "units":"173", "nano":930000000}});
+        let resolved =
+            super::resolve_report_payment(&operation, std::slice::from_ref(&row)).unwrap();
+        assert!(resolved.rejection.is_none());
+        assert_eq!(resolved.payment.unwrap().amount.raw(), -17393);
+        assert!(super::resolve_report_payment(&operation, &[]).is_err());
+        assert!(super::resolve_report_payment(&operation, &[row.clone(), row.clone()]).is_err());
+        for (key, value) in [
+            ("figi", serde_json::json!("other")),
+            ("quantity", serde_json::json!("91")),
+            ("tradeDatetime", serde_json::json!("2026-08-19T10:00:00Z")),
+            ("clearValueDate", serde_json::Value::Null),
+            (
+                "totalOrderAmount",
+                serde_json::json!({"currency":"usd", "units":"173"}),
+            ),
+        ] {
+            let mut invalid = row.clone();
+            invalid[key] = value;
+            assert!(
+                super::resolve_report_payment(&operation, &[invalid]).is_err(),
+                "{key}"
+            );
+        }
+    }
+
     #[test]
     fn the_accounts_listing_becomes_the_ids_it_names() {
         let ids = parse_account_ids(

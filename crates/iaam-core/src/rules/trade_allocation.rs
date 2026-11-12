@@ -47,6 +47,86 @@ pub fn check_order_completeness(
     }
 }
 
+/// Cash figures explaining why the broker payment overrides calculated fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CashReconciliation {
+    pub payment: PostedMinor,
+    pub trade_total: PostedMinor,
+    pub delta: PostedMinor,
+}
+
+/// Posted fill grosses and, when needed, their cash-authoritative explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrossAllocation {
+    pub amounts: Vec<PostedMinor>,
+    pub reconciliation: Option<CashReconciliation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum GrossAllocationError {
+    #[error("accrued interest must be nonnegative and must not exceed payment")]
+    InvalidAccrued,
+    #[error("nonzero payment cannot be allocated across zero trade gross")]
+    ZeroGross,
+    #[error(transparent)]
+    Money(#[from] crate::money::MoneyError),
+    #[error(transparent)]
+    Allocation(#[from] AllocationError),
+}
+
+/// Allocate the broker's posted payment less accrued interest by exact fill gross.
+///
+/// Prices remain calculated values: no per-unit or per-fill rounding supplies the
+/// weights. The caller orders fills to break equal largest remainders stably.
+pub fn allocate_gross_minor(
+    payment: PostedMinor,
+    accrued: PostedMinor,
+    grosses: &[CalcMoney],
+    currency: CurrencyCode,
+) -> Result<GrossAllocation, GrossAllocationError> {
+    if accrued.raw() < 0 || accrued.raw() > payment.raw() {
+        return Err(GrossAllocationError::InvalidAccrued);
+    }
+    let total = payment
+        .checked_sub(accrued)
+        .ok_or(crate::money::MoneyError::Overflow)?;
+    let accrued_money = CalcMoney::new(
+        Dec::new(rust_decimal::Decimal::new(
+            accrued.raw(),
+            currency.minor_units(),
+        )),
+        currency,
+    );
+    let reconciliation = check_order_completeness(grosses, Some(accrued_money), payment, currency)?
+        .map(|mismatch| {
+            Ok::<_, crate::money::MoneyError>(CashReconciliation {
+                payment: mismatch.reported,
+                trade_total: mismatch.expected,
+                delta: mismatch
+                    .reported
+                    .checked_sub(mismatch.expected)
+                    .ok_or(crate::money::MoneyError::Overflow)?,
+            })
+        })
+        .transpose()?;
+    let weights = grosses
+        .iter()
+        .map(|gross| Quantity(Dec::new(gross.value().inner().abs())))
+        .collect::<Vec<_>>();
+    let amounts = if weights.iter().all(|weight| weight.0.is_zero()) {
+        if total.raw() != 0 {
+            return Err(GrossAllocationError::ZeroGross);
+        }
+        vec![PostedMinor::new(0); weights.len()]
+    } else {
+        allocate_minor(total, &weights)?
+    };
+    Ok(GrossAllocation {
+        amounts,
+        reconciliation,
+    })
+}
+
 /// Failure while distributing a posted order amount across fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum AllocationError {
@@ -186,6 +266,56 @@ mod tests {
         assert_eq!(
             check_order_completeness(&grosses, None, PostedMinor::new(0), CurrencyCode::Rub,),
             Err(crate::money::MoneyError::Numeric(NumericError::Overflow))
+        );
+    }
+
+    #[test]
+    fn gross_allocation_preserves_cash_and_exact_price_weights() {
+        let grosses = [
+            CalcMoney::new(dec("0.001"), CurrencyCode::Rub),
+            CalcMoney::new(dec("0.002"), CurrencyCode::Rub),
+        ];
+        let allocation = allocate_gross_minor(
+            PostedMinor::new(13),
+            PostedMinor::new(3),
+            &grosses,
+            CurrencyCode::Rub,
+        )
+        .unwrap();
+        assert_eq!(
+            allocation.amounts,
+            vec![PostedMinor::new(3), PostedMinor::new(7)]
+        );
+        assert_eq!(
+            allocation.reconciliation,
+            Some(CashReconciliation {
+                payment: PostedMinor::new(13),
+                trade_total: PostedMinor::new(3),
+                delta: PostedMinor::new(10),
+            })
+        );
+    }
+
+    #[test]
+    fn gross_allocation_rejects_cash_without_weights_and_accrued_above_payment() {
+        let zero = [CalcMoney::new(dec("0"), CurrencyCode::Rub)];
+        assert_eq!(
+            allocate_gross_minor(
+                PostedMinor::new(1),
+                PostedMinor::new(0),
+                &zero,
+                CurrencyCode::Rub
+            ),
+            Err(GrossAllocationError::ZeroGross),
+        );
+        assert_eq!(
+            allocate_gross_minor(
+                PostedMinor::new(1),
+                PostedMinor::new(2),
+                &zero,
+                CurrencyCode::Rub
+            ),
+            Err(GrossAllocationError::InvalidAccrued),
         );
     }
 

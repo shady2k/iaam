@@ -536,6 +536,10 @@ pub enum OperationKindDto {
         amount: String,
         currency: CurrencyDto,
     },
+    /// Exchange one currency for another in the same account. Fees are separate operations.
+    CurrencyExchange { sold: AmountDto, bought: AmountDto },
+    /// Securities leaving the account without a cash payment or stated custody.
+    SecuritiesTransferOut { instrument: Uuid, quantity: String },
     Buy {
         instrument: Uuid,
         /// Where the security is kept, when the source states one. A bank
@@ -583,9 +587,12 @@ pub enum OperationKindDto {
         origin: FeeOriginDto,
     },
     Tax {
+        /// Positive for a charge, negative for a refund.
         amount: String,
         currency: CurrencyDto,
         origin: TaxOriginDto,
+        #[serde(default)]
+        instrument: Option<Uuid>,
     },
     /// A reconstructed opening (§10.7): the cash the account is stated to have
     /// held before the journal began, recorded as **one more movement**, not
@@ -1073,6 +1080,19 @@ impl OperationDto {
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
             },
+            OperationKindDto::CurrencyExchange { sold, bought } => {
+                OperationKind::CurrencyExchange {
+                    sold: sold.to_money("sold")?,
+                    bought: bought.to_money("bought")?,
+                }
+            }
+            OperationKindDto::SecuritiesTransferOut {
+                instrument,
+                quantity,
+            } => OperationKind::SecuritiesTransferOut {
+                instrument: InstrumentId(*instrument),
+                quantity: Dec::new(decimal(quantity, "quantity")?),
+            },
             OperationKindDto::Buy {
                 instrument,
                 custody,
@@ -1141,7 +1161,9 @@ impl OperationDto {
                 amount,
                 currency,
                 origin,
+                instrument,
             } => OperationKind::Tax {
+                instrument: instrument.map(InstrumentId),
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
                 origin: origin.to_domain(),
@@ -6942,7 +6964,8 @@ mod tests {
             instrument: Uuid::new_v4(),
             custody: None,
             quantity: "10".into(),
-            principal_returned_per_unit: amount("1000"),
+            principal_returned_per_unit: Some(amount("1000")),
+            posted_principal: None,
             compensation: amount("10000.00"),
             effective_date: time::macros::date!(2026 - 06 - 01),
             record_date: None,
@@ -6957,12 +6980,50 @@ mod tests {
     }
 
     #[test]
+    fn posted_redemption_keeps_one_ruble_for_three_securities() {
+        let make = |per_unit, posted| CorporateActionDto::Redemption {
+            instrument: Uuid::new_v4(),
+            custody: None,
+            quantity: "3".into(),
+            principal_returned_per_unit: per_unit,
+            posted_principal: posted,
+            compensation: amount("1"),
+            effective_date: time::macros::date!(2026 - 06 - 01),
+            record_date: None,
+            grounds: None,
+        };
+        let dto = make(None, Some(amount("1")));
+        let json = serde_json::to_value(&dto).unwrap();
+        assert!(json.get("principal_returned_per_unit").is_none());
+        let restored: CorporateActionDto = serde_json::from_value(json).unwrap();
+        let CorporateAction::Redemption {
+            principal_returned_per_unit,
+            ..
+        } = restored.to_domain().unwrap()
+        else {
+            panic!("expected redemption");
+        };
+        let iaam_core::money::ReturnedPrincipal::Posted(principal) = principal_returned_per_unit
+        else {
+            panic!("expected posted principal, not a rounded per-unit amount");
+        };
+        assert_eq!(principal.amount().raw(), 100);
+        assert!(make(None, None).to_domain().is_err());
+        assert!(
+            make(Some(amount("1")), Some(amount("1")))
+                .to_domain()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn every_corporate_action_member_names_itself_in_json() {
         let redemption_fields = || CorporateActionDto::Redemption {
             instrument: Uuid::new_v4(),
             custody: Some(Uuid::new_v4()),
             quantity: "10".into(),
-            principal_returned_per_unit: amount("1000"),
+            principal_returned_per_unit: Some(amount("1000")),
+            posted_principal: None,
             compensation: amount("10000.00"),
             effective_date: time::macros::date!(2026 - 06 - 01),
             record_date: None,
@@ -7278,6 +7339,36 @@ mod tests {
             source_kind: None,
             description: None,
         }
+    }
+
+    #[test]
+    fn securities_transfer_out_input_preserves_instrument_and_quantity() {
+        let instrument = Uuid::from_u128(7);
+        let kind: OperationKindDto = serde_json::from_value(serde_json::json!({
+            "type": "securities_transfer_out", "instrument": instrument, "quantity": "2.5"
+        }))
+        .unwrap();
+        let mut operation = income_operation(None);
+        operation.kind = kind;
+        assert!(matches!(operation.kind_to_domain().unwrap(),
+            OperationKind::SecuritiesTransferOut { instrument: id, quantity }
+            if id == InstrumentId(instrument) && quantity == Dec::new("2.5".parse().unwrap())));
+    }
+
+    #[test]
+    fn currency_exchange_input_preserves_both_posted_amounts() {
+        let kind: OperationKindDto = serde_json::from_value(serde_json::json!({
+            "type": "currency_exchange",
+            "sold": {"amount": "100.00", "currency": "RUB"},
+            "bought": {"amount": "1.25", "currency": "USD"}
+        }))
+        .unwrap();
+        let mut operation = income_operation(None);
+        operation.kind = kind;
+        assert!(matches!(operation.kind_to_domain().unwrap(),
+            OperationKind::CurrencyExchange { sold, bought }
+            if sold == Money::new(PostedMinor::new(10000), iaam_core::money::CurrencyCode::Rub)
+                && bought == Money::new(PostedMinor::new(125), iaam_core::money::CurrencyCode::Usd)));
     }
 
     #[test]
@@ -10036,7 +10127,10 @@ pub enum CorporateActionDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         custody: Option<Uuid>,
         quantity: String,
-        principal_returned_per_unit: AmountDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal_returned_per_unit: Option<AmountDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        posted_principal: Option<AmountDto>,
         compensation: AmountDto,
         #[serde(with = "iso_date")]
         #[schema(value_type = String, format = Date)]
@@ -10109,6 +10203,7 @@ impl CorporateActionDto {
                 custody,
                 quantity,
                 principal_returned_per_unit,
+                posted_principal,
                 compensation,
                 effective_date,
                 record_date,
@@ -10117,8 +10212,23 @@ impl CorporateActionDto {
                 instrument: InstrumentId(*instrument),
                 custody: custody.map(CustodyId),
                 quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
-                principal_returned_per_unit: principal_returned_per_unit
-                    .to_per_unit("principal_returned_per_unit")?,
+                principal_returned_per_unit: match (principal_returned_per_unit, posted_principal) {
+                    (Some(amount), None) => iaam_core::money::ReturnedPrincipal::PerUnit(
+                        amount.to_per_unit("principal_returned_per_unit")?,
+                    ),
+                    (None, Some(amount)) => iaam_core::money::ReturnedPrincipal::Posted(
+                        amount.to_money("posted_principal")?,
+                    ),
+                    _ => {
+                        return Err(Rejection {
+                            field: "principal_returned_per_unit".into(),
+                            expected:
+                                "exactly one of principal_returned_per_unit or posted_principal"
+                                    .into(),
+                            actual: "both or neither principal representations".into(),
+                        });
+                    }
+                },
                 compensation: compensation.to_money("compensation")?,
                 effective_date: *effective_date,
                 record_date: *record_date,

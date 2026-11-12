@@ -1272,6 +1272,8 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("event_legs", TableDisposition::Carried),
     ("event_trade", TableDisposition::Carried),
     ("event_cash_transfer", TableDisposition::Carried),
+    ("event_currency_exchange", TableDisposition::Carried),
+    ("event_securities_transfer_out", TableDisposition::Carried),
     ("event_unresolved_movement", TableDisposition::Carried),
     ("event_income", TableDisposition::Carried),
     ("event_fee", TableDisposition::Carried),

@@ -268,7 +268,9 @@ fn every_corporate_action() -> Vec<CorporateAction> {
             instrument: InstrumentId::new_random(),
             custody: Some(CustodyId::new_random()),
             quantity: qty("100"),
-            principal_returned_per_unit: PerUnitAmount::new(dec("800"), CurrencyCode::Rub),
+            principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                PerUnitAmount::new(dec("800"), CurrencyCode::Rub),
+            ),
             compensation: rub(8_000_000),
             effective_date: date!(2026 - 12 - 15),
             record_date: None,

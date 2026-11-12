@@ -141,6 +141,13 @@ Cannot change without a migration:
 - Accrued interest accepting a reported zero. Restoring the rejection
   would retroactively unrecord trades that reported no coupon.
 
+Currency exchange is a separate journal fact (`EventKind::CurrencyExchange`),
+not a securities purchase or sale. T-Invest classifies USD, CNY and gold as
+currency instruments; their broker trades therefore exchange cash balances
+rather than create or dispose of securities positions. The fact carries two
+opposite cash legs on one account, one for the currency sold and one for the
+currency bought. It creates no lots and no realised result.
+
 ## E3.4, continued: a per-row refusal is not a response-wide verdict
 
 One row's property was being applied to a whole response, and one import

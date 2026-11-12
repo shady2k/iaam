@@ -114,6 +114,15 @@ pub(crate) struct TradeRow {
     pub accrued_interest_currency: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrencyExchangeRow {
+    pub event: String,
+    pub sold_amount: i64,
+    pub sold_currency: String,
+    pub bought_amount: i64,
+    pub bought_currency: String,
+}
+
 /// `event_cash_transfer`. `amount` is reconstructed from the positive `to`
 /// leg (spec §4.5) and is deliberately absent here; both endpoints are
 /// stored because both legs are `LegKind::Cash` and carry no role, so
@@ -155,6 +164,7 @@ pub(crate) struct FeeRow {
 pub(crate) struct TaxRow {
     pub event: String,
     pub origin: String,
+    pub instrument: Option<String>,
 }
 
 /// `event_opening_position`. `quantity` here is the reconstructed position's
@@ -265,6 +275,8 @@ pub(crate) struct CorporateActionRow {
     pub ratio: Option<String>,
     pub principal_returned_per_unit_value: Option<String>,
     pub principal_returned_per_unit_currency: Option<String>,
+    pub posted_principal_minor: Option<i64>,
+    pub posted_principal_currency: Option<String>,
     pub fractional: Option<String>,
     pub basis_transfer: Option<String>,
     pub effective_date: String,
@@ -314,10 +326,20 @@ pub(crate) struct CoverageGapDetail {
 // columns that leaving them inline would make every `DetailRows` value pay
 // for the largest variant's size, most visibly in the `Vec<DetailRows>`
 // Task 6's bulk hydration builds per page.
+/// The asserted outbound quantity; legs carry its signed movement separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SecuritiesTransferOutRow {
+    pub event: String,
+    pub instrument: String,
+    pub quantity: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DetailRows {
     Trade(TradeRow),
+    SecuritiesTransferOut(SecuritiesTransferOutRow),
     CashTransfer(CashTransferRow),
+    CurrencyExchange(CurrencyExchangeRow),
     UnresolvedMovement(UnresolvedMovementRow),
     Income(IncomeRow),
     Fee(FeeRow),

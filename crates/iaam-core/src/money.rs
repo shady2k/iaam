@@ -345,6 +345,22 @@ impl CalcMoney {
     }
 }
 
+/// Derive a posted currency amount from source nominal and quantity without rounding.
+pub fn currency_amount_from_nominal(
+    nominal: CalcMoney,
+    quantity: Quantity,
+) -> Result<Money, ReturnedPrincipalError> {
+    if !nominal.value().is_positive() || !quantity.0.is_positive() {
+        return Err(ReturnedPrincipalError::Nonpositive);
+    }
+    let product = nominal.checked_mul(quantity.0)?;
+    let posted = Money::new(product.rounded_minor()?, product.currency());
+    if posted.to_calc_dec() != product.value() {
+        return Err(ReturnedPrincipalError::Inexact);
+    }
+    Ok(posted)
+}
+
 /// Calculate one fill's exact gross before the source-fact rounding boundary.
 pub fn gross_for_fill(price: CalcMoney, quantity: Quantity) -> Result<CalcMoney, MoneyError> {
     let product = price.checked_mul(quantity.0)?;
@@ -380,6 +396,42 @@ pub fn returned_principal_per_unit(
         return Err(ReturnedPrincipalError::Inexact);
     }
     Ok(PerUnitAmount::new(value, principal.currency()))
+}
+
+/// Principal asserted by a full-redemption source, before any deductions.
+/// The posted total remains authoritative when its per-unit value is rational.
+/// Untagged serialization preserves existing decimal per-unit records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReturnedPrincipal {
+    PerUnit(PerUnitAmount),
+    Posted(Money),
+}
+
+impl ReturnedPrincipal {
+    #[must_use]
+    pub const fn currency(self) -> CurrencyCode {
+        match self {
+            Self::PerUnit(amount) => amount.currency(),
+            Self::Posted(amount) => amount.currency(),
+        }
+    }
+
+    /// Derive exact principal per security without rounding source cash.
+    pub fn per_unit_exact(self, quantity: Quantity) -> Result<Exact, ReturnedPrincipalError> {
+        if !quantity.0.is_positive() {
+            return Err(ReturnedPrincipalError::Nonpositive);
+        }
+        match self {
+            Self::PerUnit(amount) if amount.value().is_positive() => {
+                Ok(amount.value().to_exact()?)
+            }
+            Self::Posted(amount) if amount.amount().raw() > 0 => {
+                Ok(amount.to_exact()?.div(&quantity.0.to_exact()?)?)
+            }
+            _ => Err(ReturnedPrincipalError::Nonpositive),
+        }
+    }
 }
 
 /// Calculated **per-unit** monetary value, not a posted amount.
@@ -489,6 +541,52 @@ mod tests {
             amount.checked_mul(dec("2")),
             Err(MoneyError::Numeric(NumericError::Overflow))
         ));
+    }
+
+    #[test]
+    fn posted_redemption_principal_keeps_recurring_per_unit_exact() {
+        let posted = Money::new(PostedMinor::new(100), CurrencyCode::Rub);
+        let principal = ReturnedPrincipal::Posted(posted);
+        let third = principal.per_unit_exact(Quantity(dec("3"))).unwrap();
+        assert_eq!(third, Exact::new(1, 3).unwrap());
+        assert_eq!(third.mul(&Exact::from_int(3)), posted.to_exact().unwrap());
+        assert_eq!(principal, ReturnedPrincipal::Posted(posted));
+        let serialized = serde_json::to_string(&principal).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReturnedPrincipal>(&serialized).unwrap(),
+            principal
+        );
+    }
+
+    #[test]
+    fn redemption_principal_reads_legacy_per_unit_shape() {
+        let amount = PerUnitAmount::new(dec("0.125"), CurrencyCode::Rub);
+        let legacy = serde_json::to_string(&amount).unwrap();
+        let principal: ReturnedPrincipal = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(principal, ReturnedPrincipal::PerUnit(amount));
+        assert_eq!(
+            principal.per_unit_exact(Quantity(dec("8"))).unwrap(),
+            Exact::new(1, 8).unwrap()
+        );
+    }
+
+    #[test]
+    fn redemption_principal_refuses_nonpositive_values_and_quantities() {
+        for principal in [
+            ReturnedPrincipal::Posted(Money::zero(CurrencyCode::Rub)),
+            ReturnedPrincipal::PerUnit(PerUnitAmount::new(dec("0"), CurrencyCode::Rub)),
+        ] {
+            assert_eq!(
+                principal.per_unit_exact(Quantity(dec("3"))),
+                Err(ReturnedPrincipalError::Nonpositive)
+            );
+        }
+        let principal =
+            ReturnedPrincipal::Posted(Money::new(PostedMinor::new(100), CurrencyCode::Rub));
+        assert_eq!(
+            principal.per_unit_exact(Quantity::zero()),
+            Err(ReturnedPrincipalError::Nonpositive)
+        );
     }
 
     #[test]
@@ -844,6 +942,19 @@ mod tests {
             Quantity(Dec::new(Decimal::MAX)),
         ];
         assert_eq!(sum_quantities(&quantities), Err(NumericError::Overflow));
+    }
+
+    #[test]
+    fn currency_nominal_quantity_requires_exact_posted_amount() {
+        let nominal = CalcMoney::new(dec("0.025"), CurrencyCode::Usd);
+        assert_eq!(
+            currency_amount_from_nominal(nominal, Quantity(dec("4"))).unwrap(),
+            Money::new(PostedMinor::new(10), CurrencyCode::Usd)
+        );
+        assert_eq!(
+            currency_amount_from_nominal(nominal, Quantity(dec("1"))),
+            Err(ReturnedPrincipalError::Inexact)
+        );
     }
 
     #[test]

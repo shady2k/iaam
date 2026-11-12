@@ -97,6 +97,7 @@ fn all_kinds() -> Vec<OperationKind> {
             origin: FeeOrigin::Depositary,
         },
         OperationKind::Tax {
+            instrument: None,
             amount_minor: 13_000,
             currency: CurrencyCode::Rub,
             origin: TaxOrigin::SelfPaid,
@@ -156,6 +157,7 @@ fn every_operation_kind_produces_a_structurally_valid_event() {
 #[test]
 fn a_submitted_tax_becomes_one_negative_tax_leg() {
     let operation = submit(OperationKind::Tax {
+        instrument: None,
         amount_minor: 130_000,
         currency: CurrencyCode::Rub,
         origin: TaxOrigin::SelfPaid,
@@ -165,7 +167,7 @@ fn a_submitted_tax_becomes_one_negative_tax_leg() {
         .event;
     event.validate_structure().expect("valid shape");
     match &event.kind {
-        EventKind::Tax { amount, origin } => {
+        EventKind::Tax { amount, origin, .. } => {
             // The client sent a magnitude; the sign is ours.
             assert_eq!(amount.amount(), PostedMinor::new(-130_000));
             assert_eq!(*origin, TaxOrigin::SelfPaid);
@@ -179,11 +181,33 @@ fn a_submitted_tax_becomes_one_negative_tax_leg() {
 }
 
 #[test]
-fn a_non_positive_tax_is_rejected() {
-    // A client that sends -130_000 believing it helps must be told, not
-    // silently obeyed: normalising the sign here would hide a caller's bug.
-    for amount in [0_i64, -1] {
+fn a_tax_refund_preserves_its_instrument_and_positive_cash_effect() {
+    let instrument = InstrumentId::new_random();
+    let operation = submit(OperationKind::Tax {
+        instrument: Some(instrument),
+        amount_minor: -730,
+        currency: CurrencyCode::Rub,
+        origin: TaxOrigin::WithheldAtSource,
+    });
+    let event = normalize(&operation, &context())
+        .expect("refund normalizes")
+        .event;
+    event.validate_structure().expect("valid refund");
+    assert!(matches!(event.kind, EventKind::Tax { instrument: Some(id), .. } if id == instrument));
+    assert_eq!(
+        event
+            .cash_effect(CurrencyCode::Rub)
+            .expect("cash effect")
+            .amount(),
+        PostedMinor::new(730)
+    );
+}
+
+#[test]
+fn a_zero_or_unrepresentable_tax_is_rejected() {
+    for amount in [0_i64, i64::MIN] {
         let operation = submit(OperationKind::Tax {
+            instrument: None,
             amount_minor: amount,
             currency: CurrencyCode::Rub,
             origin: TaxOrigin::SelfPaid,

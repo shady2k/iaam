@@ -4,11 +4,10 @@
 //! does not say that `OPERATION_TYPE_DIV_EXT` and
 //! `OPERATION_TYPE_DIVIDEND` are both dividends for us, or that
 //! `OPERATION_TYPE_OVER_COM` is a fee. Therefore the table lives in code and
-//! is inserted into the database once, when access is configured.
+//! refreshes contract-origin entries when the database is opened or access is configured.
 //!
-//! It is **not** the source of truth afterwards: the dictionary is edited in
-//! the database, and seeding from here does not touch existing rows. Otherwise
-//! the owner's decision would be cancelled on every access setup.
+//! Owner-origin entries in the database always take precedence: embedded updates
+//! never cancel the owner's decision.
 //!
 //! Most entries reproduce the former `match` in `parse.rs` (commit 5320fb0)
 //! word for word. The two securities-transfer entries intentionally do not:
@@ -33,6 +32,9 @@ pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
     ("OPERATION_TYPE_DIVIDEND", "dividend"),
     ("OPERATION_TYPE_DIV_EXT", "dividend"),
     ("OPERATION_TYPE_COUPON", "coupon"),
+    ("OPERATION_TYPE_DIVIDEND_TAX", "tax"),
+    ("OPERATION_TYPE_TAX", "tax"),
+    ("OPERATION_TYPE_TAX_CORRECTION", "tax"),
     ("OPERATION_TYPE_BOND_REPAYMENT_FULL", "bond_redemption"),
     ("OPERATION_TYPE_BROKER_FEE", "commission"),
     ("OPERATION_TYPE_SERVICE_FEE", "commission"),
@@ -114,6 +116,23 @@ mod tests {
             ),
         ] {
             assert_eq!(dictionary.kind_of(code), expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn broker_tax_codes_are_seeded_as_tax() {
+        let (dictionary, _) =
+            OperationKindDictionary::build(TINKOFF_OPERATION_KINDS.iter().copied());
+        for code in [
+            "OPERATION_TYPE_DIVIDEND_TAX",
+            "OPERATION_TYPE_TAX",
+            "OPERATION_TYPE_TAX_CORRECTION",
+        ] {
+            assert_eq!(
+                dictionary.kind_of(code),
+                ChannelOperationKind::Tax,
+                "{code}"
+            );
         }
     }
 

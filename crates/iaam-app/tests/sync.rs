@@ -5886,3 +5886,103 @@ async fn repeated_sync_warns_about_existing_invalid_outbound_transfer_without_de
             .any(|event| event.id == event_id)
     );
 }
+
+#[tokio::test]
+async fn paired_fund_redemption_retires_exact_units_and_never_invents_a_twin_arrival() {
+    use iaam_app::ports::PendingFullRedemption;
+    use iaam_core::event::corporate_action::CorporateAction;
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let twin = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDFUND");
+        seed_instrument(store, twin, "INVENTEDTWIN");
+    });
+    let quantity = iaam_core::money::Quantity(Dec::new(
+        "1.2345"
+            .parse::<rust_decimal::Decimal>()
+            .expect("invented fractional units"),
+    ));
+    let mut purchase = trade_without_custody(account, instrument);
+    if let OperationKind::Buy {
+        quantity: bought, ..
+    } = &mut purchase.kind
+    {
+        *bought = quantity.0;
+    }
+    purchase.dates = OperationDates {
+        trade: Some(date!(2026 - 03 - 01)),
+        settled: None,
+        cash_posted: None,
+        paid: None,
+    };
+    let mut broker = api_with_claims(SourceId::new_random(), purchase, vec![]);
+    let pending = |instrument, id: &str| PendingFullRedemption {
+        withdrawn_quantity: Some(quantity),
+        withdrawal_operation_id: Some(format!("withdrawal-{id}")),
+        account,
+        instrument,
+        compensation: iaam_core::money::Money::new(
+            iaam_core::money::PostedMinor::new(20_000),
+            CurrencyCode::Rub,
+        ),
+        effective_date: date!(2026 - 03 - 15),
+        idempotency_key: id.to_owned(),
+        source_operation_id: id.to_owned(),
+        raw: "{}".to_owned(),
+    };
+    broker.operations.as_mut().unwrap().pending_redemptions = vec![
+        pending(instrument, "invented-fund-redemption"),
+        pending(twin, "invented-twin-redemption"),
+    ];
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("paired redemption sync");
+    assert_eq!(first.set_aside, 1, "{:?}", first.recorded);
+    assert!(first.recorded.iter().any(|verdict| matches!(verdict,
+        Verdict::Quarantined { reason } if reason.contains("units never arrived in the operations stream")
+            && reason.contains(&twin.inner().to_string()) && reason.contains("1.2345")
+    )));
+    let events = load_all(&services, owner).await;
+    let redeemed: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::CorporateAction {
+                action:
+                    CorporateAction::Redemption {
+                        instrument,
+                        quantity,
+                        ..
+                    },
+            } => Some((instrument, quantity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(redeemed, vec![(instrument, quantity)]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SecuritiesTransferOut { .. }))
+    );
+    let again = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("repeat paired redemption sync");
+    assert_eq!(again.set_aside, 1);
+    assert!(again.duplicates >= 2);
+}

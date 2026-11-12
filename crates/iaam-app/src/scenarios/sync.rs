@@ -1442,11 +1442,40 @@ async fn resolve_full_redemption(
             .map_err(iaam_core::projection::ProjectionError::from)
             .map_err(AppError::from_projection)?;
     }
-    let Some(quantity) = balances
-        .position(&PositionKey {
-            account: pending.account,
-            instrument: pending.instrument,
-        })
+    let held = balances.position(&PositionKey {
+        account: pending.account,
+        instrument: pending.instrument,
+    });
+    if let Some(withdrawn) = pending.withdrawn_quantity {
+        let held = held.unwrap_or_else(iaam_core::money::Quantity::zero);
+        if held != withdrawn {
+            let reason = if !held.0.is_positive() {
+                "units never arrived in the operations stream"
+            } else if held.0 < withdrawn.0 {
+                "withdrawn units exceed the holding recorded in the operations stream"
+            } else {
+                "full redemption withdrawal does not retire the entire recorded holding"
+            };
+            tracing::debug!(
+                phase = "map",
+                instrument = %pending.instrument.inner(),
+                withdrawal_operation_id = ?pending.withdrawal_operation_id,
+                redemption_operation_id = %pending.source_operation_id,
+                withdrawn_quantity = %withdrawn.0.inner(),
+                held_quantity = %held.0.inner(),
+                reason,
+                "fund unit redemption set aside; no arrival inferred"
+            );
+            return Ok(Err(format!(
+                "fund unit redemption of instrument {}: {} units withdrawn; {reason}",
+                pending.instrument.inner(),
+                withdrawn.0.inner()
+            )));
+        }
+    }
+    let Some(quantity) = pending
+        .withdrawn_quantity
+        .or(held)
         .filter(|quantity| quantity.0.is_positive())
     else {
         if tracing::enabled!(tracing::Level::DEBUG) {

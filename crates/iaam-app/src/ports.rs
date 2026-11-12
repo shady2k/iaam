@@ -2186,6 +2186,9 @@ pub struct Quarantined {
 /// A full repayment whose source reports zero units, not a position size.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingFullRedemption {
+    /// Exact units named by a paired withdrawal, not an inferred arrival.
+    pub withdrawn_quantity: Option<iaam_core::money::Quantity>,
+    pub withdrawal_operation_id: Option<String>,
     pub account: AccountId,
     pub instrument: InstrumentId,
     pub compensation: iaam_core::money::Money,

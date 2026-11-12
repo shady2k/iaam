@@ -47,6 +47,9 @@ mod report;
 #[path = "tinkoff_diagnostics.rs"]
 mod diagnostics;
 
+#[path = "tinkoff_fund_redemption.rs"]
+mod fund_redemption;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
@@ -299,7 +302,10 @@ impl TinkoffChannel {
             Some(uid) => (uid, InstrumentIdType::Uid),
             None => match raw.get("figi").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
                 Some(figi) => (figi, InstrumentIdType::Figi),
-                None => return Ok(Err("instrument description cannot be requested: the row supplies neither instrument UID nor FIGI".to_owned())),
+                None => match raw.get("positionUid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
+                    Some(position) => (position, InstrumentIdType::PositionUid),
+                    None => return Ok(Err("instrument description cannot be requested: the row supplies neither instrument UID, FIGI nor position UID".to_owned())),
+                },
             },
         };
         let mut descriptions = self.descriptions.lock().await;
@@ -525,13 +531,15 @@ impl BrokerChannel for TinkoffChannel {
         let mut currency_rows = HashMap::new();
         for (operation_index, mut operation) in operations.into_iter().enumerate() {
             let has_identity = operation.instrument_uid.is_some()
-                || ["figi", "ticker", "isin"].into_iter().any(|key| {
-                    operation
-                        .raw
-                        .get(key)
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
-                });
+                || ["figi", "ticker", "isin", "positionUid"]
+                    .into_iter()
+                    .any(|key| {
+                        operation
+                            .raw
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| !value.is_empty())
+                    });
             let kind = self.dictionary.kind_of(&operation.source_kind);
             let is_currency = operation
                 .raw
@@ -658,6 +666,7 @@ impl BrokerChannel for TinkoffChannel {
             quarantined_trade = accounting.quarantined_trade,
             quarantined_conversion = accounting.quarantined_conversion,
             reduced_no_execution_trades = accounting.reduced_no_execution_trades,
+            reduced_paired_fund_withdrawals = accounting.reduced_paired_fund_withdrawals,
             emitted_operations =
                 parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
             "T-Invest operations accounted"
@@ -1067,6 +1076,7 @@ impl RowRefusal {
 struct OperationAccounting {
     source_rows_accepted: usize,
     reduced_no_execution_trades: usize,
+    reduced_paired_fund_withdrawals: usize,
     quarantined_parse: usize,
     quarantined_kind_not_in_dictionary: usize,
     quarantined_securities_transfer: usize,
@@ -1113,7 +1123,9 @@ fn adapt_operations_with_currencies(
     let mut quarantined = Vec::new();
     let mut accounting = OperationAccounting::default();
     let source_rows = operations.len();
-    for mut operation in operations {
+    let mut operations = operations;
+    let pairing = fund_redemption::prepare(&mut operations, dictionary);
+    for (operation_index, mut operation) in operations.into_iter().enumerate() {
         let operation_id = if operation.operation_id.is_empty() {
             operation
                 .raw
@@ -1154,6 +1166,18 @@ fn adapt_operations_with_currencies(
             continue;
         }
 
+        if let Some(reason) = pairing.refusals.get(&operation_index) {
+            quarantined.push(Quarantined {
+                raw,
+                reason: reason.clone(),
+                dimensions: cash_positions(),
+            });
+            continue;
+        }
+        if pairing.withdrawals.contains(&operation_index) {
+            accounting.reduced_paired_fund_withdrawals += 1;
+            continue;
+        }
         if matches!(kind, ChannelOperationKind::Other(_)) {
             accounting.quarantined_kind_not_in_dictionary += 1;
             let dictionary = iaam_broker::tinkoff::dictionary_seed::TINKOFF_SEED_NAME;
@@ -1239,7 +1263,15 @@ fn adapt_operations_with_currencies(
                 .is_some_and(|quantity| quantity == iaam_core::money::Quantity::zero())
             {
                 match pending_redemption(account, &operation, raw.to_string()) {
-                    Ok(pending) => pending_redemptions.push(pending),
+                    Ok(mut pending) => {
+                        if let Some((quantity, operation_id)) =
+                            pairing.redemptions.get(&operation_index)
+                        {
+                            pending.withdrawn_quantity = Some(*quantity);
+                            pending.withdrawal_operation_id = Some(operation_id.clone());
+                        }
+                        pending_redemptions.push(pending);
+                    }
                     Err(error) => {
                         trace_quarantined_operation(&operation_id, &source_kind, "conversion");
                         quarantined.push(Quarantined {
@@ -1335,8 +1367,10 @@ fn adapt_operations_with_currencies(
             }
         }
     }
-    accounting.source_rows_accepted =
-        source_rows - quarantined.len() - accounting.reduced_no_execution_trades;
+    accounting.source_rows_accepted = source_rows
+        - quarantined.len()
+        - accounting.reduced_no_execution_trades
+        - accounting.reduced_paired_fund_withdrawals;
     accounting.quarantined_conversion = quarantined.len()
         - accounting.quarantined_parse
         - accounting.quarantined_kind_not_in_dictionary
@@ -1453,6 +1487,8 @@ fn pending_redemption(
         compensation: iaam_core::money::Money::new(payment.amount, payment.currency),
         idempotency_key: operation.deduplication_key.clone(),
         source_operation_id: operation.operation_id.clone(),
+        withdrawn_quantity: None,
+        withdrawal_operation_id: None,
         raw,
     })
 }

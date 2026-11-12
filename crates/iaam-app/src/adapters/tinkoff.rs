@@ -1505,6 +1505,14 @@ fn currency_exchange_operations(
                 phase = "currency_exchange",
                 operation_id = operation.operation_id,
                 operation_type = operation.source_kind,
+                state = ?raw.get("state"),
+                description = ?raw.get("description"),
+                parent_operation_id = ?operation.parent_operation_id,
+                cancel_reason = ?operation.cancel_reason,
+                cancel_date_time = ?raw.get("cancelDateTime"),
+                trades_count = operation.trades.len(),
+                trades_quantities = ?operation.trades.iter().map(|trade| trade.quantity.0.inner().to_string()).collect::<Vec<_>>(),
+                date = ?raw.get("date"),
                 instrument_type = ?raw.get("instrumentType"),
                 instrument_kind = ?raw.get("instrumentKind"),
                 ticker = ?raw.get("ticker"),
@@ -2511,6 +2519,9 @@ mod tests {
             "date":"2026-08-20T10:11:12Z", "type":"OPERATION_TYPE_BUY",
             "state":"OPERATION_STATE_EXECUTED", "instrumentType":"currency",
             "instrumentUid":"invented-usd-uid", "ticker":"INVENTED-USD", "quantity":"2",
+            "description":"Invented correction evidence", "parentOperationId":"invented-parent",
+            "cancelReason":"Invented cancellation explanation", "cancelDateTime":"2026-08-21T09:00:00Z",
+            "tradesInfo":{"trades":[{"num":"invented-trade", "date":"2026-08-20T10:11:12Z", "quantity":"2", "price":{"units":"50","nano":0,"currency":"rub"}}]},
             "payment":{"units":"100","nano":120000000,"currency":"rub"}
         }]});
         let description = serde_json::json!({"instrument":{
@@ -2556,6 +2567,14 @@ mod tests {
             "quantity_sign",
             "expected_payment_sign",
             "negative",
+            "OPERATION_STATE_EXECUTED",
+            "Invented correction evidence",
+            "invented-parent",
+            "Invented cancellation explanation",
+            "2026-08-21T09:00:00Z",
+            "trades_count=1",
+            "trades_quantities=[\"2\"]",
+            "2026-08-20T10:11:12Z",
         ] {
             assert!(log.contains(evidence), "missing {evidence} in {log}");
         }

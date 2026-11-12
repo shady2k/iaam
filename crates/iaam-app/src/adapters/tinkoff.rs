@@ -44,7 +44,11 @@ use crate::ports::{
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
-type CachedDescription = (Instant, Result<BrokerInstrumentDescription, String>);
+struct CachedDescription {
+    read_at: Instant,
+    description: Result<BrokerInstrumentDescription, String>,
+    figi_probe: Option<&'static str>,
+}
 
 /// Broker channel implementation for T-Invest.
 pub struct TinkoffChannel {
@@ -77,6 +81,33 @@ impl TinkoffChannel {
             descriptions: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
+    // Diagnostic only: never use this answer to replace the UID miss.
+    async fn probe_figi(&self, figi: &str, context: BrokerRequestContext<'_>) -> &'static str {
+        match self
+            .client
+            .get_instrument(
+                figi,
+                InstrumentIdType::Figi,
+                context.deadline,
+                context.allowance,
+            )
+            .await
+        {
+            Ok(body) => match iaam_broker::tinkoff::parse_instrument(&body) {
+                Ok(description) if description.isin.is_some() => "described",
+                Ok(_) => "no_isin",
+                Err(_) => "unreadable",
+            },
+            Err(TinkoffError::UnexpectedStatus { status: 404, .. }) => "not_found",
+            Err(error) => match tinkoff_error(error) {
+                BrokerError::Refused { .. } => "refused",
+                BrokerError::Unparsable { .. } => "unreadable",
+                BrokerError::RequestCeiling { .. } => "request_ceiling",
+                _ => "unavailable",
+            },
+        }
+    }
+
     async fn resolve_instrument(
         &self,
         uid: Option<&str>,
@@ -101,7 +132,7 @@ impl TinkoffChannel {
         let mut descriptions = self.descriptions.lock().await;
         if descriptions
             .get(&key)
-            .is_none_or(|(read_at, _)| read_at.elapsed() >= std::time::Duration::from_secs(3600))
+            .is_none_or(|cached| cached.read_at.elapsed() >= std::time::Duration::from_secs(3600))
         {
             tracing::info!(
                 phase = "describe_instruments",
@@ -109,12 +140,16 @@ impl TinkoffChannel {
                 instruments = 1,
                 "reading broker instrument description"
             );
-            let description = match self
+            let response = self
                 .client
                 .get_instrument(id, id_type, context.deadline, context.allowance)
-                .await
-                .map_err(tinkoff_error)
-            {
+                .await;
+            let uid_not_found = id_type == InstrumentIdType::Uid
+                && matches!(
+                    &response,
+                    Err(TinkoffError::UnexpectedStatus { status: 404, .. })
+                );
+            let description = match response.map_err(tinkoff_error) {
                 Ok(body) => {
                     iaam_broker::tinkoff::parse_instrument(&body).map_err(|error| error.to_string())
                 }
@@ -123,6 +158,7 @@ impl TinkoffChannel {
                 ) => Err(detail),
                 Err(error) => return Err(error),
             };
+            let figi_probe = uid_not_found.then_some("not_supplied");
             tracing::info!(
                 phase = "describe_instruments",
                 status = "complete",
@@ -130,17 +166,34 @@ impl TinkoffChannel {
                 described = usize::from(description.is_ok()),
                 "broker instrument description read"
             );
-            descriptions.insert(key.clone(), (Instant::now(), description));
+            descriptions.insert(
+                key.clone(),
+                CachedDescription {
+                    read_at: Instant::now(),
+                    description,
+                    figi_probe,
+                },
+            );
         }
-        let description = descriptions
-            .get(&key)
-            .expect("description inserted")
-            .1
-            .clone();
+        let cached = descriptions.get_mut(&key).expect("description inserted");
+        if cached.figi_probe == Some("not_supplied") {
+            if let Some(figi) = raw
+                .get("figi")
+                .and_then(serde_json::Value::as_str)
+                .filter(|figi| !figi.is_empty())
+            {
+                cached.figi_probe = Some(self.probe_figi(figi, context).await);
+            }
+        }
+        let description = cached.description.clone();
+        let figi_probe = cached.figi_probe;
         drop(descriptions);
         let description = match description {
             Ok(description) => description,
             Err(reason) => {
+                if let Some(probe) = figi_probe {
+                    trace_instrument_miss(raw, id, id_type, "uid_not_found", probe, None);
+                }
                 return Ok(Err(format!(
                     "instrument {id} description refused or unreadable: {reason}"
                 )));
@@ -151,6 +204,14 @@ impl TinkoffChannel {
             .as_deref()
             .is_none_or(|isin| isin.trim().is_empty())
         {
+            trace_instrument_miss(
+                raw,
+                id,
+                id_type,
+                "no_isin",
+                "not_requested",
+                Some(&description),
+            );
             return Ok(Err(format!("instrument {id} description names no ISIN")));
         }
         super::catalogue::resolve_or_record(
@@ -166,6 +227,35 @@ impl TinkoffChannel {
             detail: error.to_string(),
         })
     }
+}
+
+fn trace_instrument_miss(
+    raw: &serde_json::Value,
+    lookup_identifier: &str,
+    lookup_type: InstrumentIdType,
+    reason: &str,
+    figi_probe_result: &str,
+    description: Option<&BrokerInstrumentDescription>,
+) {
+    let field = |name: &str| raw.get(name).and_then(serde_json::Value::as_str);
+    tracing::warn!(
+        phase = "resolve_instruments",
+        reason,
+        operation_id = field("id").or_else(|| field("operationId")),
+        parent_operation_id = field("parentOperationId"),
+        operation_type = field("type").or_else(|| field("operationType")),
+        instrument_type = field("instrumentType"),
+        figi = field("figi"),
+        instrument_uid = field("instrumentUid"),
+        position_uid = field("positionUid"),
+        ticker = field("ticker").or_else(|| description.map(|description| description.ticker.as_str())),
+        name = field("name").or_else(|| description.map(|description| description.name.as_str())),
+        lookup_identifier,
+        lookup_type = ?lookup_type,
+        figi_probe_identifier = field("figi"),
+        figi_probe_result,
+        "broker instrument resolution miss"
+    );
 }
 
 #[async_trait]
@@ -1679,6 +1769,7 @@ pub(crate) mod fake {
         /// Answered once the script has run out.
         otherwise: Option<Answer>,
         log: Log,
+        scripted_instruments: bool,
     }
 
     impl Transport for FakeTinvest {
@@ -1687,9 +1778,10 @@ pub(crate) mod fake {
                 Some(iaam_http::RequestBody::Json(body)) => body.clone(),
                 _ => String::new(),
             };
-            if request
-                .path()
-                .ends_with("InstrumentsService/GetInstrumentBy")
+            if !self.scripted_instruments
+                && request
+                    .path()
+                    .ends_with("InstrumentsService/GetInstrumentBy")
             {
                 let value: serde_json::Value =
                     serde_json::from_str(&body).expect("instrument request");
@@ -1748,6 +1840,14 @@ pub(crate) mod fake {
         script: Vec<Answer>,
         otherwise: Option<Answer>,
     ) -> (Arc<Gateway<FakeTinvest>>, Log, Arc<FakeTime>) {
+        gateway_with_instruments(script, otherwise, false)
+    }
+
+    pub(crate) fn gateway_with_instruments(
+        script: Vec<Answer>,
+        otherwise: Option<Answer>,
+        scripted_instruments: bool,
+    ) -> (Arc<Gateway<FakeTinvest>>, Log, Arc<FakeTime>) {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
@@ -1760,6 +1860,7 @@ pub(crate) mod fake {
                 script: Mutex::new(script.into()),
                 otherwise,
                 log: Arc::clone(&log),
+                scripted_instruments,
             },
             BUDGETS,
             Arc::clone(&time) as Arc<dyn Clock>,
@@ -1808,6 +1909,234 @@ mod tests {
             deadline,
             allowance: &ALLOWANCE,
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct InstrumentLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for InstrumentLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("instrument log")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn uid_404_figi_probe_is_diagnostic_only_and_cached_for_success_and_miss() {
+        for (status, body, outcome) in [
+            (
+                200,
+                r#"{"instrument":{"isin":"XX0000000042","ticker":"PROBE","name":"Invented probe","instrumentType":"share","currency":"rub"}}"#,
+                "described",
+            ),
+            (404, "{}", "not_found"),
+        ] {
+            let (gateway, requests, _) = fake::gateway_with_instruments(
+                vec![Answer::status(404, "{}"), Answer::status(status, body)],
+                None,
+                true,
+            );
+            let channel = channel(gateway);
+            let row = serde_json::json!({
+                "id":"invented-operation", "type":"OPERATION_TYPE_BUY", "instrumentType":"share",
+                "instrumentUid":"invented-uid", "positionUid":"invented-position", "figi":"TESTFIGI",
+                "ticker":"TEST", "name":"Invented share", "payment":{"units":"987654321"},
+            });
+            let writer = InstrumentLog::default();
+            let captured = writer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _subscriber = tracing::subscriber::set_default(subscriber);
+            for _ in 0..2 {
+                let result = channel
+                    .resolve_instrument(
+                        Some("invented-uid"),
+                        &row,
+                        time::macros::date!(2026 - 01 - 01),
+                        broker_context(None),
+                    )
+                    .await
+                    .expect("404 stays local");
+                assert!(
+                    result
+                        .expect_err("probe must not repair UID miss")
+                        .contains("404")
+                );
+            }
+            {
+                let requests = requests.lock().expect("requests");
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "one UID call and one FIGI probe, cached across rows"
+                );
+                let first: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+                let second: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+                assert_eq!(first["idType"], "INSTRUMENT_ID_TYPE_UID");
+                assert_eq!(second["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+                assert_eq!(second["id"], "TESTFIGI");
+            }
+            let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            for expected in [
+                "invented-operation",
+                "OPERATION_TYPE_BUY",
+                "share",
+                "invented-uid",
+                "invented-position",
+                "TESTFIGI",
+                "TEST",
+                "Invented share",
+                "uid_not_found",
+                outcome,
+            ] {
+                assert!(log.contains(expected), "missing {expected}: {log}");
+            }
+            assert!(
+                !log.contains("987654321"),
+                "amount escaped into diagnostics: {log}"
+            );
+            assert!(
+                channel
+                    .instruments
+                    .resolve("isin", "XX0000000042", time::macros::date!(2026 - 01 - 01))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_uid_miss_probes_once_when_a_later_row_supplies_figi() {
+        let (gateway, requests, _) = fake::gateway_with_instruments(
+            vec![Answer::status(404, "{}"), Answer::status(404, "{}")],
+            None,
+            true,
+        );
+        let channel = channel(gateway);
+        for row in [
+            serde_json::json!({}),
+            serde_json::json!({"figi":"TESTFIGI"}),
+            serde_json::json!({"figi":"TESTFIGI"}),
+        ] {
+            let result = channel
+                .resolve_instrument(
+                    Some("invented-uid"),
+                    &row,
+                    time::macros::date!(2026 - 01 - 01),
+                    broker_context(None),
+                )
+                .await
+                .unwrap();
+            assert!(result.unwrap_err().contains("404"));
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one UID lookup and one later FIGI probe");
+        let uid: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let figi: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        assert_eq!(uid["idType"], "INSTRUMENT_ID_TYPE_UID");
+        assert_eq!(figi["idType"], "INSTRUMENT_ID_TYPE_FIGI");
+    }
+
+    #[tokio::test]
+    async fn uid_404_figi_probe_uses_the_same_request_allowance() {
+        let (gateway, requests, _) =
+            fake::gateway_with_instruments(vec![Answer::status(404, "{}")], None, true);
+        let channel = channel(gateway);
+        let allowance = iaam_http::RequestAllowance::new(1);
+        let context = crate::ports::BrokerRequestContext {
+            deadline: None,
+            allowance: &allowance,
+        };
+        let result = channel
+            .resolve_instrument(
+                Some("invented-uid"),
+                &serde_json::json!({"figi":"TESTFIGI"}),
+                time::macros::date!(2026 - 01 - 01),
+                context,
+            )
+            .await;
+        assert!(
+            result
+                .expect("diagnostic ceiling stays local")
+                .expect_err("original UID miss remains quarantined")
+                .contains("404")
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "probe cannot exceed sync budget"
+        );
+        let next = channel
+            .resolve_instrument(
+                Some("another-invented-uid"),
+                &serde_json::json!({}),
+                time::macros::date!(2026 - 01 - 01),
+                context,
+            )
+            .await;
+        assert!(matches!(
+            next,
+            Err(BrokerError::RequestCeiling { ceiling: 1, .. })
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn description_without_isin_logs_metadata_without_amounts_and_stays_quarantined() {
+        let (gateway, requests, _) = fake::gateway_with_instruments(
+            vec![Answer::status(
+                200,
+                r#"{"instrument":{"ticker":"NOISIN","name":"Invented derivative","instrumentType":"futures","currency":"rub"}}"#,
+            )],
+            None,
+            true,
+        );
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let row = serde_json::json!({"id":"no-isin-operation", "instrumentUid":"no-isin-uid", "quantity":"123456789"});
+        let result = channel
+            .resolve_instrument(
+                Some("no-isin-uid"),
+                &row,
+                time::macros::date!(2026 - 01 - 01),
+                broker_context(None),
+            )
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().contains("names no ISIN"));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no FIGI probe for no-ISIN descriptions"
+        );
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "no_isin",
+            "NOISIN",
+            "Invented derivative",
+            "no-isin-operation",
+            "no-isin-uid",
+        ] {
+            assert!(log.contains(expected), "missing {expected}: {log}");
+        }
+        assert!(!log.contains("123456789"));
     }
 
     /// A future that marks itself the first time it is polled and then never

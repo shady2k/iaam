@@ -11,7 +11,8 @@ impl TinkoffChannel {
         to: Date,
         context: BrokerRequestContext<'_>,
     ) {
-        let dates = questions_commission::affected_dates(operations);
+        let mut dates = questions_commission::affected_dates(operations);
+        dates.extend(questions_zone::affected_dates(operations));
         let mut rows = Vec::new();
         if !dates.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
             for (from, to) in report::report_windows(&dates, from, to) {
@@ -60,5 +61,6 @@ impl TinkoffChannel {
             }
         }
         questions_commission::trace_commission(operations, &rows);
+        questions_zone::trace_trading_zone(operations, &rows);
     }
 }

@@ -56,6 +56,9 @@ mod questions_timestamps;
 #[path = "tinkoff_questions_commission.rs"]
 mod questions_commission;
 
+#[path = "tinkoff_questions_zone.rs"]
+mod questions_zone;
+
 #[path = "tinkoff_questions_reports.rs"]
 mod questions_reports;
 

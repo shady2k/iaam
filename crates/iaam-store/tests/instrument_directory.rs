@@ -109,6 +109,43 @@ fn broker_blocks_are_aggregated_per_handle_in_either_read_order() {
 }
 
 #[test]
+fn blocked_handles_are_sorted_scoped_and_refreshable() {
+    let (store, id) = store_with_one_bond();
+    assert!(store.blocked_instrument_handles(id).unwrap().is_empty());
+    assert!(
+        store
+            .blocked_instrument_handles(InstrumentId::new_random())
+            .unwrap()
+            .is_empty()
+    );
+    for (handle, blocked) in [
+        ("tinkoff:uid:z-last", true),
+        ("tinkoff:uid:ordinary", false),
+        ("tinkoff:uid:a-first", true),
+    ] {
+        store.update_blocked_tca_flag(id, handle, blocked).unwrap();
+    }
+    let mut other = store.instrument(id).unwrap().unwrap();
+    other.id = InstrumentId::new_random();
+    store.upsert_instrument(&other).unwrap();
+    store
+        .update_blocked_tca_flag(other.id, "tinkoff:uid:other", true)
+        .unwrap();
+    assert_eq!(
+        store.blocked_instrument_handles(id).unwrap(),
+        vec!["tinkoff:uid:a-first", "tinkoff:uid:z-last"]
+    );
+    store
+        .update_blocked_tca_flag(id, "tinkoff:uid:a-first", false)
+        .unwrap();
+    assert_eq!(
+        store.blocked_instrument_handles(id).unwrap(),
+        vec!["tinkoff:uid:z-last"]
+    );
+    assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+}
+
+#[test]
 fn a_failed_broker_block_refresh_rolls_back_its_handle_evidence() {
     let (store, id) = store_with_one_bond();
     store

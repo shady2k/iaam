@@ -835,6 +835,16 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Broker-namespaced handles currently reporting a block, sorted by handle.
+    pub fn blocked_instrument_handles(&self, id: InstrumentId) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT handle FROM instrument_broker_blocks
+             WHERE instrument = ?1 AND blocked_tca_flag = 1 ORDER BY handle",
+        )?;
+        let rows = statement.query_map([id.inner().to_string()], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Refresh one broker handle and derive the catalogue flag from all handles.
     /// `handle` is broker-namespaced, not an owner's account or source channel.
     pub fn update_blocked_tca_flag(

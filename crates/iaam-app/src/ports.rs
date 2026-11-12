@@ -630,6 +630,9 @@ pub trait InstrumentDirectory: Send + Sync {
     /// token is not given access to this method through an HTTP route (§7, §14).
     async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError>;
 
+    /// Broker-namespaced handles currently reporting a block, sorted by handle.
+    async fn blocked_instrument_handles(&self, id: InstrumentId) -> Result<Vec<String>, AppError>;
+
     /// Refresh one broker-namespaced handle; the catalogue flag is true if any handle is blocked.
     async fn update_blocked_tca_flag(
         &self,
@@ -2196,7 +2199,7 @@ pub struct Quarantined {
 /// A full repayment whose source reports zero units, not a position size.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingFullRedemption {
-    /// Blocking evidence from the paired withdrawal's own broker description.
+    /// Own-handle evidence for diagnostics; the catalogue flag governs derivation.
     pub blocked_tca_flag: bool,
     /// Exact units named by a paired withdrawal, not an inferred arrival.
     pub withdrawn_quantity: Option<iaam_core::money::Quantity>,

@@ -375,10 +375,12 @@ defect of the comparison.
 ## Blocked-asset units inferred from a broker withdrawal (iaam-xzz5.4.12)
 
 The broker's `blocked_tca_flag` is broker-description evidence, not an owner setting.
-A paired withdrawal uses the flag of its own resolved broker description, not
-that of another handle with the same ISIN. The catalogue exposes the OR of the
-latest persisted descriptions per broker handle; reading a different unblocked
-handle cannot clear a blocked handle. Each handle can refresh its own flag in
+A paired withdrawal uses the catalogue instrument's flag: handles with the same
+ISIN describe one asset. The catalogue exposes the OR of the latest persisted
+descriptions per broker handle; reading a different unblocked handle cannot
+clear a blocked handle. A withdrawal's own false flag therefore does not prevent
+its arrival from being derived when another handle makes the instrument blocked.
+DEBUG then names the blocking handles as well as the withdrawal and redemption. Each handle can refresh its own flag in
 both directions. DEBUG records name the catalogue instrument, resolved handle
 and reported flag. Migration 18 clears the old last-write-wins aggregate because
 it has no per-handle provenance; description reads rebuild it. New backups carry

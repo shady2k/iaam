@@ -6346,7 +6346,7 @@ async fn blocked_fund_two_pairs_restore_each_withdrawal_at_its_own_bound() {
 }
 
 #[tokio::test]
-async fn paired_withdrawals_use_their_own_description_flag_not_the_catalogue_aggregate() {
+async fn both_paired_withdrawals_derive_when_one_handle_makes_the_catalogue_instrument_blocked() {
     use iaam_app::ports::PendingFullRedemption;
     for reverse in [false, true] {
         let owner = OwnerId::new_random();
@@ -6355,9 +6355,22 @@ async fn paired_withdrawals_use_their_own_description_flag_not_the_catalogue_agg
         let services = services_with(date!(2026 - 03 - 31), |store| {
             seed_account(store, owner, account, "Main");
             seed_instrument(store, instrument, "INVENTEDBLOCKED");
-            store
-                .update_blocked_tca_flag(instrument, "tinkoff:invented-blocked-handle", true)
-                .unwrap();
+            let handles = if reverse {
+                [
+                    ("tinkoff:invented-open-handle", false),
+                    ("tinkoff:invented-blocked-handle", true),
+                ]
+            } else {
+                [
+                    ("tinkoff:invented-blocked-handle", true),
+                    ("tinkoff:invented-open-handle", false),
+                ]
+            };
+            for (handle, blocked) in handles {
+                store
+                    .update_blocked_tca_flag(instrument, handle, blocked)
+                    .unwrap();
+            }
         });
         let quantity = iaam_core::money::Quantity(Dec::new("1.2345".parse().unwrap()));
         let mut broker = api_with_claims(
@@ -6408,6 +6421,15 @@ async fn paired_withdrawals_use_their_own_description_flag_not_the_catalogue_agg
                 .pending_redemptions
                 .reverse();
         }
+        let writer = AccountingLogWriter::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || captured.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
         let result = sync_broker(
             &services,
             &principal(owner),
@@ -6418,13 +6440,13 @@ async fn paired_withdrawals_use_their_own_description_flag_not_the_catalogue_agg
         )
         .await
         .unwrap();
-        assert_eq!(result.set_aside, 1, "{:?}", result.recorded);
+        assert_eq!(result.set_aside, 0, "{:?}", result.recorded);
         let events = load_all(&services, owner).await;
         let arrivals: Vec<_> = events
             .iter()
             .filter(|event| matches!(event.kind, EventKind::OpeningPosition { .. }))
             .collect();
-        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals.len(), 2);
         assert_eq!(
             arrivals[0].dates.effective_date(),
             Some(date!(2026 - 03 - 10))
@@ -6433,11 +6455,29 @@ async fn paired_withdrawals_use_their_own_description_flag_not_the_catalogue_agg
             .iter()
             .filter(|event| matches!(event.kind, EventKind::CorporateAction { .. }))
             .collect();
-        assert_eq!(redeemed.len(), 1);
+        assert_eq!(redeemed.len(), 2);
         assert_eq!(
-            redeemed[0].provenance.source_operation_id(),
-            Some("invented-blocked-redemption")
+            arrivals[1].dates.effective_date(),
+            Some(date!(2026 - 03 - 20))
         );
+        let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("catalogue instrument blocked by another broker handle"),
+            "{log}"
+        );
+        assert!(log.contains("tinkoff:invented-blocked-handle"), "{log}");
+        let again = sync_broker(
+            &services,
+            &principal(owner),
+            &broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.set_aside, 0);
+        assert_eq!(load_all(&services, owner).await.len(), events.len());
     }
 }
 

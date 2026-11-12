@@ -1668,6 +1668,11 @@ impl InstrumentDirectory for SqliteAdapter {
         .await
     }
 
+    async fn blocked_instrument_handles(&self, id: InstrumentId) -> Result<Vec<String>, AppError> {
+        self.blocking(move |store| store.blocked_instrument_handles(id).map_err(store_error))
+            .await
+    }
+
     async fn update_blocked_tca_flag(
         &self,
         id: InstrumentId,

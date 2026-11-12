@@ -1510,8 +1510,27 @@ async fn derived_blocked_arrival(
     if !quantity.0.is_positive() {
         return Ok(None);
     }
-    if !pending.blocked_tca_flag {
+    let instrument = services
+        .directory
+        .as_ref()
+        .instrument(pending.instrument)
+        .await?;
+    if !instrument.is_some_and(|instrument| instrument.blocked_tca_flag) {
         return Ok(None);
+    }
+    if !pending.blocked_tca_flag && tracing::enabled!(tracing::Level::DEBUG) {
+        let blocking_handles = services
+            .directory
+            .blocked_instrument_handles(pending.instrument)
+            .await?;
+        tracing::debug!(
+            instrument = %pending.instrument.inner(),
+            withdrawal_operation_id = %withdrawal_id,
+            redemption_operation_id = %pending.source_operation_id,
+            withdrawal_handle_blocked_tca_flag = false,
+            ?blocking_handles,
+            "catalogue instrument blocked by another broker handle"
+        );
     }
     let history = services
         .store

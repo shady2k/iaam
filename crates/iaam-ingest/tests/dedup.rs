@@ -4,7 +4,7 @@
 //! a probable duplicate is shown to the owner rather than deleted.
 
 use iaam_core::event::provenance::RawHash;
-use iaam_core::ids::{AccountId, EventId, InstrumentId};
+use iaam_core::ids::{AccountId, EventId, InstrumentId, SourceId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::dedup::{
     DedupDecision, DedupKey, DedupLevel, DocumentContext, IdentityScope, KnownRecord, assess,
@@ -45,6 +45,7 @@ fn deposit(account: AccountId, minor: i64) -> SubmittedOperation {
 /// Document row: both the document and locator are known.
 fn from_row(account: AccountId, document: &RawHash, row: u64) -> DocumentContext {
     DocumentContext {
+        broker_api_source: None,
         account,
         document: Some(document.clone()),
         sheet: Some("Сделки".to_owned()),
@@ -56,6 +57,7 @@ fn from_row(account: AccountId, document: &RawHash, row: u64) -> DocumentContext
 /// Channel without a file: broker API.
 fn from_stream(account: AccountId) -> DocumentContext {
     DocumentContext {
+        broker_api_source: Some(SourceId(Uuid::from_u128(10))),
         account,
         document: None,
         sheet: None,
@@ -67,6 +69,9 @@ fn from_stream(account: AccountId) -> DocumentContext {
 fn recorded(operation: &SubmittedOperation, context: &DocumentContext) -> KnownRecord {
     KnownRecord {
         event: EventId::new_random(),
+        source: context
+            .broker_api_source
+            .unwrap_or(SourceId(Uuid::from_u128(20))),
         account: operation.account,
         source_operation_id: operation.source_operation_id.clone(),
         idempotency_key: operation.idempotency_key.clone(),
@@ -208,6 +213,7 @@ fn a_channel_without_a_row_number_falls_back_to_the_fingerprint() {
     let operation = deposit(AccountId::new_random(), 100_000);
     let document = hash("c");
     let context = DocumentContext {
+        broker_api_source: None,
         account: operation.account,
         document: Some(document.clone()),
         sheet: None,
@@ -423,12 +429,135 @@ fn different_source_identifiers_do_not_merge() {
 }
 
 #[test]
+fn distinct_api_keys_with_equal_fingerprints_are_fresh_but_repeated_keys_are_duplicates() {
+    let account = AccountId::new_random();
+    let context = from_stream(account);
+    let mut first = deposit(account, 100_000);
+    first.source_operation_id = Some("first".to_owned());
+    let known = vec![recorded(&first, &context)];
+    let mut incoming = first.clone();
+    incoming.source_operation_id = Some("second".to_owned());
+    let (decision, rule) = iaam_ingest::dedup::assess_with_rule(
+        choose_key(&incoming, &context).as_ref(),
+        &fingerprint(&incoming),
+        &context,
+        &known,
+    );
+    assert_eq!(decision, DedupDecision::Fresh);
+    assert_eq!(
+        rule,
+        iaam_ingest::dedup::DedupRule::DistinctSourceKeysWithinChannel
+    );
+    assert_eq!(
+        iaam_ingest::dedup::assess_with_rule(
+            choose_key(&first, &context).as_ref(),
+            &fingerprint(&first),
+            &context,
+            &known,
+        ),
+        (
+            DedupDecision::Duplicate {
+                key: DedupKey::SourceOperationId("first".to_owned()),
+                existing: known[0].event,
+            },
+            iaam_ingest::dedup::DedupRule::KeyMatch
+        )
+    );
+}
+
+#[test]
+fn independent_sources_and_missing_keys_retain_fingerprint_hints() {
+    let account = AccountId::new_random();
+    let context = from_stream(account);
+    let mut first = deposit(account, 100_000);
+    first.source_operation_id = Some("first".to_owned());
+    let known = recorded(&first, &context);
+    let mut incoming = first.clone();
+    incoming.source_operation_id = Some("second".to_owned());
+
+    let mut another_source = known.clone();
+    another_source.source = SourceId::new_random();
+    let mut manual = context.clone();
+    manual.broker_api_source = None;
+    let mut profile = known.clone();
+    profile.document = Some(hash("b"));
+    let mut missing_known_key = known.clone();
+    missing_known_key.source_operation_id = None;
+    let mut empty_known_key = known.clone();
+    empty_known_key.source_operation_id = Some(String::new());
+    let mut other_account = known.clone();
+    other_account.account = AccountId::new_random();
+    // Force the same fingerprint to isolate the account-evidence guard.
+    for (candidate, incoming_context, source_key) in [
+        (another_source, context.clone(), Some("second")),
+        (known.clone(), manual, Some("second")),
+        (profile, context.clone(), Some("second")),
+        (missing_known_key, context.clone(), Some("second")),
+        (empty_known_key, context.clone(), Some("second")),
+        (known.clone(), context.clone(), None),
+        (known.clone(), context.clone(), Some("")),
+        (other_account, context.clone(), Some("second")),
+    ] {
+        incoming.source_operation_id = source_key.map(str::to_owned);
+        let (decision, rule) = iaam_ingest::dedup::assess_with_rule(
+            choose_key(&incoming, &incoming_context).as_ref(),
+            &fingerprint(&incoming),
+            &incoming_context,
+            std::slice::from_ref(&candidate),
+        );
+        assert_eq!(
+            decision,
+            DedupDecision::PossibleDuplicate {
+                of: candidate.event,
+                level: DedupLevel::Probabilistic,
+            }
+        );
+        assert_eq!(
+            rule,
+            iaam_ingest::dedup::DedupRule::FingerprintAcrossSources
+        );
+    }
+}
+
+#[test]
+fn same_channel_distinct_keys_do_not_hide_an_independent_fingerprint_match() {
+    let account = AccountId::new_random();
+    let context = from_stream(account);
+    let mut first = deposit(account, 100_000);
+    first.source_operation_id = Some("first".to_owned());
+    let same_channel = recorded(&first, &context);
+    let mut independent = same_channel.clone();
+    independent.event = EventId::new_random();
+    independent.source = SourceId::new_random();
+    let mut incoming = first;
+    incoming.source_operation_id = Some("second".to_owned());
+    for known in [
+        vec![same_channel.clone(), independent.clone()],
+        vec![independent.clone(), same_channel],
+    ] {
+        assert_eq!(
+            assess(
+                choose_key(&incoming, &context).as_ref(),
+                &fingerprint(&incoming),
+                &context,
+                &known
+            ),
+            DedupDecision::PossibleDuplicate {
+                of: independent.event,
+                level: DedupLevel::Probabilistic
+            }
+        );
+    }
+}
+
+#[test]
 fn account_scope_allows_reused_source_identifier_across_accounts() {
     let first_account = AccountId::new_random();
     let second_account = AccountId::new_random();
     let mut first = deposit(first_account, 100_000);
     first.source_operation_id = Some("OP-ACCOUNT-1".to_owned());
     let context = DocumentContext {
+        broker_api_source: None,
         account: second_account,
         document: None,
         sheet: None,
@@ -453,6 +582,7 @@ fn account_scope_repeats_same_account_source_identifier_as_duplicate() {
     let mut first = deposit(account, 100_000);
     first.source_operation_id = Some("OP-ACCOUNT-2".to_owned());
     let context = DocumentContext {
+        broker_api_source: None,
         account,
         document: None,
         sheet: None,
@@ -481,6 +611,7 @@ fn source_scope_reused_identifier_across_accounts_remains_duplicate() {
     let mut first = deposit(first_account, 100_000);
     first.source_operation_id = Some("OP-SOURCE-1".to_owned());
     let context = DocumentContext {
+        broker_api_source: None,
         account: second_account,
         document: None,
         sheet: None,
@@ -505,6 +636,7 @@ fn source_scope_repeated_identifier_same_account_remains_duplicate() {
     let mut first = deposit(account, 100_000);
     first.source_operation_id = Some("OP-SOURCE-2".to_owned());
     let context = DocumentContext {
+        broker_api_source: None,
         account,
         document: None,
         sheet: None,
@@ -528,6 +660,7 @@ fn same_document_and_fingerprint_become_duplicate() {
     let account = AccountId::new_random();
     let document = hash("2");
     let context = DocumentContext {
+        broker_api_source: None,
         account,
         document: Some(document.clone()),
         sheet: None,
@@ -556,6 +689,7 @@ fn same_document_with_different_fingerprint_enters_journal() {
     let account = AccountId::new_random();
     let document = hash("3");
     let context = DocumentContext {
+        broker_api_source: None,
         account,
         document: Some(document),
         sheet: None,
@@ -576,6 +710,7 @@ fn same_document_with_different_fingerprint_enters_journal() {
 fn different_document_with_same_fingerprint_remains_a_hint() {
     let account = AccountId::new_random();
     let known_context = DocumentContext {
+        broker_api_source: None,
         account,
         document: Some(hash("4")),
         sheet: None,
@@ -583,6 +718,7 @@ fn different_document_with_same_fingerprint_remains_a_hint() {
         identity_scope: IdentityScope::Source,
     };
     let incoming_context = DocumentContext {
+        broker_api_source: None,
         account,
         document: Some(hash("5")),
         sheet: None,

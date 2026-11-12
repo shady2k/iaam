@@ -391,6 +391,7 @@ pub async fn sync_broker(
             document: None,
             sheet: None,
             row: None,
+            broker_api_source: Some(channel.source),
             identity_scope: broker.identity_scope(),
         };
         let key = dedup::choose_key(&operation, &context);
@@ -458,7 +459,15 @@ pub async fn sync_broker(
             recorded.push(Verdict::Rejected { rejection });
             continue;
         }
-        let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        let (decision, rule) =
+            dedup::assess_with_rule(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        trace_dedup_decision(
+            row_index,
+            channel.source,
+            operation.source_operation_id.as_deref().unwrap_or(""),
+            &decision,
+            rule,
+        );
         let possible_duplicate = match &decision {
             DedupDecision::PossibleDuplicate { of, level } => Some((*of, *level)),
             DedupDecision::Duplicate { .. } | DedupDecision::Fresh => None,
@@ -491,6 +500,8 @@ pub async fn sync_broker(
                     verdict = "possible_duplicate",
                     source_operation_id = ?operation.source_operation_id,
                     dedup_level = level.number(),
+                    rule = rule.code(),
+                    source = %channel.source.inner(),
                     match_basis = "canonical_fingerprint",
                     matched_fields = ?dedup::fingerprint_fields(&operation),
                     event = %event.inner(),
@@ -536,6 +547,7 @@ pub async fn sync_broker(
                     document: None,
                     sheet: None,
                     row: None,
+                    broker_api_source: Some(channel.source),
                     identity_scope: broker.identity_scope(),
                 };
                 // Identity is checked before looking up holdings: on a repeat
@@ -549,9 +561,16 @@ pub async fn sync_broker(
                         .collect::<String>(),
                 )
                 .expect("fingerprint is SHA-256");
-                if let DedupDecision::Duplicate { existing, .. } =
-                    dedup::assess(Some(&key), &fingerprint, &context, &known)
-                {
+                let (decision, rule) =
+                    dedup::assess_with_rule(Some(&key), &fingerprint, &context, &known);
+                trace_dedup_decision(
+                    row_index,
+                    channel.source,
+                    &pending.source_operation_id,
+                    &decision,
+                    rule,
+                );
+                if let DedupDecision::Duplicate { existing, .. } = decision {
                     duplicates += 1;
                     recorded.push(Verdict::Duplicate { existing });
                     continue;
@@ -586,6 +605,7 @@ pub async fn sync_broker(
             document: None,
             sheet: None,
             row: None,
+            broker_api_source: Some(channel.source),
             identity_scope: broker.identity_scope(),
         };
         let key = submitted
@@ -652,7 +672,15 @@ pub async fn sync_broker(
         event.provenance = event
             .provenance
             .with_declared_by(PrincipalId(principal.token_id));
-        let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        let (decision, rule) =
+            dedup::assess_with_rule(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        trace_dedup_decision(
+            row_index,
+            channel.source,
+            submitted.source_operation_id.as_deref().unwrap_or(""),
+            &decision,
+            rule,
+        );
         if let DedupDecision::Duplicate { existing, .. } = decision {
             duplicates += 1;
             recorded.push(Verdict::Duplicate { existing });
@@ -674,6 +702,8 @@ pub async fn sync_broker(
                     verdict = "possible_duplicate",
                     source_operation_id = ?submitted.source_operation_id,
                     dedup_level = level.number(),
+                    rule = rule.code(),
+                    source = %channel.source.inner(),
                     match_basis = "canonical_fingerprint",
                     matched_fields = ?dedup::journal_fingerprint_fields(&submitted),
                     event = %event.inner(),
@@ -912,6 +942,29 @@ pub async fn sync_broker(
         assertions_withheld: None,
         binding_recorded,
     })
+}
+
+fn trace_dedup_decision(
+    row_index: usize,
+    source: iaam_core::ids::SourceId,
+    source_operation_id: &str,
+    decision: &DedupDecision,
+    rule: dedup::DedupRule,
+) {
+    let verdict = match decision {
+        DedupDecision::Duplicate { .. } => "duplicate",
+        DedupDecision::Fresh => "fresh",
+        DedupDecision::PossibleDuplicate { .. } => "possible_duplicate",
+    };
+    tracing::debug!(
+        phase = "map",
+        row_index,
+        source = %source.inner(),
+        source_operation_id,
+        rule = rule.code(),
+        verdict,
+        "broker sync dedup assessment"
+    );
 }
 
 /// Only a named type field, never the raw row or a structured kind payload.
@@ -1258,6 +1311,7 @@ fn known_record(event: &Event, event_id: EventId) -> KnownRecord {
     let row = event.provenance.row();
     KnownRecord {
         event: event_id,
+        source: event.provenance.source(),
         account: event.account,
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),
         idempotency_key: event.idempotency_key.clone(),

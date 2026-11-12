@@ -28,7 +28,7 @@
 //! produces false matches and fails to catch duplicates after normalization.
 
 use iaam_core::event::provenance::RawHash;
-use iaam_core::ids::{AccountId, EventId};
+use iaam_core::ids::{AccountId, EventId, SourceId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -120,6 +120,8 @@ pub use iaam_core::reconciliation::evidence::IdentityScope;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentContext {
     pub account: AccountId,
+    /// The broker API channel's source identity. Other submission paths use `None`.
+    pub broker_api_source: Option<SourceId>,
     pub document: Option<RawHash>,
     pub sheet: Option<String>,
     pub row: Option<u64>,
@@ -133,6 +135,8 @@ pub struct DocumentContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownRecord {
     pub event: EventId,
+    /// The source recorded in the event's provenance.
+    pub source: SourceId,
     pub account: AccountId,
     pub source_operation_id: Option<String>,
     pub idempotency_key: Option<String>,
@@ -204,7 +208,8 @@ pub fn choose_key(operation: &SubmittedOperation, context: &DocumentContext) -> 
 ///
 /// Order: an exact match of the selected key — duplicate; otherwise
 /// a fingerprint match with a record from **another** document or a channel without
-/// a file — hint; otherwise the row is new.
+/// a file — hint, unless distinct stable keys in the same broker API channel and
+/// account prove distinct operations; otherwise the row is new.
 #[must_use]
 pub fn assess(
     key: Option<&DedupKey>,
@@ -212,25 +217,87 @@ pub fn assess(
     context: &DocumentContext,
     known: &[KnownRecord],
 ) -> DedupDecision {
+    assess_with_rule(key, fingerprint, context, known).0
+}
+
+/// Evidence for the assessment, including why an equal fingerprint was fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupRule {
+    KeyMatch,
+    DistinctSourceKeysWithinChannel,
+    FingerprintAcrossSources,
+    NoMatch,
+}
+
+impl DedupRule {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::KeyMatch => "key_match",
+            Self::DistinctSourceKeysWithinChannel => "distinct_source_keys_within_channel",
+            Self::FingerprintAcrossSources => "fingerprint_across_sources",
+            Self::NoMatch => "no_match",
+        }
+    }
+}
+
+/// The decision and the rule that supplied its evidence.
+#[must_use]
+pub fn assess_with_rule(
+    key: Option<&DedupKey>,
+    fingerprint: &RawHash,
+    context: &DocumentContext,
+    known: &[KnownRecord],
+) -> (DedupDecision, DedupRule) {
     if let Some(key) = key
         && let Some(existing) = known
             .iter()
             .find(|record| matches_key(record, key, context))
     {
-        return DedupDecision::Duplicate {
-            key: key.clone(),
-            existing: existing.event,
-        };
+        return (
+            DedupDecision::Duplicate {
+                key: key.clone(),
+                existing: existing.event,
+            },
+            DedupRule::KeyMatch,
+        );
     }
-    known
-        .iter()
-        .find(|record| &record.fingerprint == fingerprint && !same_document(record, context))
-        .map_or(DedupDecision::Fresh, |record| {
+    let mut rule = DedupRule::NoMatch;
+    for record in known {
+        if &record.fingerprint != fingerprint || same_document(record, context) {
+            continue;
+        }
+        if distinct_source_keys_within_channel(record, key, context) {
+            rule = DedupRule::DistinctSourceKeysWithinChannel;
+            continue;
+        }
+        return (
             DedupDecision::PossibleDuplicate {
                 of: record.event,
                 level: DedupLevel::Probabilistic,
-            }
-        })
+            },
+            DedupRule::FingerprintAcrossSources,
+        );
+    }
+    (DedupDecision::Fresh, rule)
+}
+
+/// Distinct stable keys in one broker API channel prove distinct operations.
+/// Missing keys or independent sources provide no such evidence.
+fn distinct_source_keys_within_channel(
+    record: &KnownRecord,
+    key: Option<&DedupKey>,
+    context: &DocumentContext,
+) -> bool {
+    context.broker_api_source == Some(record.source)
+        && record.account == context.account
+        && record.document.is_none()
+        && context.document.is_none()
+        && matches!(
+            (record.source_operation_id.as_deref(), key),
+            (Some(known), Some(DedupKey::SourceOperationId(incoming)))
+                if !known.is_empty() && !incoming.is_empty() && known != incoming
+        )
 }
 
 /// Whether it has been proven that the record and row came from the same document.

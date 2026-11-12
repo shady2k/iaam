@@ -1756,6 +1756,8 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
 
     let mut operation = trade(account, instrument, custody);
     operation.source_operation_id = Some("REN_NUMBERED-2".to_owned());
+    // Unlike distinct keys within one API channel, different source IDs leave
+    // this report/API fingerprint match ambiguous, even with both keys present.
     let report_source = SourceId::new_random();
     let existing = report_trade_event(owner, &operation, report_source);
     services
@@ -1819,10 +1821,13 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
         .expect("UTF-8 logs");
     let line = logs
         .lines()
-        .find(|line| line.contains("verdict=\"possible_duplicate\""))
+        .find(|line| {
+            line.contains("verdict=\"possible_duplicate\"") && line.contains("matched_fields=")
+        })
         .unwrap_or_else(|| panic!("missing possible duplicate diagnostic: {logs}"));
     for field in [
         "dedup_level=5",
+        "rule=\"fingerprint_across_sources\"",
         "match_basis=\"canonical_fingerprint\"",
         "REN_NUMBERED-2",
         "matched_fields=",
@@ -5310,6 +5315,140 @@ impl std::io::Write for AccountingLogWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn distinct_t_invest_fee_and_fill_keys_are_not_possible_duplicates_and_resync_is_duplicate() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "DISTINCTFILLS");
+    });
+    let fee = |id: &str| {
+        serde_json::json!({
+            "id": id, "cursor": id, "brokerAccountId": "invented-account",
+            "date": "2026-03-15T10:00:00Z", "type": "OPERATION_TYPE_BROKER_FEE",
+            "state": "OPERATION_STATE_EXECUTED", "quantityDone": "0",
+            "payment": {"units":"-9876543", "nano":0, "currency":"rub"}
+        })
+    };
+    let trade = serde_json::json!({
+        "id":"two-identical-fills", "cursor":"two-identical-fills",
+        "brokerAccountId":"invented-account", "date":"2026-03-15T10:00:00Z",
+        "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+        "instrumentUid":instrument.inner().to_string(), "positionUid":"invented-position",
+        "quantityDone":"2",
+        "payment":{"units":"-2469134", "nano":0, "currency":"rub"},
+        "tradesInfo":{"trades":[
+            {"num":"distinct-fill-one", "date":"2026-03-15T10:00:00Z", "quantity":"1",
+             "price":{"units":"1234567", "nano":0, "currency":"rub"}},
+            {"num":"distinct-fill-two", "date":"2026-03-15T10:00:00Z", "quantity":"1",
+             "price":{"units":"1234567", "nano":0, "currency":"rub"}}
+        ]}
+    });
+    let channel = channel_over(
+        CachedPortfolioTinvest {
+            operations: serde_json::json!({"hasNext":false,
+                "items":[fee("distinct-fee-one"), fee("distinct-fee-two"), trade]})
+            .to_string(),
+            portfolio: r#"{"positions":[]}"#.to_owned(),
+            portfolio_asked: Arc::new(AtomicUsize::new(0)),
+        },
+        &services,
+    );
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("sync invented single page");
+    // Equal economic details do not imply the same fact: within this channel,
+    // distinct authoritative operation/fill keys identify distinct executions.
+    assert_eq!(first.recorded.len(), 4, "{:?}", first.recorded);
+    assert_eq!(first.possible_duplicates, 0, "{:?}", first.recorded);
+    assert_eq!(first.duplicates, 0);
+    assert!(
+        first
+            .recorded
+            .iter()
+            .all(|verdict| matches!(verdict, Verdict::Provisional { .. }))
+    );
+    let events = load(&services, owner).await;
+    assert_eq!(events.len(), 4);
+    let keys = events
+        .iter()
+        .map(|event| {
+            event
+                .provenance
+                .source_operation_id()
+                .expect("each fee and fill has a source key")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys.len(),
+        4,
+        "operation and fill keys must remain distinct"
+    );
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("resync same invented keys");
+    assert_eq!(second.duplicates, 4, "{:?}", second.recorded);
+    assert_eq!(second.possible_duplicates, 0);
+    assert!(
+        second
+            .recorded
+            .iter()
+            .all(|verdict| matches!(verdict, Verdict::Duplicate { .. }))
+    );
+    assert_eq!(load(&services, owner).await.len(), 4);
+
+    let logs = String::from_utf8(captured.0.lock().expect("verdict log buffer").clone())
+        .expect("UTF-8 logs");
+    assert!(!logs.contains("verdict=\"possible_duplicate\""), "{logs}");
+    let distinct_keys = logs
+        .lines()
+        .filter(|line| {
+            line.contains("DEBUG")
+                && line.contains("verdict=\"fresh\"")
+                && line.contains("rule=\"distinct_source_keys_within_channel\"")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(distinct_keys.len(), 2, "second fee and second fill: {logs}");
+    let key_matches = logs
+        .lines()
+        .filter(|line| {
+            line.contains("DEBUG")
+                && line.contains("verdict=\"duplicate\"")
+                && line.contains("rule=\"key_match\"")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(key_matches.len(), 4, "every resynced key: {logs}");
+    for amount in ["987654300", "123456700", "246913400"] {
+        assert!(!logs.contains(amount), "amount value leaked: {logs}");
     }
 }
 

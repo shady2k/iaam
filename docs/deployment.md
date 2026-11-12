@@ -1196,6 +1196,13 @@ Possible-duplicate diagnostics name the deduplication level (`5` for the
 probabilistic hint) and the present canonical fingerprint fields that matched. This is fingerprint equality, not an
 independent field-by-field match, and it does not discard the operation.
 The diagnostics contain field names, never their values or the fingerprint.
+Within one broker API channel and account, different source operation keys
+identify distinct operations even when their fingerprints match. A repeated
+key still identifies a duplicate. Fingerprint hints remain across sources or
+when either operation has no source key. The canonical fingerprint is unchanged.
+Verdict diagnostics include a fixed `rule`: `key_match`,
+`distinct_source_keys_within_channel`, `fingerprint_across_sources`, or
+`no_match` when no comparison matches.
 Enable the relevant application's `debug` logging to inspect individual rows;
 aggregate operation counts are available at `info`.
 

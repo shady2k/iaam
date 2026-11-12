@@ -275,11 +275,21 @@ impl TinkoffChannel {
                     tracing::debug!(phase = "position_refusal_report", figi = ?row.get("figi"), security_code = ticker, catalogue_isins = ?ticker.and_then(|ticker| catalogue_isins.get(ticker)), isin_source = "catalogue", asset_name = ?row.get("name"), direction = ?row.get("direction"), quantity = ?row.get("quantity"), trade_datetime = ?row.get("tradeDatetime"), "broker report row for affected instrument");
                 }
             }
-            Err(_) => tracing::warn!(
-                phase = "position_refusal_report",
-                failure = "report_unavailable",
-                "broker report diagnostic unavailable; refusal unchanged"
-            ),
+            Err(_) => {
+                tracing::debug!(
+                    phase = "position_refusal_report",
+                    failure = "report_unavailable",
+                    account,
+                    from = %from,
+                    to = %to,
+                    "broker report diagnostic request unavailable"
+                );
+                tracing::warn!(
+                    phase = "position_refusal_report",
+                    failure = "report_unavailable",
+                    "broker report diagnostic unavailable; refusal unchanged"
+                );
+            }
         }
     }
 }

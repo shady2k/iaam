@@ -325,33 +325,93 @@ fn maps_each_currency_position_without_aggregate_totals() -> Result<(), Box<dyn 
 
 #[test]
 fn refuses_money_that_cannot_be_represented_in_minor_units() -> Result<(), Box<dyn Error>> {
-    let operations = parse_operations(
-        r#"{
-            "hasNext": false,
-            "items": [{
-                "cursor": "c",
-                "brokerAccountId": "a",
-                "id": "op",
-                "date": "2026-08-20T10:11:12Z",
-                "type": "OPERATION_TYPE_BUY",
-                "state": "OPERATION_STATE_EXECUTED",
-                "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
-                "quantity": "1",
-                "payment": {"units": "1", "nano": 1, "currency": "rub"}
-            }]
-        }"#,
-    )?;
-    assert!(matches!(
-        operations[0].rejection.as_ref(),
-        Some(ParseError::NonRepresentableFraction {
-            field: "payment",
-            currency: CurrencyCode::Rub,
-        })
-    ));
-    assert_eq!(
-        operations[0].raw["id"],
-        serde_json::Value::String("op".to_owned())
-    );
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for level in [tracing::Level::DEBUG, tracing::Level::INFO] {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(level)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || -> Result<(), Box<dyn Error>> {
+            tracing::callsite::rebuild_interest_cache();
+            for (units, nano) in [("0001", 1), ("-1", -1)] {
+                let source_payment = serde_json::json!({
+                    "units": units, "nano": nano, "currency": "rub"
+                });
+                let body = serde_json::json!({
+                    "hasNext": false,
+                    "items": [{
+                        "cursor": "c",
+                        "brokerAccountId": "a",
+                        "id": "op",
+                        "date": "2026-08-20T10:11:12Z",
+                        "type": "OPERATION_TYPE_BUY",
+                        "state": "OPERATION_STATE_EXECUTED",
+                        "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
+                        "quantity": "1",
+                        "payment": source_payment
+                    }]
+                });
+                let operations = parse_operations(&body.to_string())?;
+                assert!(matches!(
+                    operations[0].rejection.as_ref(),
+                    Some(ParseError::NonRepresentableFraction {
+                        field: "payment",
+                        currency: CurrencyCode::Rub,
+                    })
+                ));
+                assert_eq!(operations[0].payment, None);
+                assert_eq!(operations[0].raw["payment"], source_payment);
+            }
+            Ok(())
+        })?;
+        let text = String::from_utf8(capture.0.lock().expect("capture lock").clone())?;
+        if level == tracing::Level::DEBUG {
+            for expected in [
+                "DEBUG",
+                "subminor_payment_unrepresentable",
+                "field=\"payment\"",
+                "source_units=\"0001\"",
+                "source_currency=\"rub\"",
+                "source_nano=1",
+                "source_units=\"-1\"",
+                "source_nano=-1",
+                "currency=\"RUB\"",
+                "minor_units=2",
+                "nano_per_minor=10000000",
+                "remainder_nano=1",
+                "remainder_nano=-1",
+                "operation_id=\"op\"",
+                "source_kind=\"OPERATION_TYPE_BUY\"",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+        } else {
+            assert!(
+                text.is_empty(),
+                "source figures must not appear at INFO: {text}"
+            );
+        }
+    }
     Ok(())
 }
 

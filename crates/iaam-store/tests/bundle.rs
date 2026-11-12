@@ -576,7 +576,9 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
                     instrument,
                     custody: Some(custody),
                     quantity: qty("10"),
-                    principal_returned_per_unit: per_unit("800"),
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                        per_unit("800"),
+                    ),
                     compensation: money(800_000),
                     effective_date: date!(2026 - 06 - 15),
                     record_date: None,
@@ -679,7 +681,9 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
                     instrument,
                     custody: None,
                     quantity: qty("10"),
-                    principal_returned_per_unit: per_unit("800"),
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                        per_unit("800"),
+                    ),
                     compensation: money(800_000),
                     effective_date: date!(2026 - 06 - 15),
                     record_date: None,
@@ -689,6 +693,29 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
             vec![
                 Leg::principal(account, instrument, money(800_000)),
                 Leg::security_without_custody(account, instrument, qty("-10")),
+            ],
+        ),
+        bond_event(
+            owner,
+            account,
+            18,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument,
+                    custody: None,
+                    quantity: qty("3"),
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::Posted(
+                        money(100),
+                    ),
+                    compensation: money(100),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![
+                Leg::principal(account, instrument, money(100)),
+                Leg::security_without_custody(account, instrument, qty("-3")),
             ],
         ),
     ]

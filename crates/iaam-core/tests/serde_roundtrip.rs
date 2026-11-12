@@ -250,7 +250,9 @@ fn every_kind() -> Vec<Event> {
                     instrument,
                     custody: Some(custody),
                     quantity: qty(10),
-                    principal_returned_per_unit: per_unit("800.0000"),
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                        per_unit("800.0000"),
+                    ),
                     compensation: rub(800_000),
                     effective_date: date!(2026 - 12 - 15),
                     record_date: None,

@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/7";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/8";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -607,6 +607,12 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
     let cursor = required_or_reject(item.cursor, "cursor", &mut rejection);
     let date = date_or_reject(item.date, "date", &mut rejection);
     let operation_type = required_or_reject(item.operation_type, "type", &mut rejection);
+    let _operation_span = tracing::debug_span!(
+        "tinkoff_operation",
+        operation_id,
+        source_kind = operation_type
+    )
+    .entered();
     let trades_info = item.trades_info;
     let trades = parse_trades(trades_info)
         .map_err(|error| {
@@ -641,6 +647,25 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         parse_optional_money(item.payment.as_ref(), "payment"),
         &mut rejection,
     );
+    if let Some(ParseError::NonRepresentableFraction { field, .. }) = &rejection {
+        let source = raw.get(*field);
+        tracing::debug!(
+            operation_id,
+            source_kind = operation_type,
+            reason = "subminor_payment_unrepresentable",
+            field,
+            source_units = source
+                .and_then(|v| v.get("units"))
+                .and_then(serde_json::Value::as_str),
+            source_nano = source
+                .and_then(|v| v.get("nano"))
+                .and_then(serde_json::Value::as_i64),
+            source_currency = source
+                .and_then(|v| v.get("currency"))
+                .and_then(serde_json::Value::as_str),
+            "T-Invest row has unrepresentable source cash"
+        );
+    }
     let price = keep_or_reject(
         parse_optional_calc_money(item.price.as_ref(), "price"),
         &mut rejection,
@@ -789,7 +814,20 @@ fn parse_money(value: &RawMoneyValue, field: &'static str) -> Result<ChannelMone
     let divisor = 10_i128
         .checked_pow(9 - minor_units)
         .ok_or(ParseError::NumericOverflow { field })?;
-    if i128::from(value.nano) % divisor != 0 {
+    let remainder = i128::from(value.nano) % divisor;
+    if remainder != 0 {
+        tracing::debug!(
+            reason = "subminor_payment_unrepresentable",
+            field,
+            source_units = value.units.as_deref().unwrap_or_default(),
+            source_nano = value.nano,
+            source_currency = value.currency.as_deref().unwrap_or_default(),
+            currency = currency.code(),
+            minor_units,
+            nano_per_minor = %divisor,
+            remainder_nano = %remainder,
+            "T-Invest source cash cannot be represented without rounding"
+        );
         return Err(ParseError::NonRepresentableFraction { field, currency });
     }
     let scale = 10_i128

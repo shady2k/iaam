@@ -93,6 +93,8 @@ pub enum EventValidationError {
         kind: &'static str,
         field: &'static str,
     },
+    #[error("invalid redemption principal: {0}")]
+    RedemptionPrincipal(#[from] crate::money::ReturnedPrincipalError),
     #[error("for {kind} basis_fee and basis_fee_exact must be present together")]
     BasisFeePresenceMismatch { kind: &'static str },
     #[error(
@@ -770,10 +772,19 @@ impl Event {
                 custody,
                 quantity,
                 compensation,
+                principal_returned_per_unit,
                 ..
             } => {
                 require_positive(name, "compensation", compensation.amount().raw())?;
                 require_positive_quantity(name, "quantity", *quantity)?;
+                principal_returned_per_unit.per_unit_exact(*quantity)?;
+                if principal_returned_per_unit.currency() != compensation.currency() {
+                    return Err(MoneyError::CurrencyMismatch {
+                        left: principal_returned_per_unit.currency(),
+                        right: compensation.currency(),
+                    }
+                    .into());
+                }
                 self.expect_legs(
                     name,
                     &[
@@ -1562,7 +1573,9 @@ mod tests {
                         instrument: self.instrument,
                         custody: Some(self.custody),
                         quantity: qty(10),
-                        principal_returned_per_unit: Self::per_unit("800"),
+                        principal_returned_per_unit: crate::money::ReturnedPrincipal::PerUnit(
+                            Self::per_unit("800"),
+                        ),
                         compensation: rub(1_000_000),
                         effective_date: date!(2026 - 12 - 15),
                         record_date: None,

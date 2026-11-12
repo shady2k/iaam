@@ -20,6 +20,42 @@ use iaam_store::schema::{SCHEMA_VERSION, migrate};
 use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
+fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
+    conn.execute_batch("ALTER TABLE event_tax DROP COLUMN instrument;")
+        .expect("remove the version-13 tax instrument");
+    let legacy = include_str!("../migrations/0001_schema.sql");
+    let start = legacy
+        .find("CREATE TABLE event_corporate_action (")
+        .unwrap();
+    let end = start + legacy[start..].find(") STRICT;").unwrap() + ") STRICT;".len();
+    let create = legacy[start..end].replace(
+        "CREATE TABLE event_corporate_action (",
+        "CREATE TABLE event_corporate_action_old (",
+    );
+    conn.execute_batch(&create)
+        .expect("restore the pre-version-11 corporate-action shape");
+    conn.execute_batch(
+        "INSERT INTO event_corporate_action_old (
+             event, action_kind, instrument, predecessor, successor, custody,
+             quantity, quantity_in, quantity_out, ratio,
+             principal_returned_per_unit_value, principal_returned_per_unit_currency,
+             fractional, basis_transfer, effective_date, record_date, grounds,
+             allocation_kind, allocation_gap, allocation_share,
+             allocation_inputs_hash, allocation_known_as_of, allocation_algorithm
+         ) SELECT
+             event, action_kind, instrument, predecessor, successor, custody,
+             quantity, quantity_in, quantity_out, ratio,
+             principal_returned_per_unit_value, principal_returned_per_unit_currency,
+             fractional, basis_transfer, effective_date, record_date, grounds,
+             allocation_kind, allocation_gap, allocation_share,
+             allocation_inputs_hash, allocation_known_as_of, allocation_algorithm
+         FROM event_corporate_action;
+         DROP TABLE event_corporate_action;
+         ALTER TABLE event_corporate_action_old RENAME TO event_corporate_action;",
+    )
+    .expect("remove the version-14 posted-principal columns");
+}
+
 fn user_version(store: &SqliteStore) -> u32 {
     store
         .connection()
@@ -92,6 +128,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
         "a database this build created is at this build's version"
     );
 
+    rewind_tax_and_redemption_columns(store.connection());
     store
         .connection()
         .execute_batch(
@@ -228,6 +265,7 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
     // `SCHEMA_VERSION` afterwards, and migrations 0004 to 0009 would otherwise
     // find the column and the tables already there from the initial
     // `open_in_memory` and fail on a name that already exists.
+    rewind_tax_and_redemption_columns(connection);
     connection
         .execute_batch(
             "DROP TABLE event_stated_securities_value; \
@@ -291,6 +329,7 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
 
     // The shape a version-8 build actually leaves behind: everything of
     // migrations 1 to 8, nothing of 0009, and the version number it wrote.
+    rewind_tax_and_redemption_columns(store.connection());
     store
         .connection()
         .execute_batch(
@@ -373,14 +412,7 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
 fn version_ten_redemption_rows_survive_optional_custody_migration() {
     let store = SqliteStore::open_in_memory().expect("open");
     let conn = store.connection();
-    let legacy = include_str!("../migrations/0001_schema.sql");
-    let start = legacy
-        .find("CREATE TABLE event_corporate_action (")
-        .unwrap();
-    let end = start + legacy[start..].find(") STRICT;").unwrap() + ") STRICT;".len();
-    conn.execute_batch("DROP TABLE event_corporate_action;")
-        .unwrap();
-    conn.execute_batch(&legacy[start..end]).unwrap();
+    rewind_tax_and_redemption_columns(conn);
     conn.execute_batch(
         "INSERT INTO accounts (id, owner, title, created_at) VALUES ('a', 'o', 'Account', '2026-01-01T00:00:00Z');
          INSERT INTO instruments (id, kind, symbol, title, denomination_currency, settlement_currency, quote_currency, created_at) VALUES ('i', 'bond', 'BOND', 'Bond', 'RUB', 'RUB', 'RUB', '2026-01-01T00:00:00Z');
@@ -412,6 +444,23 @@ fn version_ten_redemption_rows_survive_optional_custody_migration() {
         )
         .is_err()
     );
+    assert!(conn.execute(
+        "UPDATE event_corporate_action SET principal_returned_per_unit_value = NULL, principal_returned_per_unit_currency = NULL WHERE event = 'e'", [],
+    ).is_err(), "neither principal representation is invalid");
+    assert!(conn.execute(
+        "UPDATE event_corporate_action SET posted_principal_minor = 100, posted_principal_currency = 'RUB' WHERE event = 'e'", [],
+    ).is_err(), "both principal representations are invalid");
+    conn.execute(
+        "UPDATE event_corporate_action SET quantity = '3', principal_returned_per_unit_value = NULL, principal_returned_per_unit_currency = NULL, posted_principal_minor = 100, posted_principal_currency = 'RUB' WHERE event = 'e'", [],
+    ).expect("posted principal is preserved without a rounded quotient");
+    let posted: i64 = conn
+        .query_row(
+            "SELECT posted_principal_minor FROM event_corporate_action WHERE event = 'e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(posted, 100);
     assert_eq!(user_version(&store), SCHEMA_VERSION);
 }
 

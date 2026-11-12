@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use time::Date;
 
 use crate::ids::{CustodyId, InstrumentId};
-use crate::money::{Money, PerUnitAmount, Quantity};
+use crate::money::{Money, PerUnitAmount, Quantity, ReturnedPrincipal};
 use crate::numeric::decimal::Dec;
 
 /// Corporate action for a security.
@@ -58,7 +58,7 @@ pub enum CorporateAction {
         instrument: InstrumentId,
         custody: Option<CustodyId>,
         quantity: Quantity,
-        principal_returned_per_unit: PerUnitAmount,
+        principal_returned_per_unit: ReturnedPrincipal,
         compensation: Money,
         effective_date: Date,
         record_date: Option<Date>,
@@ -188,7 +188,9 @@ mod tests {
             instrument: InstrumentId::new_random(),
             custody: Some(CustodyId::new_random()),
             quantity: Quantity(dec("100")),
-            principal_returned_per_unit: per_unit("800.0000"),
+            principal_returned_per_unit: crate::money::ReturnedPrincipal::PerUnit(per_unit(
+                "800.0000",
+            )),
             compensation: rub(8_000_000),
             effective_date: date!(2026 - 12 - 15),
             record_date: None,

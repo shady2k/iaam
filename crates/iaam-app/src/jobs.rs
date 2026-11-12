@@ -529,9 +529,8 @@ mod tests {
                     instrument,
                     custody: Some(CustodyId::new_random()),
                     quantity: qty(10),
-                    principal_returned_per_unit: PerUnitAmount::new(
-                        Dec::new(Decimal::from(800)),
-                        CurrencyCode::Rub,
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                        PerUnitAmount::new(Dec::new(Decimal::from(800)), CurrencyCode::Rub),
                     ),
                     compensation: rub(8_000),
                     effective_date: date!(2026 - 12 - 15),

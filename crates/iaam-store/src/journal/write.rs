@@ -585,8 +585,9 @@ fn insert_corporate_action(
             principal_returned_per_unit_value, principal_returned_per_unit_currency,
             fractional, basis_transfer, effective_date, record_date, grounds,
             allocation_kind, allocation_gap, allocation_share,
-            allocation_inputs_hash, allocation_known_as_of, allocation_algorithm
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+            allocation_inputs_hash, allocation_known_as_of, allocation_algorithm,
+            posted_principal_minor, posted_principal_currency
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
         params![
             row.event,
             row.action_kind,
@@ -611,6 +612,8 @@ fn insert_corporate_action(
             row.allocation_inputs_hash,
             row.allocation_known_as_of,
             row.allocation_algorithm,
+            row.posted_principal_minor,
+            row.posted_principal_currency,
         ],
     ), "insert_corporate_action_detail", "event_corporate_action", event_id = row.event, instrument_id = row.instrument, predecessor = row.predecessor, successor = row.successor, custody = row.custody)?;
     Ok(())

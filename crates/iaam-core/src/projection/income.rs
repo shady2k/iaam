@@ -831,7 +831,9 @@ mod tests {
                     instrument,
                     custody: Some(CustodyId::new_random()),
                     quantity: qty(10),
-                    principal_returned_per_unit: per_unit("100"),
+                    principal_returned_per_unit: crate::money::ReturnedPrincipal::PerUnit(
+                        per_unit("100"),
+                    ),
                     compensation,
                     effective_date: date!(2026 - 09 - 15),
                     record_date: None,

@@ -38,7 +38,9 @@ use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId, InstrumentId,
     OwnerId, PrincipalId, SourceId, TransferId,
 };
-use iaam_core::money::{CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+use iaam_core::money::{
+    CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity, ReturnedPrincipal,
+};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -456,6 +458,8 @@ fn corporate_action_to_row(
         ratio: None,
         principal_returned_per_unit_value: None,
         principal_returned_per_unit_currency: None,
+        posted_principal_minor: None,
+        posted_principal_currency: None,
         fractional: None,
         basis_transfer: None,
         effective_date: String::new(),
@@ -517,27 +521,32 @@ fn corporate_action_to_row(
             custody,
             quantity,
             principal_returned_per_unit,
-            // Reconstructed from the `Principal` leg (spec §4.5).
             compensation: _,
             effective_date,
             record_date,
             grounds,
-        } => Ok(CorporateActionRow {
-            action_kind: "redemption".to_owned(),
-            instrument: Some(instrument.inner().to_string()),
-            custody: custody.map(|id| id.inner().to_string()),
-            quantity: Some(dec_to_text(quantity.0)),
-            principal_returned_per_unit_value: Some(dec_to_text(
-                principal_returned_per_unit.value(),
-            )),
-            principal_returned_per_unit_currency: Some(
-                principal_returned_per_unit.currency().code().to_owned(),
-            ),
-            effective_date: date_to_text(*effective_date),
-            record_date: record_date.map(date_to_text),
-            grounds: grounds.clone(),
-            ..base
-        }),
+        } => {
+            let (per_unit, posted) = match principal_returned_per_unit {
+                ReturnedPrincipal::PerUnit(amount) => (Some(*amount), None),
+                ReturnedPrincipal::Posted(amount) => (None, Some(*amount)),
+            };
+            Ok(CorporateActionRow {
+                action_kind: "redemption".to_owned(),
+                instrument: Some(instrument.inner().to_string()),
+                custody: custody.map(|id| id.inner().to_string()),
+                quantity: Some(dec_to_text(quantity.0)),
+                principal_returned_per_unit_value: per_unit
+                    .map(|amount| dec_to_text(amount.value())),
+                principal_returned_per_unit_currency: per_unit
+                    .map(|amount| amount.currency().code().to_owned()),
+                posted_principal_minor: posted.map(|amount| amount.amount().raw()),
+                posted_principal_currency: posted.map(|amount| amount.currency().code().to_owned()),
+                effective_date: date_to_text(*effective_date),
+                record_date: record_date.map(date_to_text),
+                grounds: grounds.clone(),
+                ..base
+            })
+        }
         CorporateAction::Conversion {
             predecessor,
             successor,
@@ -1113,16 +1122,29 @@ fn corporate_action_from_row(
                 field,
                 &require_str(field, row.quantity.as_deref())?,
             )?),
-            principal_returned_per_unit: PerUnitAmount::new(
-                dec_from_text(
+            principal_returned_per_unit: match (
+                row.principal_returned_per_unit_value.as_deref(),
+                row.posted_principal_minor,
+            ) {
+                (Some(value), None) => ReturnedPrincipal::PerUnit(PerUnitAmount::new(
+                    dec_from_text(field, value)?,
+                    parse_currency(
+                        field,
+                        &require_str(field, row.principal_returned_per_unit_currency.as_deref())?,
+                    )?,
+                )),
+                (None, Some(minor)) => ReturnedPrincipal::Posted(require_money(
                     field,
-                    &require_str(field, row.principal_returned_per_unit_value.as_deref())?,
-                )?,
-                parse_currency(
-                    field,
-                    &require_str(field, row.principal_returned_per_unit_currency.as_deref())?,
-                )?,
-            ),
+                    Some(minor),
+                    row.posted_principal_currency.as_deref(),
+                )?),
+                _ => {
+                    return Err(StoreError::InvalidValue {
+                        field,
+                        value: "expected exactly one principal representation".to_owned(),
+                    });
+                }
+            },
             compensation: single_leg_money(legs, LegKind::Principal)?,
             effective_date,
             record_date,
@@ -2026,7 +2048,9 @@ mod tests {
         AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId,
         InstrumentId, OwnerId, PrincipalId, SourceId, TransferId,
     };
-    use iaam_core::money::{CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use iaam_core::money::{
+        CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity, ReturnedPrincipal,
+    };
     use iaam_core::numeric::decimal::Dec;
     use iaam_core::reconciliation::Dimension;
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -2508,7 +2532,9 @@ mod tests {
                     instrument: f.instrument,
                     custody: Some(f.custody),
                     quantity: qty("10"),
-                    principal_returned_per_unit: per_unit("800"),
+                    principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                        per_unit("800"),
+                    ),
                     compensation: rub(i64::MIN),
                     effective_date: date!(2026 - 12 - 15),
                     record_date: None,
@@ -2532,6 +2558,27 @@ mod tests {
             leg.custody = None;
         }
         events.push(without_custody);
+
+        let mut posted = events.last().unwrap().clone();
+        if let EventKind::CorporateAction {
+            action:
+                CorporateAction::Redemption {
+                    quantity,
+                    principal_returned_per_unit,
+                    compensation,
+                    ..
+                },
+        } = &mut posted.kind
+        {
+            *quantity = qty("3");
+            *principal_returned_per_unit = ReturnedPrincipal::Posted(rub(100));
+            *compensation = rub(100);
+        }
+        posted.legs = vec![
+            Leg::principal(f.account, f.instrument, rub(100)),
+            Leg::security(f.account, f.custody, f.instrument, qty("-3")),
+        ];
+        events.push(posted);
 
         // --- CorporateAction: Conversion, with and without compensation ------
         let successor = InstrumentId::new_random();

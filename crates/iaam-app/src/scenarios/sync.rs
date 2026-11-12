@@ -1279,18 +1279,15 @@ async fn resolve_full_redemption(
             pending.effective_date
         )));
     };
-    let principal_returned_per_unit =
-        match iaam_core::money::returned_principal_per_unit(pending.compensation, quantity) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(format!("bond redemption principal per unit: {error}"))),
-        };
     Ok(Ok(iaam_ingest::SubmittedJournalEvent {
         account: pending.account,
         fact: iaam_ingest::JournalFact::CorporateAction(CorporateAction::Redemption {
             instrument: pending.instrument,
             custody: None,
             quantity,
-            principal_returned_per_unit,
+            principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::Posted(
+                pending.compensation,
+            ),
             compensation: pending.compensation,
             effective_date: pending.effective_date,
             record_date: None,

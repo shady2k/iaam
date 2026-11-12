@@ -440,7 +440,9 @@ mod tests {
                 instrument: InstrumentId::new_random(),
                 custody: Some(CustodyId::new_random()),
                 quantity: qty("10"),
-                principal_returned_per_unit: PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
+                principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                    PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
+                ),
                 compensation: rub(1_000_000),
                 effective_date: date!(2026 - 06 - 01),
                 record_date: None,
@@ -456,7 +458,9 @@ mod tests {
                 instrument: InstrumentId::new_random(),
                 custody: None,
                 quantity: qty("10"),
-                principal_returned_per_unit: PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
+                principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::PerUnit(
+                    PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
+                ),
                 compensation: rub(1_000_000),
                 effective_date: date!(2026 - 06 - 01),
                 record_date: None,

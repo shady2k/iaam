@@ -266,6 +266,8 @@ pub(crate) struct CorporateActionRow {
     pub ratio: Option<String>,
     pub principal_returned_per_unit_value: Option<String>,
     pub principal_returned_per_unit_currency: Option<String>,
+    pub posted_principal_minor: Option<i64>,
+    pub posted_principal_currency: Option<String>,
     pub fractional: Option<String>,
     pub basis_transfer: Option<String>,
     pub effective_date: String,

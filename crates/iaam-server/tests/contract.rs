@@ -8392,6 +8392,83 @@ async fn a_redemption_is_recorded_through_the_journal_route() {
 }
 
 #[tokio::test]
+async fn a_posted_redemption_preserves_exact_cash_through_the_journal_route() {
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_id(&path, harness.instrument, "POSTED-REDEMPTION");
+    let body = json!({
+        "source_label": "test",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "redemption",
+                "instrument": harness.instrument.inner(),
+                "quantity": "3",
+                "posted_principal": { "amount": "1.00", "currency": "RUB" },
+                "compensation": { "amount": "1.00", "currency": "RUB" },
+                "effective_date": "2026-06-01"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events
+        .iter()
+        .find(|event| matches!(&event.kind, EventKind::CorporateAction { .. }))
+        .expect("stored redemption");
+    let EventKind::CorporateAction {
+        action:
+            iaam_core::event::corporate_action::CorporateAction::Redemption {
+                instrument,
+                custody,
+                quantity,
+                principal_returned_per_unit,
+                compensation,
+                ..
+            },
+    } = &event.kind
+    else {
+        panic!("expected redemption");
+    };
+    assert_eq!(*instrument, harness.instrument);
+    assert_eq!(*custody, None);
+    assert_eq!(quantity.0.inner().to_string(), "3");
+    let iaam_core::money::ReturnedPrincipal::Posted(principal) = principal_returned_per_unit else {
+        panic!("expected source-posted principal, not a rounded per-unit value");
+    };
+    assert_eq!(principal.amount().raw(), 100);
+    assert_eq!(principal.currency(), CurrencyCode::Rub);
+    assert_eq!(compensation, principal);
+    let principal_legs: Vec<_> = event
+        .legs
+        .iter()
+        .filter(|leg| leg.kind == iaam_core::event::leg::LegKind::Principal)
+        .collect();
+    assert_eq!(principal_legs.len(), 1);
+    let leg = principal_legs[0];
+    assert_eq!(leg.account, harness.account);
+    assert_eq!(leg.instrument, Some(harness.instrument));
+    assert_eq!(leg.money, Some(*principal));
+    assert_eq!(
+        event.cash_effect(CurrencyCode::Rub).expect("cash effect"),
+        *principal
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn a_conversion_is_recorded_through_the_journal_route() {
     let (harness, path) = harness_on_disk().await;
     seed_instrument_and_custody(&path, &harness).await;

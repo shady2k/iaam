@@ -26,7 +26,7 @@ use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::{Dimension, evidence::SourceChannel};
 use iaam_core::rules::trade_allocation::{
-    allocate_minor as core_allocate_minor, check_order_completeness,
+    allocate_gross_minor, allocate_minor as core_allocate_minor,
 };
 use iaam_ingest::SubmittedOperation;
 use iaam_ingest::dedup::IdentityScope;
@@ -1124,7 +1124,7 @@ fn redemption_to_journal(
     operation: ChannelOperation,
 ) -> Result<iaam_ingest::journal_event::SubmittedJournalEvent, RowRefusal> {
     use iaam_core::event::corporate_action::CorporateAction;
-    use iaam_core::money::{Money, returned_principal_per_unit};
+    use iaam_core::money::Money;
     use iaam_ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 
     let instrument = optional_instrument(&operation)?
@@ -1141,15 +1141,13 @@ fn redemption_to_journal(
         .filter(|payment| payment.amount.raw() > 0)
         .ok_or_else(|| row_unparsable("bond redemption requires positive payment"))?;
     let compensation = Money::new(payment.amount, payment.currency);
-    let principal_returned_per_unit = returned_principal_per_unit(compensation, quantity)
-        .map_err(|error| row_unparsable(format!("bond redemption principal per unit: {error}")))?;
     Ok(SubmittedJournalEvent {
         account,
         fact: JournalFact::CorporateAction(CorporateAction::Redemption {
             instrument,
             custody: None,
             quantity,
-            principal_returned_per_unit,
+            principal_returned_per_unit: iaam_core::money::ReturnedPrincipal::Posted(compensation),
             compensation,
             effective_date,
             record_date: None,
@@ -1403,30 +1401,7 @@ fn trade_row_reason(operation: &ChannelOperation, kind: &ChannelOperationKind) -
         }
         _ => {}
     }
-    let grosses = operation
-        .trades
-        .iter()
-        .map(|trade| iaam_core::money::gross_for_fill(trade.price, trade.quantity))
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(grosses) = grosses else {
-        return Some("trade gross total is not representable".to_owned());
-    };
-    let Some(payment_minor) = payment.magnitude() else {
-        return Some("payment magnitude is not representable".to_owned());
-    };
-    let accrued_money = Some(CalcMoney::new(
-        Dec::new(Decimal::new(accrued, currency.minor_units())),
-        currency,
-    ));
-    match check_order_completeness(&grosses, accrued_money, payment_minor, currency) {
-        Ok(None) => None,
-        Ok(Some(mismatch)) => Some(format!(
-            "order payment {} does not equal trade total {}",
-            mismatch.reported.raw(),
-            mismatch.expected.raw()
-        )),
-        Err(_) => Some("trade money total is not representable".to_owned()),
-    }
+    trade_gross_allocations(payment, accrued, &operation.trades, currency).err()
 }
 
 fn trade_operations(
@@ -1451,6 +1426,25 @@ fn trade_operations(
             .then_with(|| left.num.as_bytes().cmp(right.num.as_bytes()))
     });
     let currency = trades[0].price.currency();
+    let payment = operation
+        .payment
+        .ok_or_else(|| row_unparsable("trading order does not report payment"))?;
+    let accrued = operation
+        .accrued_interest
+        .map_or(0, |value| value.amount.raw());
+    let gross_allocation =
+        trade_gross_allocations(payment, accrued, &trades, currency).map_err(row_unparsable)?;
+    if let Some(reconciliation) = gross_allocation.reconciliation {
+        tracing::debug!(
+            phase = "map_operations",
+            reason = "cash_authoritative",
+            operation_id = operation.operation_id,
+            payment_minor = reconciliation.payment.raw(),
+            trade_total_minor = reconciliation.trade_total.raw(),
+            delta_minor = reconciliation.delta.raw(),
+            "broker payment overrides calculated trade total"
+        );
+    }
     let commission_minor = posted_commission(operation.commission, currency)?;
     let commission_allocations = commission_minor
         .map(|total| allocate_minor(total, &trades))
@@ -1467,24 +1461,9 @@ fn trade_operations(
         .into_iter()
         .zip(commission_allocations)
         .zip(accrued_allocations)
-        .map(|((trade, commission), accrued)| {
-            let gross_exact = iaam_core::money::gross_for_fill(trade.price, trade.quantity)
-                .map_err(|error| {
-                    row_unparsable(format!("trade {} gross overflow: {error}", trade.num))
-                })?;
-            let gross = CalcMoney::new(
-                Dec::new(gross_exact.value().inner().abs()),
-                trade.price.currency(),
-            );
-            let gross_minor = gross
-                .rounded_minor()
-                .map_err(|error| {
-                    row_unparsable(format!(
-                        "trade {} gross cannot be rounded: {error}",
-                        trade.num
-                    ))
-                })?
-                .raw();
+        .zip(gross_allocation.amounts)
+        .map(|(((trade, commission), accrued), gross)| {
+            let gross_minor = gross.raw();
             let basis_fee = calc_money_from_minor(commission, currency);
             let accrued_interest_minor = accrued_known.then_some(accrued);
             // No custody here: the channel names no place of storage for a
@@ -1548,6 +1527,40 @@ fn trade_operations(
             })
         })
         .collect()
+}
+
+fn trade_gross_allocations(
+    payment: ChannelMoney,
+    accrued: i64,
+    trades: &[iaam_broker::tinkoff::ChannelTrade],
+    currency: CurrencyCode,
+) -> Result<iaam_core::rules::trade_allocation::GrossAllocation, String> {
+    let payment = payment
+        .magnitude()
+        .ok_or_else(|| "payment magnitude is not representable".to_owned())?;
+    let mut order = (0..trades.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        trades[*left]
+            .num
+            .as_bytes()
+            .cmp(trades[*right].num.as_bytes())
+    });
+    let grosses = order
+        .iter()
+        .map(|index| {
+            iaam_core::money::gross_for_fill(trades[*index].price, trades[*index].quantity)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("trade gross total is not representable: {error}"))?;
+    let mut allocation =
+        allocate_gross_minor(payment, PostedMinor::new(accrued), &grosses, currency)
+            .map_err(|error| error.to_string())?;
+    let mut amounts = vec![PostedMinor::new(0); trades.len()];
+    for (position, index) in order.into_iter().enumerate() {
+        amounts[index] = allocation.amounts[position];
+    }
+    allocation.amounts = amounts;
+    Ok(allocation)
 }
 
 fn posted_commission(
@@ -3686,7 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_order_money_quarantines_with_both_amounts() {
+    fn mismatched_order_money_uses_broker_cash_instead_of_refusing() {
         let body = trading_operation_with_fields(TradingOperationFields {
             operation_type: "OPERATION_TYPE_BUY",
             state: "OPERATION_STATE_EXECUTED",
@@ -3702,14 +3715,21 @@ mod tests {
         });
         let (accepted, quarantined) = accepted_trade_operations(&body);
 
-        assert!(accepted.is_empty());
-        assert_eq!(quarantined.len(), 1);
-        assert!(quarantined[0].reason.contains("25"));
-        assert!(quarantined[0].reason.contains("24"));
+        assert!(quarantined.is_empty());
+        assert_eq!(accepted.len(), 2);
+        for operation in accepted {
+            assert!(matches!(
+                operation.kind,
+                OperationKind::Buy {
+                    gross_minor: 1_250,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
-    fn accrued_interest_is_part_of_order_completeness() {
+    fn accrued_interest_is_removed_from_authoritative_order_cash() {
         let trade = trade("bond-fill", "2026-08-21T10:00:00Z", "1", "120", 0);
         let matching = trading_operation_with_fields(TradingOperationFields {
             operation_type: "OPERATION_TYPE_BUY",
@@ -3734,8 +3754,72 @@ mod tests {
         assert_eq!(accepted.len(), 1);
         assert!(quarantined.is_empty());
         let (accepted, quarantined) = accepted_trade_operations(&mismatching);
-        assert!(accepted.is_empty());
-        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined.is_empty());
+        assert!(matches!(
+            accepted[0].kind,
+            OperationKind::Buy {
+                gross_minor: 11_700,
+                accrued_interest_minor: Some(300),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mismatched_cash_is_allocated_by_exact_gross_and_reconciles_after_accrued() {
+        for operation_type in ["OPERATION_TYPE_BUY", "OPERATION_TYPE_SELL"] {
+            let payment = if operation_type == "OPERATION_TYPE_BUY" {
+                r#"{"units":"-13","nano":-10000000,"currency":"rub"}"#
+            } else {
+                r#"{"units":"13","nano":10000000,"currency":"rub"}"#
+            };
+            let fills = [
+                trade("b", "2026-08-21T10:00:00Z", "1", "20", 2_000_000),
+                trade("a", "2026-08-21T10:00:00Z", "1", "10", 1_000_000),
+            ];
+            let adapt = |trades: &str| {
+                let body = trading_operation_with_fields(TradingOperationFields {
+                    operation_type,
+                    state: "OPERATION_STATE_EXECUTED",
+                    operation_id: "cash-authoritative",
+                    quantity_done: "2",
+                    payment,
+                    fields: r#","accruedInt":{"units":"3","nano":0,"currency":"rub"}"#,
+                    trades,
+                });
+                let (accepted, quarantined) = accepted_trade_operations(&body);
+                assert!(quarantined.is_empty());
+                accepted
+                    .into_iter()
+                    .map(|operation| match operation.kind {
+                        OperationKind::Buy {
+                            gross_minor,
+                            accrued_interest_minor,
+                            ..
+                        }
+                        | OperationKind::Sell {
+                            gross_minor,
+                            accrued_interest_minor,
+                            ..
+                        } => (gross_minor, accrued_interest_minor.unwrap()),
+                        other => panic!("expected trade, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let amounts = adapt(&fills.join(","));
+            assert_eq!(amounts, vec![(334, 150), (667, 150)]);
+            assert_eq!(
+                amounts
+                    .iter()
+                    .map(|(gross, accrued)| gross + accrued)
+                    .sum::<i64>(),
+                1_301
+            );
+            assert_eq!(
+                amounts,
+                adapt(&[fills[1].clone(), fills[0].clone()].join(","))
+            );
+        }
     }
 
     #[test]
@@ -4618,8 +4702,10 @@ mod full_redemption_tests {
         assert_eq!(*custody, None, "positionUid is not a custody place");
         assert_eq!(quantity.0.inner().to_string(), "3");
         assert_eq!(
-            principal_returned_per_unit.value(),
-            Dec::new(Decimal::from(800))
+            principal_returned_per_unit
+                .per_unit_exact(*quantity)
+                .unwrap(),
+            iaam_core::numeric::exact::Exact::from_int(800)
         );
         assert_eq!(principal_returned_per_unit.currency(), CurrencyCode::Rub);
         assert_eq!(compensation.amount().raw(), 240_000);
@@ -4663,6 +4749,38 @@ mod full_redemption_tests {
             "-3"
         );
         assert_eq!(security.custody, None);
+    }
+
+    #[test]
+    fn full_repayment_keeps_one_ruble_for_three_securities_exactly() {
+        use iaam_core::event::corporate_action::CorporateAction;
+        use iaam_core::money::ReturnedPrincipal;
+        use iaam_core::numeric::exact::Exact;
+        use iaam_ingest::journal_event::JournalFact;
+
+        let mut row = full_repayment_row();
+        row["payment"] = serde_json::json!({"units": "1", "nano": 0, "currency": "rub"});
+        let parsed = adapt_row(row);
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        let JournalFact::CorporateAction(CorporateAction::Redemption {
+            quantity,
+            principal_returned_per_unit,
+            compensation,
+            ..
+        }) = &parsed.journal[0].fact
+        else {
+            panic!("expected a redemption");
+        };
+        assert!(
+            matches!(principal_returned_per_unit, ReturnedPrincipal::Posted(amount) if amount.amount().raw() == 100)
+        );
+        assert_eq!(compensation.amount().raw(), 100);
+        assert_eq!(
+            principal_returned_per_unit
+                .per_unit_exact(*quantity)
+                .unwrap(),
+            Exact::new(1, 3).unwrap()
+        );
     }
 
     #[test]

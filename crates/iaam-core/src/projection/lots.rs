@@ -1687,7 +1687,9 @@ mod tests {
                     instrument: bond.instrument,
                     custody: Some(bond.custody),
                     quantity: qty(10),
-                    principal_returned_per_unit: per_unit("800"),
+                    principal_returned_per_unit: crate::money::ReturnedPrincipal::PerUnit(
+                        per_unit("800"),
+                    ),
                     compensation: rub(800_000),
                     effective_date: date!(2026 - 12 - 15),
                     record_date: None,

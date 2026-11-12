@@ -2997,8 +2997,10 @@ async fn a_full_bond_repayment_persists_principal_and_removes_quantity_only_once
             assert_eq!(*custody, None, "an opaque position UID is not custody");
             assert_eq!(*quantity, positive_quantity);
             assert_eq!(
-                principal_returned_per_unit.value(),
-                Dec::new(rust_decimal::Decimal::from(1000))
+                principal_returned_per_unit
+                    .per_unit_exact(*quantity)
+                    .unwrap(),
+                iaam_core::numeric::exact::Exact::from_int(1000)
             );
             assert_eq!(principal_returned_per_unit.currency(), CurrencyCode::Rub);
             assert_eq!(compensation.amount().raw(), 200_000);
@@ -3235,8 +3237,10 @@ async fn a_zero_quantity_full_repayment_retires_the_position_at_its_date_only_on
             assert_eq!(compensation.amount().raw(), 200_000);
             assert_eq!(compensation.currency(), CurrencyCode::Rub);
             assert_eq!(
-                principal_returned_per_unit.value(),
-                Dec::new(rust_decimal::Decimal::from(1000))
+                principal_returned_per_unit
+                    .per_unit_exact(*quantity)
+                    .unwrap(),
+                iaam_core::numeric::exact::Exact::from_int(1000)
             );
             assert_eq!(*effective_date, date!(2026 - 03 - 15));
         }
@@ -5619,7 +5623,11 @@ async fn operation_pages_account_for_source_rows_without_counting_trade_fills_as
     ] {
         let line = logs
             .lines()
-            .find(|line| line.contains("DEBUG") && line.contains(&format!("operation_id=\"{id}\"")))
+            .find(|line| {
+                line.contains("DEBUG")
+                    && line.contains(&format!("operation_id=\"{id}\""))
+                    && line.contains(&format!("reason=\"{reason}\""))
+            })
             .unwrap_or_else(|| panic!("missing quarantine diagnostic for {id}: {logs}"));
         assert!(
             line.contains("source_kind=\"OPERATION_TYPE_INPUT\""),

@@ -432,7 +432,7 @@ impl Event {
         require_equal(name, money, declared)
     }
 
-    /// Tax: exactly one negative tax leg, equal to the declared amount.
+    /// Tax: exactly one nonzero tax leg, equal to the declared cash effect.
     ///
     /// Deliberately a separate function from `validate_fee` rather than a
     /// shared one parameterised by leg kind: the two shapes are equal today by
@@ -445,7 +445,7 @@ impl Event {
     ) -> Result<(), EventValidationError> {
         let tax_legs = self.legs_of_kind(LegKind::Tax);
         let money = single_leg_money(name, &tax_legs, "exactly one tax leg")?;
-        if money.amount().raw() >= 0 {
+        if money.amount().raw() == 0 {
             return Err(EventValidationError::WrongSign {
                 kind: name,
                 amount: money.amount().raw(),
@@ -2103,6 +2103,7 @@ mod tests {
         let account = AccountId::new_random();
         event(
             EventKind::Tax {
+                instrument: None,
                 amount,
                 origin: TaxOrigin::SelfPaid,
             },
@@ -2118,10 +2119,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tax_positive_leg_is_rejected() {
-        // A tax that increases the balance is not a tax. Taking the absolute
-        // value here is how a refund silently becomes a charge.
+    fn a_tax_refund_has_a_positive_tax_leg() {
         let event = tax_event(rub(130_000), rub(130_000));
+        assert!(event.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn a_zero_tax_leg_is_rejected() {
+        let event = tax_event(rub(0), rub(0));
         assert!(matches!(
             event.validate_structure(),
             Err(EventValidationError::WrongSign { .. })
@@ -2133,6 +2138,7 @@ mod tests {
         let account = AccountId::new_random();
         let event = event(
             EventKind::Tax {
+                instrument: None,
                 amount: rub(-130_000),
                 origin: TaxOrigin::WithheldAtSource,
             },
@@ -2150,6 +2156,7 @@ mod tests {
         let account = AccountId::new_random();
         let event = event(
             EventKind::Tax {
+                instrument: None,
                 amount: rub(-130_000),
                 origin: TaxOrigin::SelfPaid,
             },
@@ -2168,6 +2175,7 @@ mod tests {
     #[test]
     fn a_tax_names_itself_and_stays_within_the_account() {
         let kind = EventKind::Tax {
+            instrument: None,
             amount: rub(-1),
             origin: TaxOrigin::SelfPaid,
         };

@@ -24,6 +24,71 @@ fn dec(text: &str) -> Dec {
 }
 
 #[test]
+fn tax_rows_preserve_signed_payment_and_named_instrument() -> Result<(), Box<dyn Error>> {
+    use iaam_broker::operation_kind::{ChannelOperationKind, OperationKindDictionary};
+    use iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS;
+
+    let (dictionary, unreadable) =
+        OperationKindDictionary::build(TINKOFF_OPERATION_KINDS.iter().copied());
+    assert!(unreadable.is_empty());
+    for (source_kind, units, nano, expected_minor, instrument) in [
+        (
+            "OPERATION_TYPE_DIVIDEND_TAX",
+            "-11",
+            -250_000_000,
+            -1125,
+            Some("00000000-0000-4000-8000-000000000071"),
+        ),
+        ("OPERATION_TYPE_TAX", "-8", 0, -800, None),
+        (
+            "OPERATION_TYPE_TAX_CORRECTION",
+            "-3",
+            -500_000_000,
+            -350,
+            None,
+        ),
+        (
+            "OPERATION_TYPE_TAX_CORRECTION",
+            "3",
+            500_000_000,
+            350,
+            Some("00000000-0000-4000-8000-000000000072"),
+        ),
+    ] {
+        let body = serde_json::json!({
+            "hasNext": false,
+            "items": [{
+                "cursor": "invented-tax-cursor",
+                "brokerAccountId": "invented-tax-account",
+                "id": "invented-tax-row",
+                "date": "2026-08-20T10:11:12Z",
+                "type": source_kind,
+                "state": "OPERATION_STATE_EXECUTED",
+                "instrumentUid": instrument,
+                "payment": {"units": units, "nano": nano, "currency": "rub"}
+            }]
+        });
+        let operations = parse_operations(&body.to_string())?;
+        let operation = &operations[0];
+        assert_eq!(operation.rejection, None, "{source_kind}");
+        assert_eq!(
+            dictionary.kind_of(&operation.source_kind),
+            ChannelOperationKind::Tax
+        );
+        assert_eq!(
+            operation.payment.expect("payment").amount,
+            PostedMinor::new(expected_minor)
+        );
+        assert_eq!(operation.instrument_uid.as_deref(), instrument);
+        assert_eq!(
+            operation.parser_version,
+            ParserVersion(TINKOFF_PARSER_VERSION.to_owned())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn tinkoff_commission_is_exact_and_does_not_reject_the_trade() -> Result<(), Box<dyn Error>> {
     let body = include_str!("../../../tests/fixtures/api/tinkoff-operations.json");
     let operations = parse_operations(body)?;

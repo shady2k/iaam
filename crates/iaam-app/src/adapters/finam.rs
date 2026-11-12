@@ -18,7 +18,7 @@ use iaam_broker::finam::{
     FinamError, ParseError, parse_asset_description, parse_operations, parse_portfolio,
 };
 use iaam_broker::operation_kind::OperationKindDictionary;
-use iaam_core::event::kind::{FeeOrigin, IncomeKind};
+use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, SourceId};
 #[cfg(test)]
@@ -720,6 +720,7 @@ fn dimensions_for_kind(kind: &ChannelOperationKind) -> BTreeSet<Dimension> {
             [Dimension::Cash, Dimension::Income].into_iter().collect()
         }
         ChannelOperationKind::Commission
+        | ChannelOperationKind::Tax
         | ChannelOperationKind::Deposit
         | ChannelOperationKind::Withdrawal
         | ChannelOperationKind::Transfer
@@ -957,6 +958,24 @@ async fn operation_to_submitted(
                     gross_minor,
                     currency,
                     kind: Some(income_kind),
+                }
+            }
+            ChannelOperationKind::Tax => {
+                let payment = operation
+                    .payment
+                    .ok_or_else(|| row_unparsable("operation does not contain change"))?;
+                let amount_minor = payment
+                    .amount
+                    .checked_neg()
+                    .ok_or_else(|| {
+                        row_unparsable("tax payment opposite sign is not representable")
+                    })?
+                    .raw();
+                OperationKind::Tax {
+                    amount_minor,
+                    currency: payment.currency,
+                    origin: TaxOrigin::WithheldAtSource,
+                    instrument: symbols.optional(&operation).await?,
                 }
             }
             ChannelOperationKind::Commission => {

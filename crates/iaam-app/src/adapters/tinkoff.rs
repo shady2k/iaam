@@ -18,7 +18,7 @@ use iaam_broker::tinkoff::{
     TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError, parse_account_ids, parse_operations,
     parse_portfolio, parse_portfolio_positions,
 };
-use iaam_core::event::kind::{FeeOrigin, IncomeKind};
+use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
@@ -968,7 +968,20 @@ fn adapt_operations_accounted(
             match operation_to_submitted(account, operation, kind)
                 .map_err(|error| error.with_dimensions(dimensions))
             {
-                Ok(operation) => accepted.push(operation),
+                Ok(operation) => {
+                    tracing::debug!(
+                        phase = "map_operations",
+                        operation_id,
+                        source_kind,
+                        mapped_kind = match &operation.kind {
+                            OperationKind::Tax { .. } => "tax",
+                            OperationKind::Fee { .. } => "fee",
+                            _ => "operation",
+                        },
+                        "T-Invest operation mapped"
+                    );
+                    accepted.push(operation);
+                }
                 Err(RowRefusal::Row { reason, dimensions }) => {
                     trace_quarantined_operation(&operation_id, &source_kind, "conversion");
                     quarantined.push(Quarantined {
@@ -1028,6 +1041,7 @@ fn dimensions_for_kind(kind: &ChannelOperationKind) -> BTreeSet<Dimension> {
             [Dimension::Cash, Dimension::Income].into_iter().collect()
         }
         ChannelOperationKind::Commission
+        | ChannelOperationKind::Tax
         | ChannelOperationKind::Deposit
         | ChannelOperationKind::Withdrawal
         | ChannelOperationKind::Transfer
@@ -1181,6 +1195,22 @@ fn operation_to_submitted(
                 gross_minor,
                 currency,
                 kind: Some(income_kind),
+            }
+        }
+        ChannelOperationKind::Tax => {
+            let payment = operation
+                .payment
+                .ok_or_else(|| row_unparsable("operation does not contain payment"))?;
+            let amount_minor = payment
+                .amount
+                .checked_neg()
+                .ok_or_else(|| row_unparsable("tax payment opposite sign is not representable"))?
+                .raw();
+            OperationKind::Tax {
+                amount_minor,
+                currency: payment.currency,
+                origin: TaxOrigin::WithheldAtSource,
+                instrument: optional_instrument(&operation)?,
             }
         }
         ChannelOperationKind::Commission => {
@@ -1900,6 +1930,71 @@ mod tests {
         order_state_reason, rfc3339_operation_end, trade_operations,
     };
     use iaam_broker::operation_kind::OperationKindDictionary;
+
+    #[test]
+    fn tax_codes_map_to_signed_tax_facts_with_optional_instruments() {
+        let (dictionary, unreadable) = OperationKindDictionary::build(
+            iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                .iter()
+                .copied(),
+        );
+        assert!(unreadable.is_empty());
+        let instrument = InstrumentId(Uuid::from_u128(71));
+        for (source_kind, units, expected_cash, named) in [
+            (
+                "OPERATION_TYPE_DIVIDEND_TAX",
+                "-11",
+                -1100,
+                Some(instrument),
+            ),
+            ("OPERATION_TYPE_TAX", "-8", -800, None),
+            ("OPERATION_TYPE_TAX_CORRECTION", "-3", -300, None),
+            ("OPERATION_TYPE_TAX_CORRECTION", "3", 300, Some(instrument)),
+        ] {
+            let body = serde_json::json!({
+                "hasNext": false,
+                "items": [{
+                    "cursor": "invented-tax-cursor",
+                    "brokerAccountId": "invented-tax-account",
+                    "id": "invented-tax-row",
+                    "date": "2026-08-20T10:11:12Z",
+                    "type": source_kind,
+                    "state": "OPERATION_STATE_EXECUTED",
+                    "instrumentUid": named.map(|id| id.inner().to_string()),
+                    "payment": {"units": units, "nano": 0, "currency": "rub"}
+                }]
+            });
+            let parsed = adapt_operations(
+                AccountId::new_random(),
+                parse_operations(&body.to_string()).expect("parse"),
+                &dictionary,
+            )
+            .expect("adapt");
+            assert!(parsed.quarantined.is_empty(), "{source_kind}");
+            assert_eq!(parsed.accepted.len(), 1);
+            let context = NormalizationContext {
+                owner: OwnerId::new_random(),
+                source: SourceId::new_random(),
+                parser_version: ParserVersion(super::TINKOFF_PARSER_VERSION.to_owned()),
+            };
+            let event = normalize(&parsed.accepted[0], &context)
+                .expect("normalize tax")
+                .event;
+            event.validate_structure().expect("tax structure");
+            assert!(
+                matches!(&event.kind, EventKind::Tax { instrument, origin: iaam_core::event::kind::TaxOrigin::WithheldAtSource, .. } if *instrument == named)
+            );
+            assert_eq!(
+                event
+                    .cash_effect(iaam_core::money::CurrencyCode::Rub)
+                    .expect("cash")
+                    .amount()
+                    .raw(),
+                expected_cash
+            );
+        }
+    }
+
     fn broker_context(
         deadline: Option<std::time::Instant>,
     ) -> crate::ports::BrokerRequestContext<'static> {

@@ -583,9 +583,12 @@ pub enum OperationKindDto {
         origin: FeeOriginDto,
     },
     Tax {
+        /// Positive for a charge, negative for a refund.
         amount: String,
         currency: CurrencyDto,
         origin: TaxOriginDto,
+        #[serde(default)]
+        instrument: Option<Uuid>,
     },
     /// A reconstructed opening (§10.7): the cash the account is stated to have
     /// held before the journal began, recorded as **one more movement**, not
@@ -1141,7 +1144,9 @@ impl OperationDto {
                 amount,
                 currency,
                 origin,
+                instrument,
             } => OperationKind::Tax {
+                instrument: instrument.map(InstrumentId),
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
                 origin: origin.to_domain(),

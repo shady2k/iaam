@@ -1088,9 +1088,16 @@ fn kind_aspects(kind: &EventKind) -> KindAspects {
             moved: vec![KindFigure::Money(*amount)],
             confidence: Vec::new(),
         },
-        EventKind::Tax { amount, origin } => KindAspects {
+        EventKind::Tax {
+            amount,
+            origin,
+            instrument,
+        } => KindAspects {
             word: vec![KindWord::Tax(*origin)],
-            moved: vec![KindFigure::Money(*amount)],
+            moved: figures([
+                instrument.map(KindFigure::Instrument),
+                Some(KindFigure::Money(*amount)),
+            ]),
             confidence: Vec::new(),
         },
         EventKind::OpeningPosition {
@@ -2237,7 +2244,11 @@ mod tests {
             ..ctx.deposit(1, -1_200, ctx.main)
         };
         let tax = |origin| iaam_core::event::Event {
-            kind: EventKind::Tax { amount, origin },
+            kind: EventKind::Tax {
+                amount,
+                origin,
+                instrument: None,
+            },
             ..ctx.deposit(2, -1_200, ctx.main)
         };
 

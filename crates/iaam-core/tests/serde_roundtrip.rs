@@ -150,6 +150,7 @@ fn every_kind() -> Vec<Event> {
         ),
         envelope(
             EventKind::Tax {
+                instrument: None,
                 amount: rub(-17),
                 origin: TaxOrigin::WithheldAtSource,
             },

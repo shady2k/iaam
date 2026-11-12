@@ -155,6 +155,7 @@ pub(crate) struct FeeRow {
 pub(crate) struct TaxRow {
     pub event: String,
     pub origin: String,
+    pub instrument: Option<String>,
 }
 
 /// `event_opening_position`. `quantity` here is the reconstructed position's

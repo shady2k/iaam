@@ -286,6 +286,7 @@ fn load_tax(conn: &Connection, ids: &[String]) -> Result<Vec<TaxRow>, StoreError
         Ok(TaxRow {
             event: row.get("event")?,
             origin: row.get("origin")?,
+            instrument: row.get("instrument")?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -925,8 +926,8 @@ mod tests {
 
     fn insert_tax(conn: &rusqlite::Connection, row: &TaxRow) {
         conn.execute(
-            "INSERT INTO event_tax (event, origin) VALUES (?1,?2)",
-            params![row.event, row.origin],
+            "INSERT INTO event_tax (event, origin, instrument) VALUES (?1,?2,?3)",
+            params![row.event, row.origin, row.instrument],
         )
         .expect("insert tax detail");
     }

@@ -252,9 +252,11 @@ fn kind_to_detail(event: &str, kind: &EventKind) -> Result<DetailRows, StoreErro
             // Reconstructed from the single tax leg (spec §4.5).
             amount: _,
             origin,
+            instrument,
         } => Ok(DetailRows::Tax(TaxRow {
             event: event.to_owned(),
             origin: tax_origin_code(*origin).to_owned(),
+            instrument: instrument.map(|id| id.inner().to_string()),
         })),
         EventKind::OpeningPosition {
             instrument,
@@ -775,6 +777,11 @@ fn detail_to_kind(kind: &str, detail: DetailRows, legs: &[Leg]) -> Result<EventK
         DetailRows::Tax(row) => Ok(EventKind::Tax {
             amount: single_leg_money(legs, LegKind::Tax)?,
             origin: parse_tax_origin(&row.origin)?,
+            instrument: row
+                .instrument
+                .as_deref()
+                .map(|id| parse_uuid("event_tax.instrument", id).map(InstrumentId))
+                .transpose()?,
         }),
         DetailRows::OpeningPosition(row) => opening_position_from_row(*row),
         DetailRows::StatedSecuritiesValue(row) => stated_securities_value_from_row(row),
@@ -2256,15 +2263,20 @@ mod tests {
             ));
         }
 
-        // --- Tax: every origin ------------------------------------------------
+        // --- Tax: origin, instrument and withholding/refund signs ------------
         for origin in [TaxOrigin::WithheldAtSource, TaxOrigin::SelfPaid] {
-            events.push(f.event(
-                EventKind::Tax {
-                    amount: rub(-1_300),
-                    origin,
-                },
-                vec![Leg::tax(f.account, rub(-1_300))],
-            ));
+            for instrument in [None, Some(f.instrument)] {
+                for amount in [rub(-1_300), rub(1_300)] {
+                    events.push(f.event(
+                        EventKind::Tax {
+                            amount,
+                            origin,
+                            instrument,
+                        },
+                        vec![Leg::tax(f.account, amount)],
+                    ));
+                }
+            }
         }
 
         // --- Trade: every Option combination on the extra fields -----------

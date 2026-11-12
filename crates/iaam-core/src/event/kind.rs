@@ -256,13 +256,18 @@ pub enum EventKind {
     },
     /// Fee not tied to a trade.
     Fee { amount: Money, origin: FeeOrigin },
-    /// Tax, whether withheld at source or paid by the owner.
+    /// Tax charge (negative cash effect) or refund (positive cash effect).
     ///
     /// Modelled on `Fee`: a cost borne by the contour rather than money
     /// crossing its boundary. Without a fact of its own, a self-paid tax is
     /// indistinguishable from ordinary spending, and discretionary spending is
     /// overstated by exactly the tax bill (spec §2).
-    Tax { amount: Money, origin: TaxOrigin },
+    Tax {
+        amount: Money,
+        origin: TaxOrigin,
+        #[serde(default)]
+        instrument: Option<InstrumentId>,
+    },
     /// Reconstructed position for an account with no history (§10.7).
     OpeningPosition {
         instrument: InstrumentId,

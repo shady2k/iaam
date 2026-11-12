@@ -253,14 +253,14 @@ pub enum OperationKind {
     },
     /// Tax, whether a broker withheld it or the owner paid it himself.
     ///
-    /// Submitted positive and recorded negative, on a tax leg. `origin` is the
-    /// distinction that matters afterwards, and it is stated rather than
-    /// inferred: withheld tax has already left the account, and self-paid tax is
-    /// a payment the owner made.
+    /// A positive amount is a charge; a negative amount is a refund.
+    /// The journal records the opposite sign as the cash effect on a tax leg.
     Tax {
         amount_minor: i64,
         currency: CurrencyCode,
         origin: TaxOrigin,
+        #[serde(default)]
+        instrument: Option<InstrumentId>,
     },
     /// The cash a reconstructed account already held before the journal begins.
     ///
@@ -839,12 +839,23 @@ fn build(
             amount_minor,
             currency,
             origin,
+            instrument,
         } => {
-            let amount = money(-positive(*amount_minor, "amount", *currency)?, *currency);
+            let signed = amount_minor
+                .checked_neg()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| Rejection {
+                    field: "amount".to_owned(),
+                    expected: "nonzero tax charge or refund with representable opposite sign"
+                        .to_owned(),
+                    actual: amount_minor.to_string(),
+                })?;
+            let amount = money(signed, *currency);
             Ok((
                 EventKind::Tax {
                     amount,
                     origin: *origin,
+                    instrument: *instrument,
                 },
                 vec![Leg::tax(account, amount)],
             ))

@@ -10119,7 +10119,7 @@ async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
         .expect("stored tax event");
 
     match &event.kind {
-        EventKind::Tax { amount, origin } => {
+        EventKind::Tax { amount, origin, .. } => {
             assert_eq!(amount.amount().raw(), -130_000);
             assert_eq!(*origin, iaam_core::event::kind::TaxOrigin::SelfPaid);
         }
@@ -10143,9 +10143,73 @@ async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
 }
 
 #[tokio::test]
-async fn tax_amounts_are_rejected_per_row_when_not_positive() {
+async fn a_tax_refund_retains_the_named_instrument_and_positive_cash_effect() {
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_id(&path, harness.instrument, "TAX");
+    let body = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "tax",
+            "amount": "-7.30",
+            "instrument": harness.instrument.inner(),
+            "currency": "RUB",
+            "origin": "self_paid",
+            "dates": { "cash_posted": "2026-08-25" },
+            "idempotency_key": "tax-refund",
+        }],
+    });
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events
+        .into_iter()
+        .find(|event| matches!(&event.kind, EventKind::Tax { .. }))
+        .expect("stored tax event");
+
+    match &event.kind {
+        EventKind::Tax {
+            amount,
+            origin,
+            instrument,
+        } => {
+            assert_eq!(*instrument, Some(harness.instrument));
+            assert_eq!(amount.amount().raw(), 730);
+            assert_eq!(*origin, iaam_core::event::kind::TaxOrigin::SelfPaid);
+        }
+        other => panic!("expected a tax event, got {other:?}"),
+    }
+
+    let tax_legs: Vec<_> = event
+        .legs
+        .iter()
+        .filter(|leg| leg.kind == iaam_core::event::leg::LegKind::Tax)
+        .collect();
+    assert_eq!(tax_legs.len(), 1);
+    let leg = tax_legs[0];
+    assert_eq!(leg.account, harness.account);
+    let money = leg.money.expect("tax leg amount");
+    assert_eq!(money.amount().raw(), 730);
+    assert_eq!(money.currency(), CurrencyCode::Rub);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn zero_tax_amount_is_rejected_per_row() {
     let harness = harness().await;
-    for (row, amount) in ["0.00", "-1.00"].into_iter().enumerate() {
+    for (row, amount) in ["0.00"].into_iter().enumerate() {
         let body = json!({
             "source_label": "manual entry",
             "operations": [{

@@ -1385,6 +1385,7 @@ mod tests {
         flow.apply(
             &event(
                 EventKind::Tax {
+                    instrument: None,
                     amount: rub(-13_000),
                     origin: TaxOrigin::SelfPaid,
                 },

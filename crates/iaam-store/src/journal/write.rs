@@ -406,8 +406,8 @@ fn insert_fee(tx: &Transaction<'_>, row: &FeeRow) -> Result<(), StoreError> {
 fn insert_tax(tx: &Transaction<'_>, row: &TaxRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
-            "INSERT INTO event_tax (event, origin) VALUES (?1,?2)",
-            params![row.event, row.origin],
+            "INSERT INTO event_tax (event, origin, instrument) VALUES (?1,?2,?3)",
+            params![row.event, row.origin, row.instrument],
         ),
         "insert_tax_detail",
         "event_tax",
@@ -1337,6 +1337,33 @@ mod tests {
     }
 
     // --- Digest stability (spec §9) --------------------------------------
+
+    #[test]
+    fn tax_instrument_and_signed_cash_round_trip_through_sql() {
+        let mut store = open_store();
+        let fixture = Fixture::new(&store);
+        for instrument in [None, Some(fixture.instrument)] {
+            for raw in [-1_300, 1_300] {
+                let amount = Money::new(PostedMinor::new(raw), CurrencyCode::Rub);
+                let event = fixture.base_event(
+                    1,
+                    EventKind::Tax {
+                        amount,
+                        origin: iaam_core::event::kind::TaxOrigin::WithheldAtSource,
+                        instrument,
+                    },
+                    vec![Leg::tax(fixture.account, amount)],
+                );
+                let tx = store.connection_mut().transaction().expect("open tx");
+                insert_event_in(&tx, &event).expect("insert tax");
+                let reconstructed = hydrate_one(&tx, event.id)
+                    .expect("hydrate tax")
+                    .expect("tax exists");
+                assert_eq!(reconstructed, event);
+                tx.rollback().expect("rollback fixture");
+            }
+        }
+    }
 
     #[test]
     fn a_round_tripped_event_encodes_to_identical_cbor() {

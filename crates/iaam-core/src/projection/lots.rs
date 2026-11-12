@@ -715,6 +715,7 @@ impl LotBook {
             | EventKind::UnresolvedOwnAccountMovement { .. }
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }
+            | EventKind::CurrencyExchange { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }

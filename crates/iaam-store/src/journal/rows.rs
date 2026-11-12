@@ -114,6 +114,15 @@ pub(crate) struct TradeRow {
     pub accrued_interest_currency: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrencyExchangeRow {
+    pub event: String,
+    pub sold_amount: i64,
+    pub sold_currency: String,
+    pub bought_amount: i64,
+    pub bought_currency: String,
+}
+
 /// `event_cash_transfer`. `amount` is reconstructed from the positive `to`
 /// leg (spec §4.5) and is deliberately absent here; both endpoints are
 /// stored because both legs are `LegKind::Cash` and carry no role, so
@@ -330,6 +339,7 @@ pub(crate) enum DetailRows {
     Trade(TradeRow),
     SecuritiesTransferOut(SecuritiesTransferOutRow),
     CashTransfer(CashTransferRow),
+    CurrencyExchange(CurrencyExchangeRow),
     UnresolvedMovement(UnresolvedMovementRow),
     Income(IncomeRow),
     Fee(FeeRow),

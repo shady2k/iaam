@@ -1043,6 +1043,11 @@ fn kind_aspects(kind: &EventKind) -> KindAspects {
             ]),
             confidence: Vec::new(),
         },
+        EventKind::CurrencyExchange { sold, bought } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Money(*sold), KindFigure::Money(*bought)],
+            confidence: Vec::new(),
+        },
         // Seven families whose whole claim is one sum. The unresolved
         // own-account movement and the stated securities value are the two
         // that post no leg to repeat it — the second because it names no

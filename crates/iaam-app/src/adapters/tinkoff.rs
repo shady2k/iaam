@@ -439,6 +439,8 @@ impl BrokerChannel for TinkoffChannel {
         );
         let mut checked = Vec::new();
         let mut refused = Vec::new();
+        let mut currency_cache = HashMap::new();
+        let mut currency_rows = HashMap::new();
         for mut operation in operations {
             let has_identity = operation.instrument_uid.is_some()
                 || ["figi", "ticker", "isin"].into_iter().any(|key| {
@@ -448,7 +450,75 @@ impl BrokerChannel for TinkoffChannel {
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|value| !value.is_empty())
                 });
-            if has_identity && operation.rejection.is_none() {
+            let kind = self.dictionary.kind_of(&operation.source_kind);
+            let is_currency = operation
+                .raw
+                .get("instrumentKind")
+                .and_then(serde_json::Value::as_str)
+                == Some("INSTRUMENT_TYPE_CURRENCY")
+                || operation
+                    .raw
+                    .get("instrumentType")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("currency");
+            let currency_trade = is_currency
+                && matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell);
+            if currency_trade && operation.rejection.is_none() {
+                let identity = operation
+                    .instrument_uid
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| (id, InstrumentIdType::Uid))
+                    .or_else(|| {
+                        operation
+                            .figi
+                            .as_deref()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| (id, InstrumentIdType::Figi))
+                    });
+                let result = if let Some((id, id_type)) = identity {
+                    let key = format!("{id_type:?}:{id}");
+                    if !currency_cache.contains_key(&key) {
+                        let result = match self
+                            .client
+                            .get_currency(id, id_type, context.deadline, context.allowance)
+                            .await
+                            .map_err(tinkoff_error)
+                        {
+                            Ok(body) => {
+                                iaam_broker::tinkoff::parse::parse_currency_description(&body)
+                                    .map_err(|error| error.to_string())
+                            }
+                            Err(
+                                BrokerError::Refused { detail, .. }
+                                | BrokerError::Unparsable { detail, .. },
+                            ) => Err(detail),
+                            Err(error) => return Err(error),
+                        };
+                        currency_cache.insert(key.clone(), result);
+                    }
+                    currency_cache.get(&key).expect("cached currency").clone()
+                } else {
+                    Err("currency description requires instrument UID or FIGI".to_owned())
+                };
+                match result {
+                    Ok(description) => {
+                        tracing::debug!(phase = "describe_currency", iso_currency = description.nominal.currency().code(), settlement = description.settlement.code(), lot = description.lot, nominal = ?description.nominal.value(), "currency description read");
+                        currency_rows.insert(operation.deduplication_key.clone(), description);
+                    }
+                    Err(reason) => {
+                        refused.push(Quarantined {
+                            reason: format!("currency description refused: {reason}"),
+                            dimensions: [Dimension::Cash].into_iter().collect(),
+                            raw: operation.raw,
+                        });
+                        continue;
+                    }
+                }
+            } else if has_identity
+                && operation.rejection.is_none()
+                && !(is_currency && matches!(kind, ChannelOperationKind::Commission))
+            {
                 match self
                     .resolve_instrument(
                         operation.instrument_uid.as_deref(),
@@ -494,7 +564,7 @@ impl BrokerChannel for TinkoffChannel {
             "broker sync phase complete"
         );
         let (mut parsed, accounting) =
-            adapt_operations_accounted(account, checked, &self.dictionary)?;
+            adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
         let quarantined_instrument_resolution = refused.len();
         parsed.quarantined.extend(refused);
         tracing::info!(
@@ -937,10 +1007,20 @@ fn adapt_operations(
     adapt_operations_accounted(account, operations, dictionary).map(|(parsed, _)| parsed)
 }
 
+#[cfg(test)]
 fn adapt_operations_accounted(
     account: AccountId,
     operations: Vec<ChannelOperation>,
     dictionary: &OperationKindDictionary,
+) -> Result<(ParsedOperations, OperationAccounting), BrokerError> {
+    adapt_operations_with_currencies(account, operations, dictionary, &HashMap::new())
+}
+
+fn adapt_operations_with_currencies(
+    account: AccountId,
+    operations: Vec<ChannelOperation>,
+    dictionary: &OperationKindDictionary,
+    currency_rows: &HashMap<String, iaam_broker::tinkoff::parse::CurrencyDescription>,
 ) -> Result<(ParsedOperations, OperationAccounting), BrokerError> {
     // An empty dictionary means an unconfigured channel, not an unknown broker.
     // Without this check, the owner would receive a rejection for every code
@@ -978,6 +1058,7 @@ fn adapt_operations_accounted(
             operation.source_kind.clone()
         };
         // Take the payload before moving the operation into conversion; no later stage reads it.
+        let currency_description = currency_rows.get(&operation.deduplication_key);
         let raw = std::mem::take(&mut operation.raw);
         let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(rejection) = operation.rejection.as_ref() {
@@ -1087,6 +1168,15 @@ fn adapt_operations_accounted(
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
+            }
+        } else if let Some(description) = currency_description {
+            match currency_exchange_operations(account, operation, kind, description) {
+                Ok(exchange) => accepted.extend(exchange),
+                Err(error) => quarantined.push(Quarantined {
+                    raw,
+                    reason: format!("currency exchange: {error:?}"),
+                    dimensions: [Dimension::Cash].into_iter().collect(),
+                }),
             }
         } else if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
             if let Some(reason) = trade_row_reason(&operation, &kind) {
@@ -1320,6 +1410,104 @@ fn redemption_to_journal(
         idempotency_key: Some(operation.deduplication_key),
         source_operation_id: Some(operation.operation_id),
     })
+}
+
+fn currency_exchange_operations(
+    account: AccountId,
+    operation: ChannelOperation,
+    kind: ChannelOperationKind,
+    description: &iaam_broker::tinkoff::parse::CurrencyDescription,
+) -> Result<Vec<SubmittedOperation>, RowRefusal> {
+    let date = operation
+        .date
+        .ok_or_else(|| row_unparsable("currency exchange lacks date"))?;
+    let quantity = operation
+        .quantity
+        .ok_or_else(|| row_unparsable("currency exchange lacks quantity"))?;
+    let foreign = iaam_core::money::currency_amount_from_nominal(description.nominal, quantity)
+        .map_err(|error| row_unparsable(format!("currency quantity: {error}")))?;
+    let payment = operation
+        .payment
+        .ok_or_else(|| row_unparsable("currency exchange lacks payment"))?;
+    if payment.currency != description.settlement || payment.currency == foreign.currency() {
+        return Err(row_unparsable(
+            "currency exchange payment does not match distinct settlement currency",
+        ));
+    }
+    let cash = iaam_core::money::Money::new(
+        payment
+            .magnitude()
+            .ok_or_else(|| row_unparsable("invalid payment"))?,
+        payment.currency,
+    );
+    let (sold, bought) = match kind {
+        ChannelOperationKind::Buy if payment.amount.raw() < 0 => (cash, foreign),
+        ChannelOperationKind::Sell if payment.amount.raw() > 0 => (foreign, cash),
+        _ => {
+            return Err(row_unparsable(
+                "currency exchange payment sign disagrees with operation",
+            ));
+        }
+    };
+    let fee = if let Some(commission) = operation
+        .commission
+        .filter(|value| value.value() != Dec::zero())
+    {
+        let magnitude = CalcMoney::new(
+            Dec::new(commission.value().inner().abs()),
+            commission.currency(),
+        );
+        let amount = iaam_core::money::currency_amount_from_nominal(
+            magnitude,
+            iaam_core::money::Quantity(Dec::new(Decimal::ONE)),
+        )
+        .map_err(|error| row_unparsable(format!("currency exchange commission: {error}")))?;
+        Some(amount)
+    } else {
+        None
+    };
+    let submitted = |kind, key: String, source_id: String| SubmittedOperation {
+        account,
+        kind,
+        dates: OperationDates {
+            trade: Some(date),
+            ..OperationDates::default()
+        },
+        source_time: operation.source_time,
+        idempotency_key: Some(key),
+        source_operation_id: Some(source_id),
+        source_position_id: None,
+        source_category: None,
+        owner_category: None,
+        source_code: None,
+        source_kind: None,
+        description: None,
+        counterparty: None,
+    };
+    let mut result = vec![submitted(
+        OperationKind::CurrencyExchange { sold, bought },
+        operation.deduplication_key.clone(),
+        operation.operation_id.clone(),
+    )];
+    if let Some(fee) = fee {
+        result.push(submitted(
+            OperationKind::Fee {
+                amount_minor: fee.amount().raw(),
+                currency: fee.currency(),
+                origin: FeeOrigin::Brokerage,
+            },
+            composite_identity(
+                &operation.broker_account_id,
+                &operation.operation_id,
+                "currency-exchange-fee",
+            ),
+            format!(
+                "{}#currency-exchange-fee",
+                escape_component(&operation.operation_id)
+            ),
+        ));
+    }
+    Ok(result)
 }
 
 fn operation_to_submitted(
@@ -2122,6 +2310,125 @@ mod tests {
         order_state_reason, rfc3339_operation_end, trade_operations,
     };
     use iaam_broker::operation_kind::OperationKindDictionary;
+
+    #[tokio::test]
+    async fn currency_descriptions_produce_cash_exchanges_and_separate_fee() {
+        use iaam_core::money::CurrencyCode;
+        for (
+            code,
+            operation_type,
+            payment,
+            nominal_units,
+            nominal_nano,
+            foreign_minor,
+            rub_minor,
+        ) in [
+            ("usd", "OPERATION_TYPE_BUY", "-100", "1", 0, 200, -10000),
+            ("usd", "OPERATION_TYPE_SELL", "100", "1", 0, -200, 10000),
+            (
+                "xau",
+                "OPERATION_TYPE_BUY",
+                "-100",
+                "0",
+                500000000,
+                10000,
+                -10000,
+            ),
+            (
+                "xau",
+                "OPERATION_TYPE_SELL",
+                "100",
+                "0",
+                500000000,
+                -10000,
+                10000,
+            ),
+        ] {
+            let row = serde_json::json!({"hasNext":false,"items":[{
+                "cursor":"invented", "brokerAccountId":"invented", "id":"currency-trade",
+                "date":"2026-08-20T10:11:12Z", "type":operation_type,
+                "state":"OPERATION_STATE_EXECUTED", "instrumentKind":"INSTRUMENT_TYPE_CURRENCY",
+                "instrumentUid":"aaaaaaaa-0000-0000-0000-000000000001", "quantity":"2",
+                "payment":{"units":payment,"nano":0,"currency":"rub"},
+                "commission":{"units":"1","nano":0,"currency":"rub"}
+            }]});
+            let description = serde_json::json!({"instrument":{
+                "isoCurrencyName":code,"currency":"rub","lot":1,
+                "nominal":{"currency":code,"units":nominal_units,"nano":nominal_nano}
+            }});
+            let (gateway, requests, _) = fake::gateway_with_instruments(
+                vec![
+                    Answer::status(200, &row.to_string()),
+                    Answer::status(200, &description.to_string()),
+                ],
+                None,
+                true,
+            );
+            let parsed = fetch(&channel(gateway))
+                .await
+                .expect("fetch currency trade");
+            assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+            assert_eq!(parsed.accepted.len(), 2);
+            assert_eq!(requests.lock().expect("requests").len(), 2);
+            let context = NormalizationContext {
+                owner: OwnerId::new_random(),
+                source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
+            };
+            let events: Vec<_> = parsed
+                .accepted
+                .iter()
+                .map(|item| normalize(item, &context).expect("normalize").event)
+                .collect();
+            assert!(matches!(events[0].kind, EventKind::CurrencyExchange { .. }));
+            assert!(matches!(events[1].kind, EventKind::Fee { .. }));
+            let foreign = if code == "usd" {
+                CurrencyCode::Usd
+            } else {
+                CurrencyCode::Xau
+            };
+            assert_eq!(
+                events[0]
+                    .cash_effect(foreign)
+                    .expect("foreign")
+                    .amount()
+                    .raw(),
+                foreign_minor
+            );
+            assert_eq!(
+                events[0]
+                    .cash_effect(CurrencyCode::Rub)
+                    .expect("rub")
+                    .amount()
+                    .raw(),
+                rub_minor
+            );
+            assert_eq!(
+                events[1]
+                    .cash_effect(CurrencyCode::Rub)
+                    .expect("fee")
+                    .amount()
+                    .raw(),
+                -100
+            );
+            let contour = ContourDefinition::new(
+                ContourId::new_random(),
+                ContourVersion(1),
+                [AccountId(Uuid::from_u128(1))],
+            );
+            let rules = RuleRegistry::with_defaults();
+            let snapshot = project(
+                &events,
+                &ProjectionContext {
+                    contour: &contour,
+                    rules: &rules,
+                    lot_rule: LotRuleVersion(1),
+                },
+            )
+            .expect("project");
+            assert_eq!(snapshot.state().book().iter().count(), 0);
+        }
+    }
 
     #[test]
     fn tax_codes_map_to_signed_tax_facts_with_optional_instruments() {

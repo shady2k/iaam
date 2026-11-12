@@ -730,6 +730,7 @@ pub(crate) fn subject(event: &Event) -> Option<ClassificationSubject> {
         EventKind::Trade { .. }
         | EventKind::SecuritiesTransferOut { .. }
         | EventKind::OpeningPosition { .. }
+        | EventKind::CurrencyExchange { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::StatedSecuritiesValue { .. }
         | EventKind::Valuation { .. }

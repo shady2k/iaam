@@ -198,6 +198,7 @@ impl IncomeLedger {
             | EventKind::Tax { .. }
             | EventKind::SecuritiesTransferOut { .. }
             | EventKind::OpeningPosition { .. }
+            | EventKind::CurrencyExchange { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }

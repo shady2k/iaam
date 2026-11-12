@@ -1223,7 +1223,7 @@ async fn health_is_public_and_reports_the_projection_version() {
     assert_eq!(body["status"], "ok");
     // Version 9 retains income totals by account, kind and currency.
     // Earlier snapshots must rebuild rather than omit historical income.
-    assert_eq!(body["projection_version"], 10);
+    assert_eq!(body["projection_version"], 11);
 }
 
 #[tokio::test]
@@ -14108,6 +14108,49 @@ async fn a_securities_transfer_out_round_trips_through_the_journal() {
     assert!(legs[0].get("custody").is_none());
     drop(harness);
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_currency_exchange_round_trips_through_the_journal() {
+    let harness = harness().await;
+    let account = harness.account.inner();
+    let body = json!({
+        "source_label": "contract test",
+        "operations": [{
+            "account": account,
+            "type": "currency_exchange",
+            "sold": { "amount": "100.00", "currency": "RUB" },
+            "bought": { "amount": "1.25", "currency": "USD" },
+            "dates": { "cash_posted": "2026-03-01" },
+            "idempotency_key": "currency-exchange"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    let rows = journal_events(&harness).await;
+    let row = rows
+        .iter()
+        .find(|row| row["idempotency_key"] == "currency-exchange")
+        .expect("recorded event");
+    assert_eq!(row["event"], verdicts[0]["event_id"]);
+    assert_eq!(row["account"], account.to_string());
+    assert_eq!(row["kind"], "currency_exchange");
+    let legs = row["legs"].as_array().expect("legs");
+    assert_eq!(legs.len(), 2, "{row}");
+    for (currency, amount) in [("RUB", "-100.00"), ("USD", "1.25")] {
+        let leg = legs
+            .iter()
+            .find(|leg| leg["currency"] == currency)
+            .expect("currency leg");
+        assert_eq!(leg["kind"], "cash");
+        assert_eq!(leg["account"], account.to_string());
+        assert_eq!(leg["amount"], amount);
+    }
 }
 
 async fn create_account(harness: &Harness, title: &str) -> AccountId {

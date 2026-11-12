@@ -43,7 +43,7 @@ use state::{LedgerState, StateHash};
 /// the event contents (`prefix_digest/v2`). Version 8 incorporates source-time
 /// ordering. Version 9 retains received income totals by account and kind.
 /// Older snapshots are incompatible and trigger a full recomputation.
-pub const PROJECTION_VERSION: u32 = 10;
+pub const PROJECTION_VERSION: u32 = 11;
 
 /// Immutable projection input: scope boundaries and rule versions.
 ///

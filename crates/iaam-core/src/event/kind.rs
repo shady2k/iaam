@@ -171,6 +171,8 @@ pub enum EventKind {
         instrument: InstrumentId,
         quantity: Quantity,
     },
+    /// Exchange of two cash currencies within the account.
+    CurrencyExchange { sold: Money, bought: Money },
     /// Money entered the contour from outside (§4.10).
     CashIn { amount: Money },
     /// Money left the contour.
@@ -440,10 +442,11 @@ impl EventKind {
     /// This is kept beside [`Self::discriminant`] so a route cannot accept a
     /// name the event model does not publish.
     #[must_use]
-    pub const fn discriminants() -> &'static [&'static str; 19] {
+    pub const fn discriminants() -> &'static [&'static str; 20] {
         &[
             "trade",
             "securities_transfer_out",
+            "currency_exchange",
             "cash_in",
             "cash_out",
             "refund",
@@ -473,6 +476,7 @@ impl EventKind {
         match self {
             Self::Trade { .. } => "trade",
             Self::SecuritiesTransferOut { .. } => "securities_transfer_out",
+            Self::CurrencyExchange { .. } => "currency_exchange",
             Self::CashIn { .. } => "cash_in",
             Self::CashOut { .. } => "cash_out",
             Self::Refund { .. } => "refund",
@@ -524,6 +528,7 @@ impl EventKind {
             }
             Self::SecuritiesTransferOut { .. } => FlowEndpoints::OwnAccountUnnamed,
             Self::Trade { .. }
+            | Self::CurrencyExchange { .. }
             | Self::Income { .. }
             | Self::Fee { .. }
             | Self::Tax { .. }

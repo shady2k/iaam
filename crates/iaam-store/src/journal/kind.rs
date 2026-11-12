@@ -53,9 +53,10 @@ use time::{Date, OffsetDateTime, Time};
 
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
-    CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow, FeeRow,
-    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, SecuritiesTransferOutRow,
-    StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow, ValuationRow,
+    CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, CurrencyExchangeRow, DetailRows,
+    EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow,
+    SecuritiesTransferOutRow, StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow,
+    ValuationRow,
 };
 use crate::StoreError;
 
@@ -223,6 +224,15 @@ fn kind_to_detail(event: &str, kind: &EventKind) -> Result<DetailRows, StoreErro
                 quantity: quantity.0.inner().to_string(),
             },
         )),
+        EventKind::CurrencyExchange { sold, bought } => {
+            Ok(DetailRows::CurrencyExchange(CurrencyExchangeRow {
+                event: event.to_owned(),
+                sold_amount: sold.amount().raw(),
+                sold_currency: sold.currency().code().to_owned(),
+                bought_amount: bought.amount().raw(),
+                bought_currency: bought.currency().code().to_owned(),
+            }))
+        }
         EventKind::CashTransfer {
             transfer_id,
             from,
@@ -781,6 +791,18 @@ fn detail_to_kind(kind: &str, detail: DetailRows, legs: &[Leg]) -> Result<EventK
     match detail {
         DetailRows::Trade(row) => trade_from_row(row),
         DetailRows::CashTransfer(row) => cash_transfer_from_row(row, legs),
+        DetailRows::CurrencyExchange(row) => Ok(EventKind::CurrencyExchange {
+            sold: require_money(
+                "event_currency_exchange.sold",
+                Some(row.sold_amount),
+                Some(&row.sold_currency),
+            )?,
+            bought: require_money(
+                "event_currency_exchange.bought",
+                Some(row.bought_amount),
+                Some(&row.bought_currency),
+            )?,
+        }),
         DetailRows::UnresolvedMovement(row) => Ok(EventKind::UnresolvedOwnAccountMovement {
             amount: require_money(
                 "event_unresolved_movement",
@@ -2165,7 +2187,6 @@ mod tests {
     fn every_event_shape() -> Vec<Event> {
         let f = Fixture::new();
         let mut events = Vec::new();
-
         events.push(f.event(
             EventKind::SecuritiesTransferOut {
                 instrument: f.instrument,
@@ -2177,6 +2198,18 @@ mod tests {
                 qty("-2"),
             )],
         ));
+        let bought = Money::new(PostedMinor::new(10_000), CurrencyCode::Usd);
+        events.push(f.event(
+            EventKind::CurrencyExchange {
+                sold: rub(900_000),
+                bought,
+            },
+            vec![
+                Leg::cash(f.account, rub(-900_000)),
+                Leg::cash(f.account, bought),
+            ],
+        ));
+
         // --- The five leg-only kinds -------------------------------------
         events.push(f.event(
             EventKind::CashIn {

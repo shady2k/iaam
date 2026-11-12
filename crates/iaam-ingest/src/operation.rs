@@ -78,6 +78,8 @@ impl OperationDates {
 /// written by `build`, not by the caller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OperationKind {
+    /// Exchange two currencies within the operation account.
+    CurrencyExchange { sold: Money, bought: Money },
     /// Money the account received from **outside** the owner's own accounts.
     ///
     /// Becomes `CashIn`, whose flow endpoints say the other side is a
@@ -641,6 +643,29 @@ fn build(
 ) -> Result<(EventKind, Vec<Leg>), Rejection> {
     let account = operation.account;
     match kind {
+        OperationKind::CurrencyExchange { sold, bought } => {
+            positive(sold.amount().raw(), "sold", sold.currency())?;
+            positive(bought.amount().raw(), "bought", bought.currency())?;
+            if sold.currency() == bought.currency() {
+                return Err(Rejection {
+                    field: "bought".into(),
+                    expected: "a currency different from sold".into(),
+                    actual: format!("{:?}", bought.currency()),
+                });
+            }
+            let outgoing = sold.checked_negate().map_err(|error| Rejection {
+                field: "sold".into(),
+                expected: "representable amount".into(),
+                actual: error.to_string(),
+            })?;
+            Ok((
+                EventKind::CurrencyExchange {
+                    sold: *sold,
+                    bought: *bought,
+                },
+                vec![Leg::cash(account, outgoing), Leg::cash(account, *bought)],
+            ))
+        }
         OperationKind::Deposit {
             amount_minor,
             currency,

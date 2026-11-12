@@ -536,6 +536,8 @@ pub enum OperationKindDto {
         amount: String,
         currency: CurrencyDto,
     },
+    /// Exchange one currency for another in the same account. Fees are separate operations.
+    CurrencyExchange { sold: AmountDto, bought: AmountDto },
     /// Securities leaving the account without a cash payment or stated custody.
     SecuritiesTransferOut { instrument: Uuid, quantity: String },
     Buy {
@@ -1078,6 +1080,12 @@ impl OperationDto {
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
             },
+            OperationKindDto::CurrencyExchange { sold, bought } => {
+                OperationKind::CurrencyExchange {
+                    sold: sold.to_money("sold")?,
+                    bought: bought.to_money("bought")?,
+                }
+            }
             OperationKindDto::SecuritiesTransferOut {
                 instrument,
                 quantity,
@@ -7345,6 +7353,22 @@ mod tests {
         assert!(matches!(operation.kind_to_domain().unwrap(),
             OperationKind::SecuritiesTransferOut { instrument: id, quantity }
             if id == InstrumentId(instrument) && quantity == Dec::new("2.5".parse().unwrap())));
+    }
+
+    #[test]
+    fn currency_exchange_input_preserves_both_posted_amounts() {
+        let kind: OperationKindDto = serde_json::from_value(serde_json::json!({
+            "type": "currency_exchange",
+            "sold": {"amount": "100.00", "currency": "RUB"},
+            "bought": {"amount": "1.25", "currency": "USD"}
+        }))
+        .unwrap();
+        let mut operation = income_operation(None);
+        operation.kind = kind;
+        assert!(matches!(operation.kind_to_domain().unwrap(),
+            OperationKind::CurrencyExchange { sold, bought }
+            if sold == Money::new(PostedMinor::new(10000), iaam_core::money::CurrencyCode::Rub)
+                && bought == Money::new(PostedMinor::new(125), iaam_core::money::CurrencyCode::Usd)));
     }
 
     #[test]

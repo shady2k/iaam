@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/10";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/11";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -177,6 +177,60 @@ pub struct OperationsPage {
     pub has_next: bool,
     /// Cursor to use for the next page, when one is available.
     pub next_cursor: Option<String>,
+}
+
+/// Currency-specific broker reference data, without inferring identity from a ticker.
+#[derive(Debug, Clone)]
+pub struct CurrencyDescription {
+    pub nominal: CalcMoney,
+    pub settlement: CurrencyCode,
+    pub lot: i64,
+}
+
+/// Parse `CurrencyBy`; nominal carries the foreign currency and exact unit size.
+pub fn parse_currency_description(body: &str) -> Result<CurrencyDescription, ParseError> {
+    let response: Value =
+        serde_json::from_str(body).map_err(|error| ParseError::Json(error.to_string()))?;
+    let instrument = response.get("instrument").ok_or(ParseError::MissingField {
+        field: "instrument",
+    })?;
+    let iso = instrument
+        .get("isoCurrencyName")
+        .and_then(Value::as_str)
+        .ok_or(ParseError::MissingField {
+            field: "isoCurrencyName",
+        })?;
+    let currency = parse_currency(iso)?;
+    let nominal: RawMoneyValue = serde_json::from_value(
+        instrument
+            .get("nominal")
+            .cloned()
+            .ok_or(ParseError::MissingField { field: "nominal" })?,
+    )
+    .map_err(|error| ParseError::Json(error.to_string()))?;
+    let nominal = parse_calc_money(&nominal, "nominal")?;
+    if nominal.currency() != currency {
+        return Err(ParseError::InvalidField {
+            field: "nominal.currency",
+            value: iso.to_owned(),
+        });
+    }
+    let settlement = parse_currency(
+        instrument
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or(ParseError::MissingField { field: "currency" })?,
+    )?;
+    let lot = instrument
+        .get("lot")
+        .and_then(Value::as_i64)
+        .filter(|lot| *lot > 0)
+        .ok_or(ParseError::MissingField { field: "lot" })?;
+    Ok(CurrencyDescription {
+        nominal,
+        settlement,
+        lot,
+    })
 }
 
 /// Parse the reference data returned by `InstrumentsService/GetInstrumentBy`.

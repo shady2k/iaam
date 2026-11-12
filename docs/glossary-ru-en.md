@@ -26,6 +26,7 @@ is how you match a term in them to the code.
 | освобождённая стоимость | released basis | |
 | реализованный результат | realised result | British `-ised`, as already in the code |
 | денежный поток | cashflow | |
+| обмен валюты | currency exchange | Two cash legs on one account; no lots or realised result |
 | НКД | accrued interest | |
 | купон | coupon | |
 | доход по займу ценных бумаг | securities lending income | `IncomeKind::SecuritiesLendingIncome` |

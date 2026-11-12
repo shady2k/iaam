@@ -284,6 +284,7 @@ impl Event {
                 OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {}
             },
             EventKind::Trade { .. }
+            | EventKind::CurrencyExchange { .. }
             | EventKind::SecuritiesTransferOut { .. }
             | EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
@@ -328,6 +329,9 @@ impl Event {
     pub fn validate_structure(&self) -> Result<(), EventValidationError> {
         let name = self.kind.discriminant();
         match &self.kind {
+            EventKind::CurrencyExchange { sold, bought } => {
+                self.validate_currency_exchange(name, *sold, *bought)
+            }
             EventKind::CashIn { amount } => self.expect_single_cash(name, *amount, Sign::Positive),
             EventKind::CashOut { amount } => self.expect_single_cash(name, *amount, Sign::Negative),
             EventKind::Refund { amount } => self.expect_single_cash(name, *amount, Sign::Positive),
@@ -403,6 +407,49 @@ impl Event {
             EventKind::CorporateAction { action } => self.validate_corporate_action(name, action),
             EventKind::OfferExercise { action } => self.validate_offer_exercise(name, action),
         }
+    }
+
+    fn validate_currency_exchange(
+        &self,
+        name: &'static str,
+        sold: Money,
+        bought: Money,
+    ) -> Result<(), EventValidationError> {
+        require_positive(name, "sold", sold.amount().raw())?;
+        require_positive(name, "bought", bought.amount().raw())?;
+        if sold.currency() == bought.currency() {
+            return Err(EventValidationError::LegDoesNotMatchEvent {
+                kind: name,
+                field: "currencies",
+            });
+        }
+        if self.legs.len() != 2 {
+            return Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "exactly two cash legs",
+                found: self.legs.len(),
+            });
+        }
+        let outgoing = Money::new(
+            sold.amount().checked_neg().ok_or(MoneyError::Overflow)?,
+            sold.currency(),
+        );
+        for expected in [outgoing, bought] {
+            if !self.legs.iter().any(|leg| {
+                leg.kind == LegKind::Cash
+                    && leg.account == self.account
+                    && leg.money == Some(expected)
+                    && leg.custody.is_none()
+                    && leg.instrument.is_none()
+                    && leg.quantity.is_none()
+            }) {
+                return Err(EventValidationError::LegDoesNotMatchEvent {
+                    kind: name,
+                    field: "cash legs",
+                });
+            }
+        }
+        Ok(())
     }
 
     fn expect_single_cash(
@@ -1454,6 +1501,64 @@ mod tests {
     use crate::money::{CalcMoney, PostedMinor, Quantity};
     use crate::reconciliation::Dimension;
     use time::macros::date;
+
+    #[test]
+    fn exchange_changes_cash_balances_without_creating_lots() {
+        use crate::projection::balances::Balances;
+        use crate::projection::lots::LotBook;
+        use crate::rules::{LotRuleVersion, RuleRegistry};
+        let account = AccountId::new_random();
+        let gold = Money::new(PostedMinor::new(2_000), CurrencyCode::Xau);
+        let exchange = event(
+            EventKind::CurrencyExchange {
+                sold: rub(100_000),
+                bought: gold,
+            },
+            vec![Leg::cash(account, rub(-100_000)), Leg::cash(account, gold)],
+            account,
+        );
+        let mut balances = Balances::new();
+        balances.apply(&exchange).unwrap();
+        assert_eq!(
+            balances.cash(account, CurrencyCode::Rub),
+            Some(rub(-100_000))
+        );
+        assert_eq!(balances.cash(account, CurrencyCode::Xau), Some(gold));
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&exchange, &RuleRegistry::with_defaults())
+            .unwrap();
+        assert_eq!(book.iter().count(), 0);
+    }
+
+    #[test]
+    fn currency_exchange_requires_two_opposite_cash_legs_on_one_account() {
+        let account = AccountId::new_random();
+        let kind = EventKind::CurrencyExchange {
+            sold: rub(100),
+            bought: usd(2),
+        };
+        let good = vec![Leg::cash(account, rub(-100)), Leg::cash(account, usd(2))];
+        assert!(
+            event(kind.clone(), good.clone(), account)
+                .validate_structure()
+                .is_ok()
+        );
+        let mut wrong = good.clone();
+        wrong[1].account = AccountId::new_random();
+        assert!(
+            event(kind.clone(), wrong, account)
+                .validate_structure()
+                .is_err()
+        );
+        let mut extra = good.clone();
+        extra.push(Leg::fee(account, rub(-1)));
+        assert!(event(kind, extra, account).validate_structure().is_err());
+        let same = EventKind::CurrencyExchange {
+            sold: rub(100),
+            bought: rub(2),
+        };
+        assert!(event(same, good, account).validate_structure().is_err());
+    }
 
     // Amounts are written in minimal units as one number: grouping
     // like `50_000_00` does not compile (`clippy::inconsistent_digit_grouping`

@@ -442,8 +442,8 @@ impl MoneyFlow {
                     EventKind::SecuritiesTransferOut { .. } | EventKind::OpeningPosition { .. } => {
                         // An opening position establishes state, not a cash flow.
                     }
-                    EventKind::OpeningCash { .. } => {
-                        // Opening cash is a starting point, not a flow.
+                    EventKind::CurrencyExchange { .. } | EventKind::OpeningCash { .. } => {
+                        // Neither an exchange nor opening cash is an external flow.
                     }
                     EventKind::StatedSecuritiesValue { .. } => {
                         // It has no legs, so this arm is unreachable through
@@ -499,6 +499,7 @@ impl MoneyFlow {
                     | EventKind::Tax { .. }
                     | EventKind::SecuritiesTransferOut { .. }
                     | EventKind::OpeningPosition { .. }
+                    | EventKind::CurrencyExchange { .. }
                     | EventKind::OpeningCash { .. }
                     | EventKind::StatedSecuritiesValue { .. }
                     | EventKind::Valuation { .. }

@@ -1265,6 +1265,7 @@ pub const fn classification_of(event: &Event) -> Option<Classification> {
         EventKind::Trade { .. }
         | EventKind::SecuritiesTransferOut { .. }
         | EventKind::OpeningPosition { .. }
+        | EventKind::CurrencyExchange { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::StatedSecuritiesValue { .. }
         | EventKind::Valuation { .. }

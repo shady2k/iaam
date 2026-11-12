@@ -21,8 +21,10 @@ use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
 fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
-    conn.execute_batch("DROP TABLE event_securities_transfer_out;")
-        .expect("remove version-15 detail table");
+    conn.execute_batch(
+        "DROP TABLE event_currency_exchange; DROP TABLE event_securities_transfer_out;",
+    )
+    .expect("remove version-15 and version-16 detail tables");
     conn.execute_batch("ALTER TABLE event_tax DROP COLUMN instrument;")
         .expect("remove the version-13 tax instrument");
     let legacy = include_str!("../migrations/0001_schema.sql");

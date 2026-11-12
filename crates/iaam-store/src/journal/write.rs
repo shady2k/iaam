@@ -35,10 +35,10 @@ use super::category_index;
 use super::kind::to_rows;
 use super::read::hydrate_one;
 use super::rows::{
-    CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail, DetailRows,
-    EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow,
-    SecuritiesTransferOutRow, StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow,
-    ValuationRow,
+    CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
+    CurrencyExchangeRow, DetailRows, EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow,
+    OpeningPositionRow, SecuritiesTransferOutRow, StatedSecuritiesValueRow, TaxRow, TradeRow,
+    UnresolvedMovementRow, ValuationRow,
 };
 use crate::StoreError;
 
@@ -297,6 +297,7 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
         DetailRows::Trade(row) => insert_trade(tx, row),
         DetailRows::SecuritiesTransferOut(row) => insert_securities_transfer_out(tx, row),
         DetailRows::CashTransfer(row) => insert_cash_transfer(tx, row),
+        DetailRows::CurrencyExchange(row) => insert_currency_exchange(tx, row),
         DetailRows::UnresolvedMovement(row) => insert_unresolved_movement(tx, row),
         DetailRows::Income(row) => insert_income(tx, row),
         DetailRows::Fee(row) => insert_fee(tx, row),
@@ -357,6 +358,17 @@ fn insert_trade(tx: &Transaction<'_>, row: &TradeRow) -> Result<(), StoreError> 
         "event_trade",
         event_id = row.event,
         instrument_id = row.instrument
+    )?;
+    Ok(())
+}
+
+fn insert_currency_exchange(
+    tx: &Transaction<'_>,
+    row: &CurrencyExchangeRow,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO event_currency_exchange (event, sold_amount, sold_currency, bought_amount, bought_currency) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![row.event, row.sold_amount, row.sold_currency, row.bought_amount, row.bought_currency],
     )?;
     Ok(())
 }
@@ -707,6 +719,7 @@ mod tests {
         "event_legs",
         "event_trade",
         "event_cash_transfer",
+        "event_currency_exchange",
         "event_unresolved_movement",
         "event_income",
         "event_fee",

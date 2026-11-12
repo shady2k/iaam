@@ -204,6 +204,27 @@ impl TinkoffClient {
         .map(|(body, _)| body)
     }
 
+    /// Read currency-specific nominal and settlement reference data.
+    pub async fn get_currency(
+        &self,
+        id: &str,
+        id_type: InstrumentIdType,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            ReadCall {
+                method: Method::Instrument,
+                path: "InstrumentsService/CurrencyBy",
+            },
+            json!({ "idType": id_type.code(), "id": id }),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
+    }
+
     /// Search broker reference data by a known identifier or name.
     /// Uses the same service budget, deadline and allowance as instrument reads.
     pub async fn find_instrument(

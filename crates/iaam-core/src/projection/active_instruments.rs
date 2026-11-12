@@ -110,6 +110,7 @@ pub fn active_instruments(
             | EventKind::Income { .. }
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }
+            | EventKind::CurrencyExchange { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }

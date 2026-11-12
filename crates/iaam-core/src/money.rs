@@ -345,6 +345,22 @@ impl CalcMoney {
     }
 }
 
+/// Derive a posted currency amount from source nominal and quantity without rounding.
+pub fn currency_amount_from_nominal(
+    nominal: CalcMoney,
+    quantity: Quantity,
+) -> Result<Money, ReturnedPrincipalError> {
+    if !nominal.value().is_positive() || !quantity.0.is_positive() {
+        return Err(ReturnedPrincipalError::Nonpositive);
+    }
+    let product = nominal.checked_mul(quantity.0)?;
+    let posted = Money::new(product.rounded_minor()?, product.currency());
+    if posted.to_calc_dec() != product.value() {
+        return Err(ReturnedPrincipalError::Inexact);
+    }
+    Ok(posted)
+}
+
 /// Calculate one fill's exact gross before the source-fact rounding boundary.
 pub fn gross_for_fill(price: CalcMoney, quantity: Quantity) -> Result<CalcMoney, MoneyError> {
     let product = price.checked_mul(quantity.0)?;
@@ -926,6 +942,19 @@ mod tests {
             Quantity(Dec::new(Decimal::MAX)),
         ];
         assert_eq!(sum_quantities(&quantities), Err(NumericError::Overflow));
+    }
+
+    #[test]
+    fn currency_nominal_quantity_requires_exact_posted_amount() {
+        let nominal = CalcMoney::new(dec("0.025"), CurrencyCode::Usd);
+        assert_eq!(
+            currency_amount_from_nominal(nominal, Quantity(dec("4"))).unwrap(),
+            Money::new(PostedMinor::new(10), CurrencyCode::Usd)
+        );
+        assert_eq!(
+            currency_amount_from_nominal(nominal, Quantity(dec("1"))),
+            Err(ReturnedPrincipalError::Inexact)
+        );
     }
 
     #[test]

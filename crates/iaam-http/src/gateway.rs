@@ -991,6 +991,8 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
                 | "OperationsService/GetOperationsByCursor" => Some("OperationsService"),
                 "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
                 | "InstrumentsService/GetInstrumentBy"
+                | "tinkoff.public.invest.api.contract.v1.InstrumentsService/CurrencyBy"
+                | "InstrumentsService/CurrencyBy"
                 | "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
                 | "InstrumentsService/FindInstrument" => Some("InstrumentsService"),
                 _ => None,
@@ -3016,6 +3018,8 @@ mod tests {
             for path in [
                 "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
                 "/InstrumentsService/GetInstrumentBy",
+                "/tinkoff.public.invest.api.contract.v1.InstrumentsService/CurrencyBy",
+                "/InstrumentsService/CurrencyBy",
                 "/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
                 "/InstrumentsService/FindInstrument",
             ] {

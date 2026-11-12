@@ -157,6 +157,7 @@ async fn seed_market_price_with(
             title: "Sberbank".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .unwrap_or_else(|error| panic!("insert market instrument: {error}"));
     let run = store
@@ -233,6 +234,7 @@ async fn report_values_position_from_market_observation() {
             title: "Sberbank".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .await
         .unwrap_or_else(|error| panic!("insert instrument: {error}"));
@@ -317,6 +319,7 @@ async fn contradictory_price_leaves_only_its_position_uncovered() {
                 title: "Sberbank".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .await
             .unwrap_or_else(|error| panic!("insert instrument: {error}"));

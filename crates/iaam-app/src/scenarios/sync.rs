@@ -38,6 +38,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use time::Date;
 use time::OffsetDateTime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Why no control assertion was recorded, when none was.
@@ -157,6 +158,17 @@ pub struct BrokerSyncRequest {
 }
 
 /// Retrieves the broker's operations and portfolio and records new facts.
+#[tracing::instrument(
+    name = "broker_sync",
+    skip_all,
+    fields(
+        broker = %request.broker_code.as_str(),
+        account = %request.account.inner(),
+        from = %request.from,
+        to = %request.to,
+        broker_account = tracing::field::Empty
+    )
+)]
 pub async fn sync_broker(
     services: &AppServices,
     principal: &Principal,
@@ -177,6 +189,7 @@ pub async fn sync_broker(
         });
     }
 
+    tracing::info!(phase = "start", "broker sync started");
     let _claim = services.running_syncs.claim(principal.owner, account)?;
     let deadline = Some(Instant::now() + SYNC_DEADLINE);
     let allowance = RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING);
@@ -220,10 +233,23 @@ pub async fn sync_broker(
         }
     };
 
+    tracing::Span::current().record("broker_account", broker_account.as_str());
+    tracing::info!(
+        phase = "fetch_operations",
+        status = "start",
+        "broker sync phase"
+    );
     let parsed = broker
         .fetch_operations(account, &broker_account, from, to, broker_context)
         .await
         .map_err(broker_error)?;
+    tracing::info!(
+        phase = "fetch_operations",
+        status = "complete",
+        accepted = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
+        quarantined = parsed.quarantined.len(),
+        "broker sync phase complete"
+    );
     let channel = broker.channel();
     // Deduplication belongs to the requested interval; it must not treat later facts
     // as part of this sync.
@@ -243,15 +269,34 @@ pub async fn sync_broker(
     // after the operations were recorded would leave a journal the refusal
     // claims is unchanged. An out-of-interval trade withholds every
     // assertion, so its portfolio is not asked for at all.
+    tracing::info!(
+        phase = "fetch_portfolio",
+        status = "start",
+        "broker sync phase"
+    );
     let snapshot = if has_out_of_interval_trade {
+        tracing::info!(
+            phase = "fetch_portfolio",
+            status = "skipped",
+            reason = "out_of_interval_trade",
+            claims = 0,
+            refused = 0,
+            "broker sync phase complete"
+        );
         None
     } else {
-        Some(
-            broker
-                .fetch_portfolio(account, &broker_account, to, broker_context)
-                .await
-                .map_err(broker_error)?,
-        )
+        let snapshot = broker
+            .fetch_portfolio(account, &broker_account, to, broker_context)
+            .await
+            .map_err(broker_error)?;
+        tracing::info!(
+            phase = "fetch_portfolio",
+            status = "complete",
+            claims = snapshot.claims.len(),
+            refused = snapshot.refused.len(),
+            "broker sync phase complete"
+        );
+        Some(snapshot)
     };
     // The sync's fetches have succeeded — both answers, wherever the
     // portfolio is asked for at all: an out-of-interval trade withholds
@@ -270,6 +315,12 @@ pub async fn sync_broker(
         }
         None => false,
     };
+    tracing::info!(
+        phase = "map",
+        status = "start",
+        accepted = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
+        "broker sync phase start"
+    );
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -301,7 +352,14 @@ pub async fn sync_broker(
             .map(|snapshot| snapshot.refused.as_slice())
             .unwrap_or_default(),
     );
-    for row in quarantined {
+    for (row_index, row) in quarantined.enumerate() {
+        tracing::debug!(
+            phase = "map",
+            row_index,
+            operation_type = quarantined_operation_type(&row.raw),
+            reason = %row.reason,
+            "broker sync row quarantined"
+        );
         let key = SourceRowKey {
             source: channel.source,
             row: fingerprint_of(&row.raw),
@@ -320,12 +378,20 @@ pub async fn sync_broker(
         ));
     }
 
-    for operation in parsed.accepted {
+    // Mapping and appending share the loop so deduplication sees prior writes.
+    tracing::info!(
+        phase = "write",
+        status = "start",
+        rows = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
+        "broker sync phase start"
+    );
+    for (row_index, operation) in parsed.accepted.into_iter().enumerate() {
         let context = DocumentContext {
             account: operation.account,
             document: None,
             sheet: None,
             row: None,
+            broker_api_source: Some(channel.source),
             identity_scope: broker.identity_scope(),
         };
         let key = dedup::choose_key(&operation, &context);
@@ -344,6 +410,14 @@ pub async fn sync_broker(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
+                tracing::debug!(
+                    phase = "map",
+                    row_index,
+                    operation_type = operation_kind_name(&operation.kind),
+                    reason = "normalization_rejected",
+                    field = %rejection.field,
+                    "broker sync row rejected"
+                );
                 let row = refused_row(&operation, channel.source);
                 refusals.push(row.clone());
                 refusal_records.push(refusal_record(
@@ -364,6 +438,14 @@ pub async fn sync_broker(
             .with_declared_by(PrincipalId(principal.token_id));
         if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
         {
+            tracing::debug!(
+                phase = "map",
+                row_index,
+                operation_type = operation_kind_name(&operation.kind),
+                reason = "structure_rejected",
+                field = %rejection.field,
+                "broker sync row rejected"
+            );
             let row = refused_row(&operation, channel.source);
             refusals.push(row.clone());
             refusal_records.push(refusal_record(
@@ -377,7 +459,15 @@ pub async fn sync_broker(
             recorded.push(Verdict::Rejected { rejection });
             continue;
         }
-        let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        let (decision, rule) =
+            dedup::assess_with_rule(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        trace_dedup_decision(
+            row_index,
+            channel.source,
+            operation.source_operation_id.as_deref().unwrap_or(""),
+            &decision,
+            rule,
+        );
         let possible_duplicate = match &decision {
             DedupDecision::PossibleDuplicate { of, level } => Some((*of, *level)),
             DedupDecision::Duplicate { .. } | DedupDecision::Fresh => None,
@@ -393,11 +483,31 @@ pub async fn sync_broker(
             vec![event.clone()],
             broker.identity_scope(),
         )
+        .instrument(tracing::info_span!(
+            "broker_sync_row",
+            row_index,
+            operation_type = operation_kind_name(&operation.kind)
+        ))
         .await?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         let verdict = match (possible_duplicate, event_id_from_verdict(&verdict)) {
             (Some((of, level)), Some(event)) => {
                 possible_duplicates += 1;
+                tracing::debug!(
+                    phase = "map",
+                    row_index,
+                    operation_type = operation_kind_name(&operation.kind),
+                    verdict = "possible_duplicate",
+                    source_operation_id = ?operation.source_operation_id,
+                    dedup_level = level.number(),
+                    rule = rule.code(),
+                    source = %channel.source.inner(),
+                    match_basis = "canonical_fingerprint",
+                    matched_fields = ?dedup::fingerprint_fields(&operation),
+                    event = %event.inner(),
+                    existing_event = %of.inner(),
+                    "broker sync possible duplicate (present fields covered by equal fingerprints)"
+                );
                 Verdict::PossibleDuplicate { event, of, level }
             }
             _ => verdict,
@@ -407,6 +517,219 @@ pub async fn sync_broker(
         }
         recorded.push(verdict);
     }
+
+    // Resolve repayments in date order, after this sync's position movements
+    // have entered the journal. Each lookup is bounded to the repayment date.
+    let mut journal: Vec<_> = parsed
+        .journal
+        .into_iter()
+        .map(|submitted| {
+            let date = match &submitted.fact {
+                iaam_ingest::JournalFact::CorporateAction(action) => action.effective_date(),
+                iaam_ingest::JournalFact::OfferExercise { day, .. } => *day,
+            };
+            (date, Ok(submitted))
+        })
+        .chain(
+            parsed
+                .pending_redemptions
+                .into_iter()
+                .map(|pending| (pending.effective_date, Err(pending))),
+        )
+        .collect();
+    journal.sort_by_key(|(date, _)| *date);
+    for (row_index, (_, submission)) in journal.into_iter().enumerate() {
+        let submitted = match submission {
+            Ok(submitted) => submitted,
+            Err(pending) => {
+                let context = DocumentContext {
+                    account: pending.account,
+                    document: None,
+                    sheet: None,
+                    row: None,
+                    broker_api_source: Some(channel.source),
+                    identity_scope: broker.identity_scope(),
+                };
+                // Identity is checked before looking up holdings: on a repeat
+                // sync the previously recorded redemption has already retired them.
+                let key = dedup::DedupKey::SourceOperationId(pending.source_operation_id.clone());
+                let digest = Sha256::digest(pending.raw.as_bytes());
+                let fingerprint = RawHash::parse(
+                    &digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                )
+                .expect("fingerprint is SHA-256");
+                let (decision, rule) =
+                    dedup::assess_with_rule(Some(&key), &fingerprint, &context, &known);
+                trace_dedup_decision(
+                    row_index,
+                    channel.source,
+                    &pending.source_operation_id,
+                    &decision,
+                    rule,
+                );
+                if let DedupDecision::Duplicate { existing, .. } = decision {
+                    duplicates += 1;
+                    recorded.push(Verdict::Duplicate { existing });
+                    continue;
+                }
+                match resolve_full_redemption(services, principal.owner, &pending).await? {
+                    Ok(submitted) => submitted,
+                    Err(reason) => {
+                        tracing::debug!(phase = "map", row_index, reason = %reason, "broker full redemption set aside");
+                        let key = SourceRowKey {
+                            source: channel.source,
+                            row: RowName::Given(pending.source_operation_id),
+                        };
+                        let dimensions = [Dimension::Cash, Dimension::Positions]
+                            .into_iter()
+                            .collect();
+                        refusal_records.push(refusal_record(
+                            &refusal_context,
+                            &key,
+                            &dimensions,
+                            reason.clone(),
+                            pending.raw,
+                        ));
+                        refusals.push(RefusedRow { key, dimensions });
+                        recorded.push(Verdict::Quarantined { reason });
+                        continue;
+                    }
+                }
+            }
+        };
+        let context = DocumentContext {
+            account: submitted.account,
+            document: None,
+            sheet: None,
+            row: None,
+            broker_api_source: Some(channel.source),
+            identity_scope: broker.identity_scope(),
+        };
+        let key = submitted
+            .source_operation_id
+            .clone()
+            .map(dedup::DedupKey::SourceOperationId)
+            .or_else(|| {
+                submitted
+                    .idempotency_key
+                    .clone()
+                    .map(dedup::DedupKey::IdempotencyKey)
+            });
+        let normalized = iaam_ingest::normalize_journal_event(
+            &submitted,
+            &iaam_ingest::JournalEventEnrichment::default(),
+            &NormalizationContext {
+                owner: principal.owner,
+                source: channel.source,
+                parser_version: channel.parser_version.clone(),
+            },
+        )
+        .and_then(|normalized| {
+            if let Some(rejection) =
+                crate::scenarios::ingest::structural_rejection(&normalized.event, "journal")
+            {
+                Err(rejection)
+            } else {
+                Ok(normalized)
+            }
+        });
+        let mut event = match normalized {
+            Ok(normalized) => normalized.event,
+            Err(rejection) => {
+                tracing::debug!(phase = "map", row_index, reason = %rejection_sentence(&rejection), "broker journal row rejected");
+                let row = RefusedRow {
+                    key: SourceRowKey {
+                        source: channel.source,
+                        row: submitted
+                            .source_operation_id
+                            .clone()
+                            .map(RowName::Given)
+                            .unwrap_or_else(|| {
+                                fingerprint_of(
+                                    &serde_json::to_value(&submitted).expect("journal serializes"),
+                                )
+                            }),
+                    },
+                    dimensions: [Dimension::Cash, Dimension::Positions]
+                        .into_iter()
+                        .collect(),
+                };
+                refusal_records.push(refusal_record(
+                    &refusal_context,
+                    &row.key,
+                    &row.dimensions,
+                    rejection_sentence(&rejection),
+                    serde_json::to_string(&submitted).expect("journal serializes"),
+                ));
+                refusals.push(row);
+                recorded.push(Verdict::Rejected { rejection });
+                continue;
+            }
+        };
+        event.provenance = event
+            .provenance
+            .with_declared_by(PrincipalId(principal.token_id));
+        let (decision, rule) =
+            dedup::assess_with_rule(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        trace_dedup_decision(
+            row_index,
+            channel.source,
+            submitted.source_operation_id.as_deref().unwrap_or(""),
+            &decision,
+            rule,
+        );
+        if let DedupDecision::Duplicate { existing, .. } = decision {
+            duplicates += 1;
+            recorded.push(Verdict::Duplicate { existing });
+            continue;
+        }
+        let result = crate::scenarios::ingest::append_checked(
+            services,
+            vec![event.clone()],
+            broker.identity_scope(),
+        )
+        .await?;
+        let verdict = verdict_from_recorded(&result, &mut duplicates);
+        let verdict = match (decision, event_id_from_verdict(&verdict)) {
+            (DedupDecision::PossibleDuplicate { of, level }, Some(event)) => {
+                possible_duplicates += 1;
+                tracing::debug!(
+                    phase = "map",
+                    row_index,
+                    verdict = "possible_duplicate",
+                    source_operation_id = ?submitted.source_operation_id,
+                    dedup_level = level.number(),
+                    rule = rule.code(),
+                    source = %channel.source.inner(),
+                    match_basis = "canonical_fingerprint",
+                    matched_fields = ?dedup::journal_fingerprint_fields(&submitted),
+                    event = %event.inner(),
+                    existing_event = %of.inner(),
+                    "broker sync possible duplicate (present fields covered by equal fingerprints)"
+                );
+                Verdict::PossibleDuplicate { event, of, level }
+            }
+            _ => verdict,
+        };
+        if let Some(event_id) = event_id_from_verdict(&verdict) {
+            known.push(known_record(&event, event_id));
+        }
+        recorded.push(verdict);
+    }
+
+    tracing::info!(
+        phase = "map",
+        status = "complete",
+        rows = recorded.len(),
+        rejected = set_aside(&recorded),
+        quarantined = refusal_records.len() - set_aside(&recorded),
+        duplicates,
+        possible_duplicates,
+        "broker sync phase complete"
+    );
 
     // A refused row is reported whatever else happens to this response: its
     // reason names what is missing, and it reaches the owner nowhere else. A
@@ -464,6 +787,24 @@ pub async fn sync_broker(
             recorded.push(verdict);
         }
     }
+    tracing::info!(
+        phase = "write",
+        status = "complete",
+        rows = recorded.len(),
+        duplicates,
+        possible_duplicates,
+        set_aside = set_aside(&recorded),
+        binding_recorded,
+        "broker sync phase complete"
+    );
+    tracing::info!(
+        phase = "assertions",
+        status = "start",
+        claims = snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.claims.len()),
+        "broker sync phase"
+    );
     // An out-of-interval trade remains its own early-return condition, which is
     // why no portfolio was fetched for it; refusals only add the coverage gap
     // above and do not suppress the portfolio answer.
@@ -476,6 +817,13 @@ pub async fn sync_broker(
         // portfolio was never fetched, so the rows that are not in this
         // sync's refusal list are merely the rows it never re-read.
         keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
+        tracing::info!(
+            phase = "assertions",
+            status = "skipped",
+            reason = "out_of_interval_trade",
+            assertions = 0,
+            "broker sync phase complete"
+        );
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -509,6 +857,13 @@ pub async fn sync_broker(
         // from this sync's list were not demonstrably re-read whole. A sync
         // that ended in an error would never reach here.
         keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
+        tracing::info!(
+            phase = "assertions",
+            status = "skipped",
+            reason = "portfolio_describes_another_day",
+            assertions = 0,
+            "broker sync phase complete"
+        );
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -521,6 +876,8 @@ pub async fn sync_broker(
         });
     }
 
+    let assertion_claims = snapshot.claims.len();
+    let assertion_duplicates_before = duplicates;
     let mut assertions = 0;
     for (index, claim) in snapshot.claims.into_iter().enumerate() {
         let mut event = assertion_event(
@@ -567,6 +924,14 @@ pub async fn sync_broker(
     // absent from this sync's refusal list was re-read whole and is no
     // longer refused.
     keep_refusal_questions(services, &refusal_context, &refusal_records, true).await?;
+    tracing::info!(
+        phase = "assertions",
+        status = "complete",
+        claims = assertion_claims,
+        assertions,
+        duplicates = duplicates - assertion_duplicates_before,
+        "broker sync phase complete"
+    );
     let set_aside = set_aside(&recorded);
     Ok(SyncOutcome {
         recorded,
@@ -577,6 +942,65 @@ pub async fn sync_broker(
         assertions_withheld: None,
         binding_recorded,
     })
+}
+
+fn trace_dedup_decision(
+    row_index: usize,
+    source: iaam_core::ids::SourceId,
+    source_operation_id: &str,
+    decision: &DedupDecision,
+    rule: dedup::DedupRule,
+) {
+    let verdict = match decision {
+        DedupDecision::Duplicate { .. } => "duplicate",
+        DedupDecision::Fresh => "fresh",
+        DedupDecision::PossibleDuplicate { .. } => "possible_duplicate",
+    };
+    tracing::debug!(
+        phase = "map",
+        row_index,
+        source = %source.inner(),
+        source_operation_id,
+        rule = rule.code(),
+        verdict,
+        "broker sync dedup assessment"
+    );
+}
+
+/// Only a named type field, never the raw row or a structured kind payload.
+fn quarantined_operation_type(raw: &serde_json::Value) -> &str {
+    [
+        "operation_type",
+        "operationType",
+        "transaction_type",
+        "transactionType",
+        "type",
+        "kind",
+    ]
+    .into_iter()
+    .find_map(|key| raw.get(key).and_then(serde_json::Value::as_str))
+    .unwrap_or("unparsed")
+}
+
+/// The operation variant only: its Debug representation also contains amounts.
+fn operation_kind_name(kind: &iaam_ingest::operation::OperationKind) -> &'static str {
+    use iaam_ingest::operation::OperationKind;
+    match kind {
+        OperationKind::Deposit { .. } => "Deposit",
+        OperationKind::Withdrawal { .. } => "Withdrawal",
+        OperationKind::Refund { .. } => "Refund",
+        OperationKind::Transfer { .. } => "Transfer",
+        OperationKind::OwnAccountMovement { .. } => "OwnAccountMovement",
+        OperationKind::Buy { .. } => "Buy",
+        OperationKind::Sell { .. } => "Sell",
+        OperationKind::Income { .. } => "Income",
+        OperationKind::Fee { .. } => "Fee",
+        OperationKind::Tax { .. } => "Tax",
+        OperationKind::OpeningCash { .. } => "OpeningCash",
+        OperationKind::StatedSecuritiesValue { .. } => "StatedSecuritiesValue",
+        OperationKind::OpeningPosition { .. } => "OpeningPosition",
+        OperationKind::Valuation { .. } => "Valuation",
+    }
 }
 
 /// A broker that is down or says no is not our store failing: each is told
@@ -824,6 +1248,59 @@ fn coverage_gap_event(
     )
 }
 
+async fn resolve_full_redemption(
+    services: &AppServices,
+    owner: OwnerId,
+    pending: &crate::ports::PendingFullRedemption,
+) -> Result<Result<iaam_ingest::SubmittedJournalEvent, String>, AppError> {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::projection::balances::{Balances, PositionKey};
+    let events = services
+        .store
+        .load_events_through(owner, pending.effective_date)
+        .await?;
+    let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
+    let mut balances = Balances::new();
+    for event in effective {
+        balances
+            .apply(event)
+            .map_err(iaam_core::projection::ProjectionError::from)
+            .map_err(AppError::from_projection)?;
+    }
+    let Some(quantity) = balances
+        .position(&PositionKey {
+            account: pending.account,
+            instrument: pending.instrument,
+        })
+        .filter(|quantity| quantity.0.is_positive())
+    else {
+        return Ok(Err(format!(
+            "bond redemption reports zero quantity and the journal holds no positive position of this instrument on this account at {}; history may start after the holding",
+            pending.effective_date
+        )));
+    };
+    let principal_returned_per_unit =
+        match iaam_core::money::returned_principal_per_unit(pending.compensation, quantity) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(format!("bond redemption principal per unit: {error}"))),
+        };
+    Ok(Ok(iaam_ingest::SubmittedJournalEvent {
+        account: pending.account,
+        fact: iaam_ingest::JournalFact::CorporateAction(CorporateAction::Redemption {
+            instrument: pending.instrument,
+            custody: None,
+            quantity,
+            principal_returned_per_unit,
+            compensation: pending.compensation,
+            effective_date: pending.effective_date,
+            record_date: None,
+            grounds: None,
+        }),
+        idempotency_key: Some(pending.idempotency_key.clone()),
+        source_operation_id: Some(pending.source_operation_id.clone()),
+    }))
+}
+
 fn known_records(events: &[Event]) -> Vec<KnownRecord> {
     events
         .iter()
@@ -834,6 +1311,7 @@ fn known_record(event: &Event, event_id: EventId) -> KnownRecord {
     let row = event.provenance.row();
     KnownRecord {
         event: event_id,
+        source: event.provenance.source(),
         account: event.account,
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),
         idempotency_key: event.idempotency_key.clone(),
@@ -1391,6 +1869,7 @@ mod market_tests {
                 title: "Sberbank".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .expect("instrument");
         let body = include_bytes!("../../../../tests/fixtures/market/moex-iss-history-sber.json");

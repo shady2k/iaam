@@ -121,6 +121,44 @@ fn a_bundle_restores_a_complete_working_state() {
 }
 
 #[test]
+fn securities_lending_income_and_its_classification_rule_survive_a_bundle() {
+    let (mut source, owner, account, _) = populated();
+    let mut event = deposit(owner, account, 3, 700);
+    event.kind = EventKind::Income {
+        instrument: None,
+        gross: Money::new(PostedMinor::new(700), CurrencyCode::Rub),
+        kind: Some(IncomeKind::SecuritiesLendingIncome),
+    };
+    source.append_event(&event, IdentityScope::Source).unwrap();
+    let rule = source
+        .insert_rule(
+            owner,
+            NewRule {
+                counterparty_account: None,
+                description_contains: Some("Securities lending".into()),
+                source_kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+                movement: None,
+                outcome_kind: "income".into(),
+                to_account: None,
+                fee_origin: None,
+                income_kind: Some("securities_lending_income".into()),
+            },
+        )
+        .unwrap();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    assert_eq!(
+        restored.load_events(owner).unwrap(),
+        source.load_events(owner).unwrap()
+    );
+    assert_eq!(restored.list_active_rules(owner).unwrap(), vec![rule]);
+}
+
+#[test]
 fn importing_the_same_bundle_twice_changes_nothing() {
     let (source, owner, _, _) = populated();
     let bundle = source.export_bundle(owner).unwrap();
@@ -468,6 +506,7 @@ impl BondReferenceData {
                 title: "Test Bond".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .unwrap();
         store
@@ -478,6 +517,7 @@ impl BondReferenceData {
                 title: "Test Bond, Successor".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .unwrap();
         store
@@ -534,7 +574,7 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
             EventKind::CorporateAction {
                 action: CorporateAction::Redemption {
                     instrument,
-                    custody,
+                    custody: Some(custody),
                     quantity: qty("10"),
                     principal_returned_per_unit: per_unit("800"),
                     compensation: money(800_000),
@@ -629,6 +669,27 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
                 kind: Some(IncomeKind::Coupon),
             },
             vec![Leg::cash(account, money(70_000))],
+        ),
+        bond_event(
+            owner,
+            account,
+            17,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument,
+                    custody: None,
+                    quantity: qty("10"),
+                    principal_returned_per_unit: per_unit("800"),
+                    compensation: money(800_000),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![
+                Leg::principal(account, instrument, money(800_000)),
+                Leg::security_without_custody(account, instrument, qty("-10")),
+            ],
         ),
     ]
 }
@@ -743,6 +804,7 @@ fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
             title: "Already Known Title".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .unwrap();
 
@@ -802,6 +864,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
             title: "Grandparent Bond".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .unwrap();
     store
@@ -815,6 +878,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 parent: grandparent,
                 reason: LineageReason::Replacement,
             }),
+            metadata: None,
         })
         .unwrap();
     store
@@ -828,6 +892,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 parent,
                 reason: LineageReason::Replacement,
             }),
+            metadata: None,
         })
         .unwrap();
 
@@ -2140,6 +2205,7 @@ fn measure_the_size_of_a_realistic_export() {
                 title: format!("Synthetic Bond {index}"),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .unwrap();
         store

@@ -130,9 +130,15 @@ fn store_assignment(
 ) -> Result<bool, StoreError> {
     match category::assign(&CategorySubject::of(event), rules) {
         CategoryAssignment::NotDecomposed => {
-            tx.execute(
-                "DELETE FROM event_category_assignments WHERE owner = ?1 AND event = ?2",
-                params![owner.inner().to_string(), event.id.inner().to_string()],
+            super::write::write_result!(
+                tx.execute(
+                    "DELETE FROM event_category_assignments WHERE owner = ?1 AND event = ?2",
+                    params![owner.inner().to_string(), event.id.inner().to_string()],
+                ),
+                "delete_category_assignment",
+                "event_category_assignments",
+                owner_id = owner.inner(),
+                event_id = event.id.inner()
             )?;
             Ok(false)
         }
@@ -142,8 +148,9 @@ fn store_assignment(
                 CategoryBasis::SourceCategory { rule } => ("source_category", rule),
                 CategoryBasis::Description { rule } => ("description", rule),
             };
-            tx.execute(
-                "INSERT INTO event_category_assignments
+            super::write::write_result!(
+                tx.execute(
+                    "INSERT INTO event_category_assignments
                      (owner, event, category, rule, basis, rules_revision)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (owner, event) DO UPDATE SET
@@ -151,14 +158,21 @@ fn store_assignment(
                      rule = excluded.rule,
                      basis = excluded.basis,
                      rules_revision = excluded.rules_revision",
-                params![
-                    owner.inner().to_string(),
-                    event.id.inner().to_string(),
-                    category.inner().to_string(),
-                    rule.inner().to_string(),
-                    basis_text,
-                    rules_revision,
-                ],
+                    params![
+                        owner.inner().to_string(),
+                        event.id.inner().to_string(),
+                        category.inner().to_string(),
+                        rule.inner().to_string(),
+                        basis_text,
+                        rules_revision,
+                    ],
+                ),
+                "upsert_category_assignment",
+                "event_category_assignments",
+                owner_id = owner.inner(),
+                event_id = event.id.inner(),
+                category_id = category.inner(),
+                rule_id = rule.inner()
             )?;
             Ok(true)
         }

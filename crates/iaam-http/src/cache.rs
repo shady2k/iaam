@@ -503,6 +503,15 @@ impl Entry {
         if let Some(at) = response.observed_at {
             line(&mut bytes, &format!("observed-at {}", unix_nanos(at)));
         }
+        for (name, value) in [
+            ("rate-limit", response.rate_limit),
+            ("rate-remaining", response.rate_remaining),
+            ("rate-reset", response.rate_reset),
+        ] {
+            if let Some(value) = value {
+                line(&mut bytes, &format!("{name} {value}"));
+            }
+        }
         line(&mut bytes, &format!("status {}", response.status));
         line(
             &mut bytes,
@@ -511,6 +520,12 @@ impl Entry {
                 None => "retry-after-ms -".to_owned(),
             },
         );
+        if let Some(delay) = response.retry_after_header {
+            line(
+                &mut bytes,
+                &format!("retry-after-header-ms {}", delay.as_millis()),
+            );
+        }
         line(
             &mut bytes,
             &named(
@@ -545,8 +560,8 @@ impl Entry {
 
     /// The strict inverse of [`Self::of`]: the version line, the storage
     /// stamp, an optional `observed-at` line when the stored answer
-    /// carried its own observation moment, then the five answer header
-    /// lines, then the body. Anything else — another version, a short or
+    /// carried its own observation moment, optional numeric rate-limit
+    /// lines, then the five answer header lines and the body. Anything else — another version, a short or
     /// repeated line, a carriage return in a header — is not an answer.
     /// An entry written before the `observed-at` line existed (an earlier
     /// build's entry) has none and still parses: the storage stamp is then
@@ -572,6 +587,19 @@ impl Entry {
                 .map_err(|_| ())?;
             observed_at = Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos));
         }
+        let mut rates = [None; 3];
+        for (index, name) in ["rate-limit", "rate-remaining", "rate-reset"]
+            .iter()
+            .enumerate()
+        {
+            if peek_line(rest).is_some_and(|line| line.starts_with(format!("{name} ").as_bytes())) {
+                rates[index] = Some(
+                    header_field(line_of(&mut rest)?, name)?
+                        .parse()
+                        .map_err(|_| ())?,
+                );
+            }
+        }
         let status = header_field(line_of(&mut rest)?, "status")?
             .parse()
             .map_err(|_| ())?;
@@ -579,6 +607,16 @@ impl Entry {
             "-" => None,
             millis => Some(Duration::from_millis(millis.parse().map_err(|_| ())?)),
         };
+        let retry_after_header =
+            if peek_line(rest).is_some_and(|line| line.starts_with(b"retry-after-header-ms ")) {
+                Some(Duration::from_millis(
+                    header_field(line_of(&mut rest)?, "retry-after-header-ms")?
+                        .parse()
+                        .map_err(|_| ())?,
+                ))
+            } else {
+                None
+            };
         let location = value(line_of(&mut rest)?, "location")?;
         let content_type = value(line_of(&mut rest)?, "content-type")?;
         let request_id = value(line_of(&mut rest)?, "request-id")?;
@@ -586,9 +624,13 @@ impl Entry {
             status,
             body: rest.to_vec(),
             retry_after,
+            retry_after_header,
             location,
             content_type,
             request_id,
+            rate_limit: rates[0],
+            rate_remaining: rates[1],
+            rate_reset: rates[2],
             // `lookup` dates the served answer: from the answer's own
             // moment when the entry carries one, else from the storage
             // stamp.
@@ -938,10 +980,12 @@ mod tests {
             status: 200,
             body: b"<history>pages</history>".to_vec(),
             retry_after: Some(Duration::from_secs(30)),
+            retry_after_header: Some(Duration::from_secs(30)),
             location: Some("https://iss.moex.com/elsewhere".to_owned()),
             content_type: Some("application/json; charset=utf-8".to_owned()),
             request_id: Some("moex-req-7".to_owned()),
             observed_at: None,
+            ..Default::default()
         };
         cache.store(&key, &response, None, None);
         // The stored answer also carries the moment it was stored.
@@ -1000,6 +1044,21 @@ mod tests {
     }
 
     #[test]
+    fn rate_headers_survive_cache_storage_without_changing_the_body() {
+        let response = HttpResponse {
+            status: 200,
+            body: b"rate-limit 999\nnot a header".to_vec(),
+            rate_limit: Some(200),
+            rate_remaining: Some(0),
+            rate_reset: Some(17),
+            ..Default::default()
+        };
+        let bytes = Entry::of(&response, 1000, None, None);
+        let parsed = Entry::parse(&bytes).expect("entry parses");
+        assert_eq!(parsed.response, response);
+    }
+
+    #[test]
     fn an_entry_written_without_the_observed_at_line_still_parses() {
         // The exact layout an entry written before the observed-at line
         // existed has: the storage stamp followed straight by the status.
@@ -1010,6 +1069,9 @@ mod tests {
         assert_eq!(parsed.observed_at, None, "an old entry has no own moment");
         assert_eq!(parsed.response.status, 200);
         assert_eq!(parsed.response.retry_after, None);
+        assert_eq!(parsed.response.rate_limit, None);
+        assert_eq!(parsed.response.rate_remaining, None);
+        assert_eq!(parsed.response.rate_reset, None);
         assert_eq!(parsed.response.location, None);
         assert_eq!(parsed.response.request_id.as_deref(), Some("moex-req-7"));
         assert_eq!(parsed.response.body, b"page");

@@ -206,6 +206,7 @@ pub enum IncomeKindDto {
     Coupon,
     Dividend,
     DepositInterest,
+    SecuritiesLendingIncome,
 }
 
 impl IncomeKindDto {
@@ -215,6 +216,16 @@ impl IncomeKindDto {
             Self::Coupon => IncomeKind::Coupon,
             Self::Dividend => IncomeKind::Dividend,
             Self::DepositInterest => IncomeKind::DepositInterest,
+            Self::SecuritiesLendingIncome => IncomeKind::SecuritiesLendingIncome,
+        }
+    }
+    #[must_use]
+    pub const fn from_domain(value: IncomeKind) -> Self {
+        match value {
+            IncomeKind::Coupon => Self::Coupon,
+            IncomeKind::Dividend => Self::Dividend,
+            IncomeKind::DepositInterest => Self::DepositInterest,
+            IncomeKind::SecuritiesLendingIncome => Self::SecuritiesLendingIncome,
         }
     }
 }
@@ -3635,6 +3646,10 @@ pub struct EarningSourceAmountDto {
     /// earning is its own line, never folded into a bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<Uuid>,
+    /// Which kind of income produced this earning, when stated. Kept apart
+    /// even when no security or owner category names the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub income_kind: Option<IncomeKindDto>,
     pub amount: String,
 }
 
@@ -3714,6 +3729,7 @@ impl MoneyFlowReportDto {
                         account: source.account.inner(),
                         instrument: source.instrument.map(|id| id.inner()),
                         category: source.category.map(|category| category.inner()),
+                        income_kind: source.income_kind.map(IncomeKindDto::from_domain),
                         amount: amount.to_calc_dec().inner().to_string(),
                     })
                     .collect();
@@ -4683,6 +4699,52 @@ impl ReconciliationStatusDto {
     }
 }
 
+/// Recorded income grouped by economic kind and native currency.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IncomeByKindDto {
+    /// Absent means the recorded income did not state a kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<IncomeKindDto>,
+    /// Native-currency sum. No conversion or cross-currency sum is implied.
+    pub amount: AmountDto,
+}
+
+/// Native-currency income totals, or the reason they cannot be computed.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComputedIncomeByKindDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Vec<IncomeByKindDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_computable: Option<NotComputableCodeDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ComputedIncomeByKindDto {
+    fn from_domain(value: &Computed<Vec<(Option<IncomeKind>, Money)>>) -> Self {
+        match value {
+            Computed::Value(totals) => Self {
+                value: Some(
+                    totals
+                        .iter()
+                        .map(|(kind, amount)| IncomeByKindDto {
+                            kind: kind.map(IncomeKindDto::from_domain),
+                            amount: AmountDto::from_money(*amount),
+                        })
+                        .collect(),
+                ),
+                not_computable: None,
+                detail: None,
+            },
+            Computed::NotComputable { reason } => Self {
+                value: None,
+                not_computable: Some(NotComputableCodeDto::from_domain(reason)),
+                detail: Some(describe(reason)),
+            },
+        }
+    }
+}
+
 /// Return report.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReturnsReportDto {
@@ -4710,6 +4772,9 @@ pub struct ReturnsReportDto {
     pub contributed: ComputedDto,
     pub withdrawn: ComputedDto,
     pub terminal_value: ComputedDto,
+    /// Recorded income grouped by kind and native currency over the history
+    /// through `as_of`. These sums are not converted to `report_currency`.
+    pub income_by_kind: ComputedIncomeByKindDto,
     /// Valuation before hypothetical exit costs and before tax.
     pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto,
     /// Bond position attributes (§5.1).
@@ -4808,6 +4873,7 @@ impl ReturnsReportDto {
             contributed: ComputedDto::from_dec(&report.contributed),
             withdrawn: ComputedDto::from_dec(&report.withdrawn),
             terminal_value: ComputedDto::from_dec(&report.terminal_value),
+            income_by_kind: ComputedIncomeByKindDto::from_domain(&report.income_by_kind),
             liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto::from_domain(
                 &report.liquidation_value_before_exit_costs_and_tax,
             ),
@@ -6871,10 +6937,30 @@ mod tests {
     }
 
     #[test]
+    fn redemption_without_custody_is_not_given_an_invented_place() {
+        let dto = CorporateActionDto::Redemption {
+            instrument: Uuid::new_v4(),
+            custody: None,
+            quantity: "10".into(),
+            principal_returned_per_unit: amount("1000"),
+            compensation: amount("10000.00"),
+            effective_date: time::macros::date!(2026 - 06 - 01),
+            record_date: None,
+            grounds: None,
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        let restored: CorporateActionDto = serde_json::from_value(json).unwrap();
+        let CorporateAction::Redemption { custody, .. } = restored.to_domain().unwrap() else {
+            panic!("expected redemption");
+        };
+        assert_eq!(custody, None);
+    }
+
+    #[test]
     fn every_corporate_action_member_names_itself_in_json() {
         let redemption_fields = || CorporateActionDto::Redemption {
             instrument: Uuid::new_v4(),
-            custody: Uuid::new_v4(),
+            custody: Some(Uuid::new_v4()),
             quantity: "10".into(),
             principal_returned_per_unit: amount("1000"),
             compensation: amount("10000.00"),
@@ -7227,6 +7313,35 @@ mod tests {
             income_operation(None).to_domain(&directory()).unwrap().kind,
             OperationKind::Income { kind: None, .. }
         ));
+    }
+
+    #[test]
+    fn securities_lending_income_survives_the_api_and_report_dtos() {
+        let dto = income_operation(Some(IncomeKindDto::SecuritiesLendingIncome));
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["kind"], "securities_lending_income");
+        let restored: OperationDto = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            restored.to_domain(&directory()).unwrap().kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::SecuritiesLendingIncome),
+                ..
+            }
+        ));
+
+        let earning = EarningSourceAmountDto {
+            account: Uuid::from_u128(3),
+            instrument: None,
+            category: None,
+            income_kind: Some(IncomeKindDto::from_domain(
+                IncomeKind::SecuritiesLendingIncome,
+            )),
+            amount: "12.00".to_owned(),
+        };
+        let value = serde_json::to_value(earning).unwrap();
+        assert_eq!(value["income_kind"], "securities_lending_income");
+        assert!(value.get("instrument").is_none());
+        assert!(value.get("category").is_none());
     }
 
     #[test]
@@ -9601,6 +9716,16 @@ pub struct InstrumentDto {
     /// A quotation read as though it stood in either sibling states the
     /// position in money nobody quoted it in.
     pub quote_currency: String,
+    pub metadata: Option<InstrumentMetadataDto>,
+}
+
+/// Broker trading details, with missing values left unknown.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct InstrumentMetadataDto {
+    pub mic: Option<String>,
+    pub board: Option<String>,
+    pub lot: Option<u32>,
+    pub price_decimals: Option<u8>,
 }
 
 /// The instrument catalogue response.
@@ -9631,6 +9756,7 @@ pub struct CreateInstrumentRequest {
     pub denomination_currency: String,
     pub settlement_currency: String,
     pub quote_currency: String,
+    pub metadata: Option<InstrumentMetadataDto>,
 }
 
 /// Transport namespace of an external instrument code. A separate type because
@@ -9907,7 +10033,8 @@ pub enum CorporateActionDto {
     /// is disposed of.
     Redemption {
         instrument: Uuid,
-        custody: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custody: Option<Uuid>,
         quantity: String,
         principal_returned_per_unit: AmountDto,
         compensation: AmountDto,
@@ -9988,7 +10115,7 @@ impl CorporateActionDto {
                 grounds,
             } => CorporateAction::Redemption {
                 instrument: InstrumentId(*instrument),
-                custody: CustodyId(*custody),
+                custody: custody.map(CustodyId),
                 quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
                 principal_returned_per_unit: principal_returned_per_unit
                     .to_per_unit("principal_returned_per_unit")?,

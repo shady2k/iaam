@@ -56,7 +56,7 @@ pub enum CorporateAction {
     /// securities, which does not exist.
     Redemption {
         instrument: InstrumentId,
-        custody: CustodyId,
+        custody: Option<CustodyId>,
         quantity: Quantity,
         principal_returned_per_unit: PerUnitAmount,
         compensation: Money,
@@ -186,7 +186,7 @@ mod tests {
     fn sample_redemption() -> CorporateAction {
         CorporateAction::Redemption {
             instrument: InstrumentId::new_random(),
-            custody: CustodyId::new_random(),
+            custody: Some(CustodyId::new_random()),
             quantity: Quantity(dec("100")),
             principal_returned_per_unit: per_unit("800.0000"),
             compensation: rub(8_000_000),

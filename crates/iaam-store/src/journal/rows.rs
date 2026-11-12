@@ -258,7 +258,7 @@ pub(crate) struct CorporateActionRow {
     pub instrument: Option<String>,
     pub predecessor: Option<String>,
     pub successor: Option<String>,
-    pub custody: String,
+    pub custody: Option<String>,
     pub quantity: Option<String>,
     pub quantity_in: Option<String>,
     pub quantity_out: Option<String>,

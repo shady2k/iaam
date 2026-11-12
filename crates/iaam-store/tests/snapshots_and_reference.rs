@@ -691,6 +691,7 @@ fn an_upserted_instrument_reaches_the_table() {
         title: "Sberbank common shares".into(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
+        metadata: None,
     };
     store.upsert_instrument(&instrument).unwrap();
 

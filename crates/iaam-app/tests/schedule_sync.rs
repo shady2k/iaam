@@ -170,6 +170,7 @@ fn store() -> (SqliteStore, InstrumentId) {
             title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument created");
     store

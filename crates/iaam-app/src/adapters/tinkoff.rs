@@ -6,15 +6,17 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use iaam_broker::BrokerInstrumentDescription;
 use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, ChannelOrderState,
-    ChannelPortfolioPosition, GetOperationsByCursorRequest, ParseError, TINKOFF_PARSER_VERSION,
-    TinkoffClient, TinkoffError, parse_account_ids, parse_operations, parse_portfolio,
-    parse_portfolio_positions,
+    ChannelPortfolioPosition, GetOperationsByCursorRequest, InstrumentIdType, ParseError,
+    TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError, parse_account_ids, parse_operations,
+    parse_portfolio, parse_portfolio_positions,
 };
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::ParserVersion;
@@ -35,12 +37,14 @@ use uuid::Uuid;
 use time::{Date, OffsetDateTime};
 
 use crate::ports::{
-    BrokerChannel, BrokerError, BrokerRequestContext, ParsedOperations, PortfolioAsOf,
-    PortfolioSnapshot, Quarantined,
+    BrokerChannel, BrokerError, BrokerRequestContext, InstrumentDirectory, ParsedOperations,
+    PortfolioAsOf, PortfolioSnapshot, Quarantined,
 };
 
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
+
+type CachedDescription = (Instant, Result<BrokerInstrumentDescription, String>);
 
 /// Broker channel implementation for T-Invest.
 pub struct TinkoffChannel {
@@ -51,6 +55,8 @@ pub struct TinkoffChannel {
     /// this adapter binds them — using the same approach already used
     /// for SQLite.
     dictionary: OperationKindDictionary,
+    instruments: Arc<dyn InstrumentDirectory>,
+    descriptions: tokio::sync::Mutex<HashMap<String, CachedDescription>>,
 }
 
 impl TinkoffChannel {
@@ -61,12 +67,104 @@ impl TinkoffChannel {
         client: TinkoffClient,
         source: SourceId,
         dictionary: OperationKindDictionary,
+        instruments: Arc<dyn InstrumentDirectory>,
     ) -> Self {
         Self {
             client,
             source,
             dictionary,
+            instruments,
+            descriptions: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+    async fn resolve_instrument(
+        &self,
+        uid: Option<&str>,
+        raw: &serde_json::Value,
+        on: Date,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<Result<InstrumentId, String>, BrokerError> {
+        let (id, id_type) = match uid.filter(|value| !value.is_empty()) {
+            Some(uid) => (uid, InstrumentIdType::Uid),
+            None => match raw.get("figi").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
+                Some(figi) => (figi, InstrumentIdType::Figi),
+                None => return Ok(Err("instrument description cannot be requested: the row supplies neither instrument UID nor FIGI".to_owned())),
+            },
+        };
+        let key = match id_type {
+            InstrumentIdType::Uid => format!(
+                "uid:{}",
+                Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string())
+            ),
+            InstrumentIdType::Figi => format!("figi:{id}"),
+        };
+        let mut descriptions = self.descriptions.lock().await;
+        if descriptions
+            .get(&key)
+            .is_none_or(|(read_at, _)| read_at.elapsed() >= std::time::Duration::from_secs(3600))
+        {
+            tracing::info!(
+                phase = "describe_instruments",
+                status = "start",
+                instruments = 1,
+                "reading broker instrument description"
+            );
+            let description = match self
+                .client
+                .get_instrument(id, id_type, context.deadline, context.allowance)
+                .await
+                .map_err(tinkoff_error)
+            {
+                Ok(body) => {
+                    iaam_broker::tinkoff::parse_instrument(&body).map_err(|error| error.to_string())
+                }
+                Err(
+                    BrokerError::Refused { detail, .. } | BrokerError::Unparsable { detail, .. },
+                ) => Err(detail),
+                Err(error) => return Err(error),
+            };
+            tracing::info!(
+                phase = "describe_instruments",
+                status = "complete",
+                instruments = 1,
+                described = usize::from(description.is_ok()),
+                "broker instrument description read"
+            );
+            descriptions.insert(key.clone(), (Instant::now(), description));
+        }
+        let description = descriptions
+            .get(&key)
+            .expect("description inserted")
+            .1
+            .clone();
+        drop(descriptions);
+        let description = match description {
+            Ok(description) => description,
+            Err(reason) => {
+                return Ok(Err(format!(
+                    "instrument {id} description refused or unreadable: {reason}"
+                )));
+            }
+        };
+        if description
+            .isin
+            .as_deref()
+            .is_none_or(|isin| isin.trim().is_empty())
+        {
+            return Ok(Err(format!("instrument {id} description names no ISIN")));
+        }
+        super::catalogue::resolve_or_record(
+            self.instruments.as_ref(),
+            &description,
+            self.source,
+            on,
+        )
+        .await
+        .map(Ok)
+        .map_err(|error| BrokerError::Adapter {
+            broker: BROKER.to_owned(),
+            detail: error.to_string(),
+        })
     }
 }
 
@@ -111,7 +209,92 @@ impl BrokerChannel for TinkoffChannel {
                 .await
         })
         .await?;
-        adapt_operations(account, operations, &self.dictionary)
+        let received = operations.len();
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "start",
+            rows = operations.len(),
+            strategy = "broker_description_isin",
+            "broker sync phase"
+        );
+        let mut checked = Vec::new();
+        let mut refused = Vec::new();
+        for mut operation in operations {
+            let has_identity = operation.instrument_uid.is_some()
+                || ["figi", "ticker", "isin"].into_iter().any(|key| {
+                    operation
+                        .raw
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                });
+            if has_identity && operation.rejection.is_none() {
+                match self
+                    .resolve_instrument(
+                        operation.instrument_uid.as_deref(),
+                        &operation.raw,
+                        operation.date.unwrap_or(from),
+                        context,
+                    )
+                    .await?
+                {
+                    Ok(instrument) => {
+                        operation.instrument_uid = Some(instrument.inner().to_string())
+                    }
+                    Err(reason) => {
+                        trace_quarantined_operation(
+                            &operation.operation_id,
+                            &operation.source_kind,
+                            "instrument_resolution",
+                        );
+                        tracing::debug!(
+                            phase = "resolve_instruments",
+                            reason,
+                            "operation set aside"
+                        );
+                        refused.push(Quarantined {
+                            reason,
+                            dimensions: dimensions_for_kind(
+                                &self.dictionary.kind_of(&operation.source_kind),
+                            ),
+                            raw: operation.raw,
+                        });
+                        continue;
+                    }
+                }
+            }
+            checked.push(operation);
+        }
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "complete",
+            accepted = checked.len(),
+            quarantined = refused.len(),
+            strategy = "broker_description_isin",
+            "broker sync phase complete"
+        );
+        let (mut parsed, accounting) =
+            adapt_operations_accounted(account, checked, &self.dictionary)?;
+        let quarantined_instrument_resolution = refused.len();
+        parsed.quarantined.extend(refused);
+        tracing::info!(
+            phase = "fetch_operations",
+            status = "complete",
+            received,
+            source_rows_accepted = accounting.source_rows_accepted,
+            quarantined = parsed.quarantined.len(),
+            quarantined_instrument_resolution,
+            quarantined_parse = accounting.quarantined_parse,
+            quarantined_securities_transfer = accounting.quarantined_securities_transfer,
+            quarantined_order_state = accounting.quarantined_order_state,
+            quarantined_trade = accounting.quarantined_trade,
+            quarantined_conversion = accounting.quarantined_conversion,
+            reduced_no_execution_trades = accounting.reduced_no_execution_trades,
+            emitted_operations =
+                parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
+            "T-Invest operations accounted"
+        );
+        Ok(parsed)
     }
 
     async fn fetch_portfolio(
@@ -136,7 +319,98 @@ impl BrokerChannel for TinkoffChannel {
         // cache. A `Current` portfolio fetched yesterday and served today
         // stays dated yesterday (`iaam-vg8te.1.1`).
         let observed_on = observed_at.map(|moment| OffsetDateTime::from(moment).date());
-        adapt_portfolio(&body, observed_on)
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| unparsable(error.to_string()))?;
+        let mut refused = Vec::new();
+        let mut accepted_positions = Vec::new();
+        let mut originals: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        let positions = raw
+            .get_mut("positions")
+            .and_then(serde_json::Value::as_array_mut);
+        if let Some(positions) = positions {
+            tracing::info!(
+                phase = "resolve_instruments",
+                status = "start",
+                rows = positions.len(),
+                strategy = "broker_description_isin",
+                "resolving portfolio instruments"
+            );
+            for mut position in std::mem::take(positions) {
+                if position
+                    .get("instrumentType")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("currency")
+                {
+                    let uid = position
+                        .get("instrumentUid")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    match self
+                        .resolve_instrument(uid.as_deref(), &position, _at, context)
+                        .await?
+                    {
+                        Ok(instrument) => {
+                            originals
+                                .entry(instrument.inner().to_string())
+                                .or_default()
+                                .push(position.clone());
+                            position["instrumentUid"] =
+                                serde_json::json!(instrument.inner().to_string());
+                        }
+                        Err(reason) => {
+                            tracing::debug!(
+                                phase = "resolve_instruments",
+                                reason,
+                                "portfolio row set aside"
+                            );
+                            let dimensions = refusal_dimensions(
+                                position
+                                    .get("instrumentType")
+                                    .and_then(serde_json::Value::as_str),
+                            );
+                            refused.push(Quarantined {
+                                reason,
+                                raw: position,
+                                dimensions,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                accepted_positions.push(position);
+            }
+            tracing::info!(
+                phase = "resolve_instruments",
+                status = "complete",
+                accepted = accepted_positions.len(),
+                quarantined = refused.len(),
+                "portfolio instruments resolved"
+            );
+            *positions = accepted_positions;
+        }
+        let mut snapshot = adapt_portfolio(&raw.to_string(), observed_on)?;
+        for refusal in &mut snapshot.refused {
+            if let Some(uid) = refusal
+                .raw
+                .get("instrumentUid")
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(rows) = originals.get(uid) {
+                    refusal.raw = if rows.len() == 1 {
+                        rows[0].clone()
+                    } else {
+                        serde_json::json!({"positions": rows})
+                    };
+                }
+            }
+            tracing::debug!(
+                phase = "map_portfolio",
+                reason = refusal.reason,
+                "portfolio row set aside"
+            );
+        }
+        snapshot.refused.extend(refused);
+        Ok(snapshot)
     }
 
     fn channel(&self) -> SourceChannel {
@@ -343,8 +617,21 @@ where
             .map_err(|error| after_pages(tinkoff_error(error), fetched))?;
         fetched += 1;
         let page = parse_operations(&body).map_err(parse_error)?;
+        tracing::debug!(
+            phase = "fetch_operation_pages",
+            page = fetched,
+            received = page.operations.len(),
+            "T-Invest operation page received"
+        );
         operations.extend(page.operations);
         if !page.has_next {
+            tracing::info!(
+                phase = "fetch_operation_pages",
+                status = "complete",
+                pages_fetched = fetched,
+                received = operations.len(),
+                "T-Invest operation pages fetched"
+            );
             return Ok(operations);
         }
         let Some(cursor) = page.next_cursor else {
@@ -408,11 +695,31 @@ impl RowRefusal {
     }
 }
 
+#[derive(Debug, Default)]
+struct OperationAccounting {
+    source_rows_accepted: usize,
+    reduced_no_execution_trades: usize,
+    quarantined_parse: usize,
+    quarantined_securities_transfer: usize,
+    quarantined_order_state: usize,
+    quarantined_trade: usize,
+    quarantined_conversion: usize,
+}
+
+#[cfg(test)]
 fn adapt_operations(
     account: AccountId,
     operations: Vec<ChannelOperation>,
     dictionary: &OperationKindDictionary,
 ) -> Result<ParsedOperations, BrokerError> {
+    adapt_operations_accounted(account, operations, dictionary).map(|(parsed, _)| parsed)
+}
+
+fn adapt_operations_accounted(
+    account: AccountId,
+    operations: Vec<ChannelOperation>,
+    dictionary: &OperationKindDictionary,
+) -> Result<(ParsedOperations, OperationAccounting), BrokerError> {
     // An empty dictionary means an unconfigured channel, not an unknown broker.
     // Without this check, the owner would receive a rejection for every code
     // separately and investigate the broker instead of the configuration.
@@ -422,12 +729,38 @@ fn adapt_operations(
         ));
     }
     let mut accepted = Vec::new();
+    let mut journal = Vec::new();
+    let mut pending_redemptions = Vec::new();
     let mut quarantined = Vec::new();
+    let mut accounting = OperationAccounting::default();
+    let source_rows = operations.len();
     for mut operation in operations {
+        let operation_id = if operation.operation_id.is_empty() {
+            operation
+                .raw
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            operation.operation_id.clone()
+        };
+        let source_kind = if operation.source_kind.is_empty() {
+            operation
+                .raw
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            operation.source_kind.clone()
+        };
         // Take the payload before moving the operation into conversion; no later stage reads it.
         let raw = std::mem::take(&mut operation.raw);
         let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(rejection) = operation.rejection.as_ref() {
+            accounting.quarantined_parse += 1;
+            trace_quarantined_operation(&operation_id, &source_kind, "parse");
             let dimensions = if operation.source_kind.is_empty() {
                 all_dimensions()
             } else {
@@ -442,6 +775,8 @@ fn adapt_operations(
         }
 
         if let Some(reason) = securities_transfer_reason(&kind) {
+            accounting.quarantined_securities_transfer += 1;
+            trace_quarantined_operation(&operation_id, &source_kind, "securities_transfer");
             quarantined.push(Quarantined {
                 raw,
                 reason: reason.to_owned(),
@@ -450,6 +785,8 @@ fn adapt_operations(
             continue;
         }
         if let Some(reason) = order_state_reason(&kind, &operation.state) {
+            accounting.quarantined_order_state += 1;
+            trace_quarantined_operation(&operation_id, &source_kind, "order_state");
             quarantined.push(Quarantined {
                 raw,
                 reason,
@@ -464,8 +801,42 @@ fn adapt_operations(
             });
             continue;
         }
-        if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
+        if matches!(kind, ChannelOperationKind::BondRedemption) {
+            if operation
+                .quantity
+                .is_some_and(|quantity| quantity == iaam_core::money::Quantity::zero())
+            {
+                match pending_redemption(account, &operation, raw.to_string()) {
+                    Ok(pending) => pending_redemptions.push(pending),
+                    Err(error) => {
+                        trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                        quarantined.push(Quarantined {
+                            raw,
+                            reason: error.to_string(),
+                            dimensions: cash_positions(),
+                        });
+                    }
+                }
+                continue;
+            }
+            match redemption_to_journal(account, operation) {
+                Ok(event) => journal.push(event),
+                Err(RowRefusal::Row { reason, .. }) => {
+                    trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions: cash_positions(),
+                    });
+                }
+                Err(error @ RowRefusal::Adapter(_)) => {
+                    return Err(error.into_broker_error());
+                }
+            }
+        } else if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
             if let Some(reason) = trade_row_reason(&operation, &kind) {
+                accounting.quarantined_trade += 1;
+                trace_quarantined_operation(&operation_id, &source_kind, "trade");
                 quarantined.push(Quarantined {
                     raw,
                     reason,
@@ -477,12 +848,27 @@ fn adapt_operations(
             match trade_operations(account, operation, kind)
                 .map_err(|error| error.with_dimensions(dimensions))
             {
-                Ok(operations) => accepted.extend(operations),
-                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
-                    raw,
-                    reason,
-                    dimensions,
-                }),
+                Ok(operations) => {
+                    if operations.is_empty() {
+                        accounting.reduced_no_execution_trades += 1;
+                        tracing::debug!(
+                            phase = "map_operations",
+                            operation_id,
+                            source_kind,
+                            reason = "no_execution_trades",
+                            "T-Invest operation reduced"
+                        );
+                    }
+                    accepted.extend(operations);
+                }
+                Err(RowRefusal::Row { reason, dimensions }) => {
+                    trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions,
+                    });
+                }
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
@@ -493,21 +879,46 @@ fn adapt_operations(
                 .map_err(|error| error.with_dimensions(dimensions))
             {
                 Ok(operation) => accepted.push(operation),
-                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
-                    raw,
-                    reason,
-                    dimensions,
-                }),
+                Err(RowRefusal::Row { reason, dimensions }) => {
+                    trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions,
+                    });
+                }
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
             }
         }
     }
-    Ok(ParsedOperations {
-        accepted,
-        quarantined,
-    })
+    accounting.source_rows_accepted =
+        source_rows - quarantined.len() - accounting.reduced_no_execution_trades;
+    accounting.quarantined_conversion = quarantined.len()
+        - accounting.quarantined_parse
+        - accounting.quarantined_securities_transfer
+        - accounting.quarantined_order_state
+        - accounting.quarantined_trade;
+    Ok((
+        ParsedOperations {
+            accepted,
+            journal,
+            pending_redemptions,
+            quarantined,
+        },
+        accounting,
+    ))
+}
+
+fn trace_quarantined_operation(operation_id: &str, source_kind: &str, reason: &'static str) {
+    tracing::debug!(
+        phase = "map_operations",
+        operation_id,
+        source_kind,
+        reason,
+        "T-Invest operation quarantined"
+    );
 }
 
 fn all_dimensions() -> BTreeSet<Dimension> {
@@ -578,6 +989,73 @@ fn order_state_reason(kind: &ChannelOperationKind, state: &ChannelOrderState) ->
     };
     Some(format!("order state {state_name}: {evidence}"))
 }
+fn pending_redemption(
+    account: AccountId,
+    operation: &ChannelOperation,
+    raw: String,
+) -> Result<crate::ports::PendingFullRedemption, BrokerError> {
+    let instrument = optional_instrument(operation)
+        .map_err(RowRefusal::into_broker_error)?
+        .ok_or_else(|| unparsable("bond redemption does not contain instrumentUid"))?;
+    let effective_date = operation
+        .date
+        .ok_or_else(|| unparsable("bond redemption does not contain date"))?;
+    let payment = operation
+        .payment
+        .filter(|payment| payment.amount.raw() > 0)
+        .ok_or_else(|| unparsable("bond redemption requires positive payment"))?;
+    Ok(crate::ports::PendingFullRedemption {
+        account,
+        instrument,
+        effective_date,
+        compensation: iaam_core::money::Money::new(payment.amount, payment.currency),
+        idempotency_key: operation.deduplication_key.clone(),
+        source_operation_id: operation.operation_id.clone(),
+        raw,
+    })
+}
+
+fn redemption_to_journal(
+    account: AccountId,
+    operation: ChannelOperation,
+) -> Result<iaam_ingest::journal_event::SubmittedJournalEvent, RowRefusal> {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::money::{Money, returned_principal_per_unit};
+    use iaam_ingest::journal_event::{JournalFact, SubmittedJournalEvent};
+
+    let instrument = optional_instrument(&operation)?
+        .ok_or_else(|| row_unparsable("bond redemption does not contain instrumentUid"))?;
+    let effective_date = operation
+        .date
+        .ok_or_else(|| row_unparsable("bond redemption does not contain date"))?;
+    let quantity = operation
+        .quantity
+        .filter(|quantity| quantity.0 > Dec::zero())
+        .ok_or_else(|| row_unparsable("bond redemption requires positive quantity"))?;
+    let payment = operation
+        .payment
+        .filter(|payment| payment.amount.raw() > 0)
+        .ok_or_else(|| row_unparsable("bond redemption requires positive payment"))?;
+    let compensation = Money::new(payment.amount, payment.currency);
+    let principal_returned_per_unit = returned_principal_per_unit(compensation, quantity)
+        .map_err(|error| row_unparsable(format!("bond redemption principal per unit: {error}")))?;
+    Ok(SubmittedJournalEvent {
+        account,
+        fact: JournalFact::CorporateAction(CorporateAction::Redemption {
+            instrument,
+            custody: None,
+            quantity,
+            principal_returned_per_unit,
+            compensation,
+            effective_date,
+            record_date: None,
+            grounds: None,
+        }),
+        idempotency_key: Some(operation.deduplication_key),
+        source_operation_id: Some(operation.operation_id),
+    })
+}
+
 fn operation_to_submitted(
     account: AccountId,
     operation: ChannelOperation,
@@ -653,13 +1131,8 @@ fn operation_to_submitted(
                 dimensions: BTreeSet::new(),
             });
         }
-        // Amortisation and redemption are corporate actions, not
-        // owner operations: they have their own representation and endpoint
-        // (POST /v1/ingest/journal-events). The rejection here identifies
-        // WHAT IS MISSING, rather than «unknown kind»: the channel reports the
-        // payment amount, but not the returned face value per unit or the custody
-        // location; without them the fact cannot be constructed, and substituting
-        // a guess would record something that never happened in the append-only journal.
+        // Partial repayment still needs its own journal mapping. Final
+        // redemption is routed to the journal before this conversion.
         ChannelOperationKind::BondAmortisation => {
             return Err(row_unparsable(
                 "bond amortisation: the channel does not report the returned face value per unit \
@@ -667,9 +1140,8 @@ fn operation_to_submitted(
             ));
         }
         ChannelOperationKind::BondRedemption => {
-            return Err(row_unparsable(
-                "bond redemption: the channel does not report the returned face value per unit \
-                 or custody location — the fact is entered via the journal endpoint",
+            return Err(RowRefusal::Adapter(
+                "bond redemption must be submitted through the journal path".to_owned(),
             ));
         }
         ChannelOperationKind::Other(kind) => {
@@ -1215,6 +1687,18 @@ pub(crate) mod fake {
                 Some(iaam_http::RequestBody::Json(body)) => body.clone(),
                 _ => String::new(),
             };
+            if request
+                .path()
+                .ends_with("InstrumentsService/GetInstrumentBy")
+            {
+                let value: serde_json::Value =
+                    serde_json::from_str(&body).expect("instrument request");
+                let id = value["id"].as_str().expect("instrument ID");
+                return Ok(HttpResponse { status: 200, body: serde_json::json!({"instrument": {
+                    "isin": if id == "eeeeeeee-0000-0000-0000-000000000001" { None } else { Some(format!("TEST-{id}")) }, "ticker": "TEST", "name": "Invented instrument",
+                    "instrumentType": "share", "currency": "rub", "uid": id
+                }}).to_string().into_bytes(), ..Default::default() });
+            }
             self.log.lock().expect("log").push(body);
             let scripted = self.script.lock().expect("script").pop_front();
             let answer = scripted
@@ -1438,60 +1922,55 @@ mod tests {
         )
     }
 
-    /// Amortisation and redemption are corporate actions, and the channel
-    /// does not provide the data they require. The rejection must identify WHAT IS MISSING:
+    /// Partial repayment remains refused until its journal mapping exists. The rejection must identify WHAT IS MISSING:
     /// «unsupported kind» would send the owner looking for support
     /// for a kind that is supported, rather than for the data that is missing.
     #[test]
-    fn a_bond_repayment_is_refused_by_naming_what_the_channel_does_not_report() {
+    fn a_partial_bond_repayment_is_refused_by_naming_what_the_channel_does_not_report() {
         use iaam_broker::operation_kind::ChannelOperationKind;
         use iaam_broker::tinkoff::ChannelOperation;
 
-        for kind in [
-            ChannelOperationKind::BondAmortisation,
-            ChannelOperationKind::BondRedemption,
-        ] {
-            let operation = ChannelOperation {
-                date: None,
-                source_time: None,
-                broker_account_id: "account".to_owned(),
-                operation_id: "1".to_owned(),
-                parent_operation_id: None,
-                cursor: "c".to_owned(),
-                source_kind: "irrelevant: the kind is passed separately".to_owned(),
-                state: ChannelOrderState::Executed,
-                position_uid: None,
-                instrument_uid: None,
-                figi: None,
-                quantity: None,
-                trades: Vec::new(),
-                quantity_done: iaam_core::money::Quantity::zero(),
-                quantity_rest: iaam_core::money::Quantity::zero(),
-                cancel_reason: None,
-                accrued_interest: None,
-                payment: None,
-                price: None,
-                commission: None,
-                deduplication_key: "k".to_owned(),
-                parser_version: iaam_core::event::provenance::ParserVersion("test".to_owned()),
-                raw: serde_json::Value::Null,
-                rejection: None,
-            };
-            let account = AccountId(Uuid::from_u128(1));
-            let error = operation_to_submitted(account, operation, kind.clone())
-                .expect_err("a corporate action cannot be constructed through the channel");
-            let RowRefusal::Row { reason, .. } = error else {
-                panic!("corporate action should be a row refusal");
-            };
-            assert!(
-                reason.contains("returned face value per unit"),
-                "error does not identify what is missing: {reason}"
-            );
-            assert!(
-                reason.contains("journal endpoint"),
-                "error does not identify where the fact is entered: {reason}"
-            );
-        }
+        let kind = ChannelOperationKind::BondAmortisation;
+        let operation = ChannelOperation {
+            date: None,
+            source_time: None,
+            broker_account_id: "account".to_owned(),
+            operation_id: "1".to_owned(),
+            parent_operation_id: None,
+            cursor: "c".to_owned(),
+            source_kind: "irrelevant: the kind is passed separately".to_owned(),
+            state: ChannelOrderState::Executed,
+            position_uid: None,
+            instrument_uid: None,
+            figi: None,
+            quantity: None,
+            trades: Vec::new(),
+            quantity_done: iaam_core::money::Quantity::zero(),
+            quantity_rest: iaam_core::money::Quantity::zero(),
+            cancel_reason: None,
+            accrued_interest: None,
+            payment: None,
+            price: None,
+            commission: None,
+            deduplication_key: "k".to_owned(),
+            parser_version: iaam_core::event::provenance::ParserVersion("test".to_owned()),
+            raw: serde_json::Value::Null,
+            rejection: None,
+        };
+        let account = AccountId(Uuid::from_u128(1));
+        let error = operation_to_submitted(account, operation, kind.clone())
+            .expect_err("a corporate action cannot be constructed through the channel");
+        let RowRefusal::Row { reason, .. } = error else {
+            panic!("corporate action should be a row refusal");
+        };
+        assert!(
+            reason.contains("returned face value per unit"),
+            "error does not identify what is missing: {reason}"
+        );
+        assert!(
+            reason.contains("journal endpoint"),
+            "error does not identify where the fact is entered: {reason}"
+        );
     }
 
     /// The channel dictionary is defined explicitly in tests: classification is data,
@@ -3238,10 +3717,47 @@ mod tests {
     fn channel(gateway: Arc<dyn Outbound>) -> super::TinkoffChannel {
         let key = Key::from_bytes([5; 32]);
         let token = open(&key, &seal(&key, TOKEN)).expect("token opens");
+        let store = iaam_store::SqliteStore::open_in_memory().expect("instrument directory");
+        for uid in [
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "cccccccc-0000-0000-0000-000000000099",
+            "dddddddd-0000-0000-0000-000000000042",
+            "bbbbbbbb-0000-0000-0000-0000000000c2",
+            "bbbbbbbb-0000-0000-0000-0000000000c4",
+            "dddddddd-0000-0000-0000-000000000098",
+            "bbbbbbbb-0000-0000-0000-0000000000c8",
+        ] {
+            store
+                .upsert_instrument(&iaam_store::reference::InstrumentRecord {
+                    id: InstrumentId(Uuid::parse_str(uid).expect("invented UID")),
+                    kind: None,
+                    symbol: "TEST".to_owned(),
+                    title: "Invented instrument".to_owned(),
+                    currencies: iaam_core::instrument::CurrencyRoles::uniform(
+                        iaam_core::money::CurrencyCode::Rub,
+                    ),
+                    lineage: None,
+                    metadata: None,
+                })
+                .expect("seed instrument");
+            store
+                .record_alias(&iaam_store::reference::AliasRecord {
+                    namespace: iaam_core::instrument::AliasNamespace::Isin,
+                    value: format!("TEST-{uid}"),
+                    instrument: InstrumentId(Uuid::parse_str(uid).expect("invented UID")),
+                    interval: iaam_core::instrument::AliasInterval {
+                        valid_from: time::macros::date!(0001 - 01 - 01),
+                        valid_to: None,
+                    },
+                    source: SourceId(Uuid::from_u128(9)),
+                })
+                .expect("seed ISIN");
+        }
         super::TinkoffChannel::new(
             TinkoffClient::new(Environment::Prod, token, gateway),
             SourceId(Uuid::from_u128(9)),
             dictionary(),
+            Arc::new(crate::adapters::sqlite::SqliteAdapter::new(store)),
         )
     }
 
@@ -3257,6 +3773,31 @@ mod tests {
                 broker_context(None),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn descriptions_without_isin_are_refused_before_any_operation_kind_is_mapped() {
+        let missing = "eeeeeeee-0000-0000-0000-000000000001";
+        for kind in [
+            "OPERATION_TYPE_BUY",
+            "OPERATION_TYPE_SELL",
+            "OPERATION_TYPE_COUPON",
+            "OPERATION_TYPE_DIVIDEND",
+            "OPERATION_TYPE_BOND_REPAYMENT_FULL",
+            "OPERATION_TYPE_BOND_REPAYMENT",
+        ] {
+            let body =
+                income_operation(kind).replace("01234567-89ab-cdef-0123-456789abcdef", missing);
+            let (gateway, _, _) = fake::gateway(vec![Answer::status(200, &body)], None);
+            let parsed = fetch(&channel(gateway))
+                .await
+                .expect("unknown instrument is a row refusal");
+            assert!(parsed.accepted.is_empty());
+            assert_eq!(parsed.quarantined.len(), 1);
+            let reason = &parsed.quarantined[0].reason;
+            assert!(reason.contains(missing), "{reason}");
+            assert!(reason.contains("names no ISIN"), "{reason}");
+        }
     }
 
     #[tokio::test]
@@ -3550,6 +4091,227 @@ mod tests {
         ] {
             let error = super::tinkoff_error(super::TinkoffError::Transport(fault));
             assert!(matches!(error, BrokerError::Adapter { .. }), "{error:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod full_redemption_tests {
+    use super::*;
+
+    // Invented end to end, including the zero execution counters that belong
+    // to the channel's non-trading repayment rows.
+    fn full_repayment_row() -> serde_json::Value {
+        serde_json::json!({
+            "cursor": "invented-redemption-cursor",
+            "brokerAccountId": "invented-broker-account",
+            "id": "invented-redemption",
+            "parentOperationId": "",
+            "date": "2026-08-20T10:11:12Z",
+            "type": "OPERATION_TYPE_BOND_REPAYMENT_FULL",
+            "state": "OPERATION_STATE_EXECUTED",
+            "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
+            "positionUid": "11234567-89ab-cdef-0123-456789abcdef",
+            "figi": "TESTBOND0001",
+            "instrumentType": "bond",
+            "instrumentKind": "INSTRUMENT_TYPE_BOND",
+            "ticker": "TESTBOND",
+            "classCode": "TQCB",
+            "name": "Invented bond",
+            "description": "Full repayment of an invented bond",
+            "quantity": "3",
+            "quantityRest": "0",
+            "quantityDone": "0",
+            "payment": {"units": "2400", "nano": 0, "currency": "rub"},
+            "price": {"units": "800", "nano": 0, "currency": "rub"},
+            "commission": {"units": "0", "nano": 0, "currency": ""},
+            "accruedInt": {"units": "0", "nano": 0, "currency": ""},
+            "cancelReason": "",
+            "tradesInfo": {"trades": []},
+            "childOperations": []
+        })
+    }
+
+    fn adapt_row(row: serde_json::Value) -> ParsedOperations {
+        let body = serde_json::json!({"hasNext": false, "items": [row]}).to_string();
+        let operations = parse_operations(&body)
+            .expect("invented repayment parses")
+            .operations;
+        let (dictionary, unreadable) = OperationKindDictionary::build(
+            iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                .iter()
+                .copied(),
+        );
+        assert!(unreadable.is_empty());
+        adapt_operations(AccountId(Uuid::from_u128(1)), operations, &dictionary)
+            .expect("row mapping")
+    }
+
+    #[test]
+    fn full_repayment_becomes_principal_return_and_retires_the_reported_quantity() {
+        use iaam_core::event::corporate_action::CorporateAction;
+        use iaam_ingest::journal_event::JournalFact;
+
+        let mut row = full_repayment_row();
+        // Principal comes from the payment, not a quote or execution counter.
+        row["price"]["units"] = serde_json::json!("999");
+        let parsed = adapt_row(row);
+        assert!(
+            parsed.accepted.is_empty(),
+            "redemption is not income or a sale"
+        );
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.journal.len(), 1);
+        let submitted = &parsed.journal[0];
+        assert_eq!(submitted.account, AccountId(Uuid::from_u128(1)));
+        assert_eq!(
+            submitted.source_operation_id.as_deref(),
+            Some("invented-redemption")
+        );
+        assert_eq!(
+            submitted.idempotency_key.as_deref(),
+            Some("invented-broker-account/invented-redemption")
+        );
+        let JournalFact::CorporateAction(CorporateAction::Redemption {
+            instrument,
+            custody,
+            quantity,
+            principal_returned_per_unit,
+            compensation,
+            effective_date,
+            record_date,
+            grounds,
+        }) = &submitted.fact
+        else {
+            panic!("full repayment must be a journal redemption");
+        };
+        assert_eq!(
+            *instrument,
+            InstrumentId(
+                Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("invented UID")
+            )
+        );
+        assert_eq!(*custody, None, "positionUid is not a custody place");
+        assert_eq!(quantity.0.inner().to_string(), "3");
+        assert_eq!(
+            principal_returned_per_unit.value(),
+            Dec::new(Decimal::from(800))
+        );
+        assert_eq!(principal_returned_per_unit.currency(), CurrencyCode::Rub);
+        assert_eq!(compensation.amount().raw(), 240_000);
+        assert_eq!(compensation.currency(), CurrencyCode::Rub);
+        assert_eq!(*effective_date, time::macros::date!(2026 - 08 - 20));
+        assert_eq!(*record_date, None);
+        assert_eq!(*grounds, None);
+        let normalized = iaam_ingest::journal_event::normalize_journal_event(
+            submitted,
+            &iaam_ingest::journal_event::JournalEventEnrichment::default(),
+            &iaam_ingest::operation::NormalizationContext {
+                owner: iaam_core::ids::OwnerId(Uuid::from_u128(2)),
+                source: SourceId(Uuid::from_u128(3)),
+                parser_version: ParserVersion(TINKOFF_PARSER_VERSION.to_owned()),
+            },
+        )
+        .expect("redemption normalizes into journal legs");
+        normalized
+            .event
+            .validate_structure()
+            .expect("valid redemption");
+        assert_eq!(normalized.event.legs.len(), 2);
+        let principal = normalized
+            .event
+            .legs
+            .iter()
+            .find(|leg| leg.kind == iaam_core::event::leg::LegKind::Principal)
+            .expect("principal cash return");
+        assert_eq!(
+            principal.cash_effect().expect("cash").amount().raw(),
+            240_000
+        );
+        let security = normalized
+            .event
+            .legs
+            .iter()
+            .find(|leg| leg.kind == iaam_core::event::leg::LegKind::SecurityQuantity)
+            .expect("retired quantity");
+        assert_eq!(
+            security.quantity.expect("quantity").0.inner().to_string(),
+            "-3"
+        );
+        assert_eq!(security.custody, None);
+    }
+
+    #[test]
+    fn full_repayment_refuses_missing_or_nonpositive_principal_and_invalid_quantity() {
+        for (field, value, reason) in [
+            ("payment", serde_json::Value::Null, "positive payment"),
+            (
+                "payment",
+                serde_json::json!({"units": "0", "nano": 0, "currency": "rub"}),
+                "positive payment",
+            ),
+            (
+                "payment",
+                serde_json::json!({"units": "-1", "nano": 0, "currency": "rub"}),
+                "positive payment",
+            ),
+            ("quantity", serde_json::Value::Null, "positive quantity"),
+            ("quantity", serde_json::json!("-1"), "positive quantity"),
+            ("instrumentUid", serde_json::Value::Null, "instrumentUid"),
+            (
+                "instrumentUid",
+                serde_json::json!("not-a-uuid"),
+                "instrumentUid",
+            ),
+        ] {
+            let mut row = full_repayment_row();
+            row[field] = value;
+            let parsed = adapt_row(row.clone());
+            assert!(parsed.accepted.is_empty());
+            assert!(parsed.journal.is_empty());
+            assert_eq!(parsed.quarantined.len(), 1);
+            let refusal = &parsed.quarantined[0];
+            assert!(
+                refusal.reason.contains(reason),
+                "{field}: {}",
+                refusal.reason
+            );
+            assert_eq!(refusal.dimensions, cash_positions());
+            assert_eq!(refusal.raw, row);
+        }
+    }
+
+    #[test]
+    fn zero_quantity_full_repayment_waits_for_journal_holdings() {
+        let mut row = full_repayment_row();
+        row["quantity"] = serde_json::json!("0");
+        row["price"] = serde_json::json!({"units": "0", "nano": 0, "currency": "rub"});
+        let parsed = adapt_row(row.clone());
+        assert!(parsed.accepted.is_empty());
+        assert!(parsed.journal.is_empty());
+        assert!(parsed.quarantined.is_empty());
+        assert_eq!(parsed.pending_redemptions.len(), 1);
+        assert_eq!(
+            parsed.pending_redemptions[0].compensation.amount().raw(),
+            240_000
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.pending_redemptions[0].raw).unwrap(),
+            row
+        );
+    }
+
+    #[test]
+    fn unexecuted_full_repayment_does_not_create_a_journal_fact() {
+        for state in ["OPERATION_STATE_CANCELED", "OPERATION_STATE_PROGRESS"] {
+            let mut row = full_repayment_row();
+            row["state"] = serde_json::json!(state);
+            let parsed = adapt_row(row);
+            assert!(parsed.accepted.is_empty());
+            assert!(parsed.journal.is_empty());
+            assert_eq!(parsed.quarantined.len(), 1);
+            assert!(parsed.quarantined[0].reason.contains(state));
+            assert_eq!(parsed.quarantined[0].dimensions, cash_positions());
         }
     }
 }

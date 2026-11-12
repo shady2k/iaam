@@ -50,6 +50,21 @@ const BROKER_HOSTS: [&str; 3] = [
     Destination::FinamApi.base_url(),
 ];
 
+/// A missing instrument is a catalogue answer, not a broker access refusal.
+pub(crate) fn is_instrument_lookup_miss(host: &str, path: &str, status: u16) -> bool {
+    status == 404
+        && matches!(
+            host,
+            "https://invest-public-api.tbank.ru/rest"
+                | "https://sandbox-invest-public-api.tbank.ru/rest"
+        )
+        && matches!(
+            path.trim_start_matches('/'),
+            "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
+                | "InstrumentsService/GetInstrumentBy"
+        )
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum TallyError {
     #[error("could not {action}: {source}")]
@@ -607,6 +622,7 @@ impl OutboundTally {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn record_response(
         &self,
         host: &str,
@@ -614,6 +630,18 @@ impl OutboundTally {
         retry_after: Option<Duration>,
         clock: &dyn Clock,
     ) -> Result<TallyResponseDecision, TallyError> {
+        self.record_response_for_request(host, "", status, retry_after, clock)
+    }
+
+    pub(crate) fn record_response_for_request(
+        &self,
+        host: &str,
+        path: &str,
+        status: u16,
+        retry_after: Option<Duration>,
+        clock: &dyn Clock,
+    ) -> Result<TallyResponseDecision, TallyError> {
+        let lookup_miss = is_instrument_lookup_miss(host, path, status);
         self.transact(|state| {
             let boot = read_boot(clock)?;
             let now_nanos = boot.elapsed().as_nanos();
@@ -632,7 +660,7 @@ impl OutboundTally {
             let host_state = state.host_for_boot(host, now_nanos);
             host_state.pending_since = None;
             host_state.pending_budget_key = None;
-            let named_pause = (!(200..300).contains(&status))
+            let named_pause = (!lookup_miss && !(200..300).contains(&status))
                 .then(|| retry_after.map(|delay| delay.as_nanos().min(DAY_NANOS)))
                 .flatten();
             if let Some(pause) = named_pause {
@@ -670,7 +698,7 @@ impl OutboundTally {
                         host_state.closed_reason = Some(ClosureReason::RateLimits);
                     }
                 }
-                400..=499 => {
+                400..=499 if !lookup_miss => {
                     host_state.refusals.push(now_nanos);
                     if host_state.refusals.len() >= 3 {
                         let closed_until = now_nanos.saturating_add(CLOSURE_NANOS);
@@ -1653,6 +1681,67 @@ mod tests {
             Ok(TallyDecision::Send)
         ));
         ready
+    }
+
+    #[test]
+    fn only_exact_tinkoff_instrument_lookup_404_is_a_catalogue_miss() {
+        let path = "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy";
+        for host in [
+            Destination::TinkoffProd.base_url(),
+            Destination::TinkoffSandbox.base_url(),
+        ] {
+            assert!(is_instrument_lookup_miss(host, path, 404));
+            assert!(!is_instrument_lookup_miss(host, path, 403));
+            assert!(!is_instrument_lookup_miss(
+                host,
+                "/UsersService/GetAccounts",
+                404
+            ));
+            assert!(!is_instrument_lookup_miss(
+                host,
+                &format!("{path}/extra"),
+                404
+            ));
+        }
+        assert!(!is_instrument_lookup_miss(
+            Destination::FinamApi.base_url(),
+            path,
+            404
+        ));
+    }
+
+    #[test]
+    fn ordinary_broker_404_responses_still_close_the_host() {
+        let (_temporary, _directory, tally) = tally("ordinary-404-closure");
+        let host = Destination::TinkoffProd.base_url();
+        let first = BootTime::new("test-boot", Duration::from_secs(30_000));
+        tally
+            .initialize_fresh_pair(&first)
+            .expect("fresh pair minted");
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &first),
+            Ok(TallyDecision::Send)
+        ));
+        for offset in 0..3 {
+            let at = BootTime::new("test-boot", first.elapsed() + Duration::from_secs(offset));
+            if offset > 0 {
+                assert!(matches!(
+                    tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &at),
+                    Ok(TallyDecision::Send)
+                ));
+            }
+            tally
+                .record_response_for_request(host, "/UsersService/GetAccounts", 404, None, &at)
+                .expect("refusal persisted");
+        }
+        let next = BootTime::new("test-boot", first.elapsed() + Duration::from_secs(3));
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &next),
+            Ok(TallyDecision::Closed {
+                reason: ClosureReason::Refusals,
+                ..
+            })
+        ));
     }
 
     #[test]

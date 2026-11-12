@@ -532,6 +532,7 @@ pub struct InstrumentView {
     pub denomination_currency: String,
     pub settlement_currency: String,
     pub quote_currency: String,
+    pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
 }
 
 /// Active instrument alias.
@@ -570,6 +571,7 @@ pub struct InstrumentUpsert {
     pub title: String,
     pub currencies: iaam_core::instrument::CurrencyRoles,
     pub lineage: Option<iaam_core::instrument::Lineage>,
+    pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
 }
 
 /// A place of custody from an authorised writer.
@@ -625,6 +627,15 @@ pub trait InstrumentDirectory: Send + Sync {
     /// Writing is needed by source synchronisation and the administrator; an agent
     /// token is not given access to this method through an HTTP route (§7, §14).
     async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError>;
+
+    /// Resolve an ISIN or atomically record the instrument and its ISIN alias.
+    async fn register_instrument_with_isin(
+        &self,
+        record: InstrumentUpsert,
+        isin: String,
+        source: iaam_core::ids::SourceId,
+        on: Date,
+    ) -> Result<InstrumentId, AppError>;
 
     /// Record an instrument's external code with its validity interval.
     async fn record_alias(&self, alias: AliasUpsert) -> Result<(), AppError>;
@@ -2172,6 +2183,18 @@ pub struct Quarantined {
     pub dimensions: std::collections::BTreeSet<Dimension>,
 }
 
+/// A full repayment whose source reports zero units, not a position size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingFullRedemption {
+    pub account: AccountId,
+    pub instrument: InstrumentId,
+    pub compensation: iaam_core::money::Money,
+    pub effective_date: Date,
+    pub idempotency_key: String,
+    pub source_operation_id: String,
+    pub raw: String,
+}
+
 /// Result of retrieving a page of broker-channel operations.
 ///
 /// Rejected rows are not lost: they are separated from accepted operations, but
@@ -2179,6 +2202,8 @@ pub struct Quarantined {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedOperations {
     pub accepted: Vec<SubmittedOperation>,
+    pub journal: Vec<iaam_ingest::SubmittedJournalEvent>,
+    pub pending_redemptions: Vec<PendingFullRedemption>,
     pub quarantined: Vec<Quarantined>,
 }
 

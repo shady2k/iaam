@@ -55,6 +55,8 @@ pub(crate) fn now() -> String {
 pub enum StoreError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("invalid instrument metadata JSON: {0}")]
+    InstrumentMetadataJson(#[from] serde_json::Error),
     #[error("failed to serialize event: {0}")]
     EventEncode(#[source] serde_json::Error),
     #[error("failed to parse snapshot: {0}")]

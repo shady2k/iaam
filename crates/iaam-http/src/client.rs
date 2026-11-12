@@ -150,18 +150,26 @@ impl HttpClient {
         // it and the store persists when the same answer is cached.
         let observed_at = SystemTime::now();
         let retry_after = named_delay(headers, request.reset_header(), observed_at);
+        let retry_after_header = named_delay(headers, None, observed_at);
         let location = response_location(headers);
         let content_type = response_content_type(headers);
         let request_id = response_request_id(headers);
+        let rate_limit = numeric_header(headers, "x-ratelimit-limit");
+        let rate_remaining = numeric_header(headers, "x-ratelimit-remaining");
+        let rate_reset = numeric_header(headers, "x-ratelimit-reset");
         // The status line with its headers, before the body is read: what
         // the answer said survives a body that stalls or fails.
         observe(HttpResponse {
             status,
             body: Vec::new(),
             retry_after,
+            retry_after_header,
             location: location.clone(),
             content_type: content_type.clone(),
             request_id: request_id.clone(),
+            rate_limit,
+            rate_remaining,
+            rate_reset,
             observed_at: Some(observed_at),
         });
         // A status line that arrived is never lost: after a non-2xx status a
@@ -179,9 +187,13 @@ impl HttpClient {
             status,
             body,
             retry_after,
+            retry_after_header,
             location,
             content_type,
             request_id,
+            rate_limit,
+            rate_remaining,
+            rate_reset,
             observed_at: Some(observed_at),
         })
     }
@@ -282,7 +294,8 @@ fn response_content_type(headers: &reqwest::header::HeaderMap) -> Option<String>
 
 /// The request-id names a destination's support asks for, in the order the
 /// names are commonly agreed on; the first present wins.
-const REQUEST_ID_HEADERS: [&str; 4] = [
+const REQUEST_ID_HEADERS: [&str; 5] = [
+    "x-tracking-id",
     "x-request-id",
     "x-trace-id",
     "traceparent",
@@ -296,6 +309,15 @@ fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
     })
+}
+
+// Only unsigned decimal counts leave the transport, never arbitrary headers.
+fn numeric_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    let value = headers.get(name)?.to_str().ok()?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn classify_transport_error(error: reqwest::Error) -> HttpError {
@@ -358,6 +380,50 @@ mod tests {
     }
 
     #[test]
+    fn tracking_id_is_preferred_and_standard_request_ids_remain_fallbacks() {
+        assert_eq!(
+            response_request_id(&headers(&[
+                ("x-tracking-id", "tracking-7"),
+                ("x-request-id", "request-8")
+            ])),
+            Some("tracking-7".to_owned())
+        );
+        for name in [
+            "x-request-id",
+            "x-trace-id",
+            "traceparent",
+            "x-correlation-id",
+        ] {
+            assert_eq!(
+                response_request_id(&headers(&[(name, "request-8")])),
+                Some("request-8".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn rate_headers_accept_only_unsigned_decimal_counts() {
+        let fields = headers(&[
+            ("x-ratelimit-limit", "200"),
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "17"),
+            ("authorization", "Bearer private"),
+        ]);
+        assert_eq!(numeric_header(&fields, "x-ratelimit-limit"), Some(200));
+        assert_eq!(numeric_header(&fields, "x-ratelimit-remaining"), Some(0));
+        assert_eq!(numeric_header(&fields, "x-ratelimit-reset"), Some(17));
+        for invalid in ["-1", "+1", "1.5", "private", "18446744073709551616", ""] {
+            assert_eq!(
+                numeric_header(
+                    &headers(&[("x-ratelimit-reset", invalid)]),
+                    "x-ratelimit-reset"
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn retry_after_is_the_named_delay() {
         let named = named_delay(&headers(&[("retry-after", "12")]), None, SystemTime::now());
         assert_eq!(named, Some(Duration::from_secs(12)));
@@ -381,6 +447,15 @@ mod tests {
             SystemTime::now(),
         );
         assert_eq!(named, Some(Duration::from_secs(17)));
+        assert_eq!(
+            named_delay(
+                &headers(&[("x-ratelimit-reset", "17")]),
+                None,
+                SystemTime::now()
+            ),
+            None,
+            "a reset fallback is not an actual Retry-After header"
+        );
     }
 
     #[test]

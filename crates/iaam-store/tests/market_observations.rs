@@ -22,6 +22,7 @@ fn store_with_instrument() -> (SqliteStore, InstrumentId) {
             title: "Sberbank".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument created");
     (store, instrument)

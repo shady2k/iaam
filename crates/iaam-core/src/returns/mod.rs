@@ -703,6 +703,10 @@ pub struct ReturnsReport {
     pub withdrawn: Computed<Dec>,
     /// Portfolio value as of the report date: cash plus positions valued at their prices.
     pub terminal_value: Computed<Dec>,
+    /// Received income grouped by economic kind and native currency over the
+    /// account history. Unknown kinds remain explicit; no FX conversion is made.
+    pub income_by_kind:
+        Computed<Vec<(Option<crate::event::kind::IncomeKind>, crate::money::Money)>>,
     /// Bond position metrics for each available scenario.
     pub bond_metrics: Vec<BondPositionMetrics>,
     /// Value before exit costs and before tax.
@@ -1425,6 +1429,14 @@ pub fn returns_report_with_bond_inputs(
         contributed,
         withdrawn,
         terminal_value,
+        income_by_kind: match state.income().income_by_kind(request.contour) {
+            Ok(rows) => Computed::Value(rows),
+            Err(_) => Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "income_by_kind_overflow",
+                },
+            },
+        },
         bond_metrics,
         liquidation_value_before_exit_costs_and_tax,
         xirr: rate,
@@ -2653,6 +2665,86 @@ mod tests {
         };
         (returns_report(&state, &request), instrument)
     }
+    #[test]
+    fn returns_keep_lending_income_separate_and_include_it_in_terminal_cash() {
+        use crate::event::kind::IncomeKind;
+        let account = AccountId::new_random();
+        let outside = AccountId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let mut events = Vec::new();
+        for (sequence, (owner, kind, amount, currency)) in (1_u32..).zip([
+            (account, Some(IncomeKind::Coupon), 100, CurrencyCode::Rub),
+            (account, Some(IncomeKind::Dividend), 200, CurrencyCode::Rub),
+            (
+                account,
+                Some(IncomeKind::DepositInterest),
+                300,
+                CurrencyCode::Rub,
+            ),
+            (
+                account,
+                Some(IncomeKind::SecuritiesLendingIncome),
+                400,
+                CurrencyCode::Rub,
+            ),
+            (
+                account,
+                Some(IncomeKind::SecuritiesLendingIncome),
+                50,
+                CurrencyCode::Rub,
+            ),
+            (
+                outside,
+                Some(IncomeKind::SecuritiesLendingIncome),
+                900,
+                CurrencyCode::Rub,
+            ),
+        ]) {
+            let gross = Money::new(PostedMinor::new(amount), currency);
+            events.push(event_with(
+                owner,
+                date!(2026 - 08 - 01),
+                sequence,
+                EventKind::Income {
+                    instrument: None,
+                    gross,
+                    kind,
+                },
+                vec![Leg::cash(owner, gross)],
+            ));
+        }
+        let projection = project(&events, &context).expect("income projects");
+        let state = projection.snapshot().state();
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let report = returns_report(state, &request);
+        let Computed::Value(rows) = &report.income_by_kind else {
+            panic!("income fits")
+        };
+        assert_eq!(rows.len(), 4);
+        for (kind, amount) in [
+            (IncomeKind::Coupon, 100),
+            (IncomeKind::Dividend, 200),
+            (IncomeKind::DepositInterest, 300),
+            (IncomeKind::SecuritiesLendingIncome, 450),
+        ] {
+            assert!(rows.contains(&(
+                Some(kind),
+                Money::new(PostedMinor::new(amount), CurrencyCode::Rub)
+            )));
+        }
+        assert_eq!(report.terminal_value, Computed::Value(dec("10.5")));
+        assert!(state.flows().external().is_empty());
+    }
+
     #[test]
     fn legacy_valuation_enters_terminal_value_as_money_per_unit() {
         let account = AccountId::new_random();

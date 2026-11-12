@@ -306,6 +306,7 @@ pub struct InstrumentRecord {
     pub title: String,
     pub currencies: CurrencyRoles,
     pub lineage: Option<Lineage>,
+    pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -763,13 +764,43 @@ impl SqliteStore {
         Ok(accounts)
     }
 
+    /// Resolve and register under one write lock, so no failed alias leaves an orphan.
+    pub fn register_instrument_with_isin(
+        &mut self,
+        instrument: &InstrumentRecord,
+        isin: &str,
+        source: SourceId,
+        on: Date,
+    ) -> Result<InstrumentId, ResolveError> {
+        self.with_immediate_transaction(ResolveError::Store, |store| {
+            match store.resolve_instrument(AliasNamespace::Isin, isin, on) {
+                Ok(id) => Ok(id),
+                Err(ResolveError::Unknown { .. }) => {
+                    store.upsert_instrument(instrument)?;
+                    store.record_alias(&AliasRecord {
+                        namespace: AliasNamespace::Isin,
+                        value: isin.to_owned(),
+                        instrument: instrument.id,
+                        interval: AliasInterval {
+                            valid_from: time::macros::date!(0001 - 01 - 01),
+                            valid_to: None,
+                        },
+                        source,
+                    })?;
+                    Ok(instrument.id)
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     pub fn upsert_instrument(&self, instrument: &InstrumentRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO instruments
                  (id, kind, symbol, title,
                   denomination_currency, settlement_currency, quote_currency,
-                  lineage_parent, lineage_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                  lineage_parent, lineage_reason, created_at, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (id) DO UPDATE SET
                  kind = excluded.kind,
                  symbol = excluded.symbol,
@@ -778,7 +809,8 @@ impl SqliteStore {
                  settlement_currency = excluded.settlement_currency,
                  quote_currency = excluded.quote_currency,
                  lineage_parent = excluded.lineage_parent,
-                 lineage_reason = excluded.lineage_reason",
+                 lineage_reason = excluded.lineage_reason,
+                 metadata = COALESCE(excluded.metadata, instruments.metadata)",
             params![
                 instrument.id.inner().to_string(),
                 instrument.kind.map(InstrumentKind::code),
@@ -790,6 +822,11 @@ impl SqliteStore {
                 instrument.lineage.map(|l| l.parent.inner().to_string()),
                 instrument.lineage.map(|l| l.reason.code()),
                 now(),
+                instrument
+                    .metadata
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
             ],
         )?;
         Ok(())
@@ -1009,7 +1046,7 @@ impl SqliteStore {
             .query_row(
                 "SELECT kind, symbol, title, denomination_currency,
                         settlement_currency, quote_currency,
-                        lineage_parent, lineage_reason
+                        lineage_parent, lineage_reason, metadata
                  FROM instruments WHERE id = ?1",
                 [id.inner().to_string()],
                 |row| {
@@ -1022,6 +1059,7 @@ impl SqliteStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1033,7 +1071,7 @@ impl SqliteStore {
         let mut statement = self.conn.prepare(
             "SELECT id, kind, symbol, title, denomination_currency,
                     settlement_currency, quote_currency,
-                    lineage_parent, lineage_reason
+                    lineage_parent, lineage_reason, metadata
              FROM instruments ORDER BY symbol, id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1047,10 +1085,22 @@ impl SqliteStore {
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, kind, symbol, title, denomination, settlement, quote, parent, reason) = row?;
+            let (
+                id,
+                kind,
+                symbol,
+                title,
+                denomination,
+                settlement,
+                quote,
+                parent,
+                reason,
+                metadata,
+            ) = row?;
             let id = InstrumentId(parse_uuid(&id, "instrument")?);
             decode_instrument(
                 id,
@@ -1063,6 +1113,7 @@ impl SqliteStore {
                     quote,
                     parent,
                     reason,
+                    metadata,
                 ),
             )
         })
@@ -2027,13 +2078,14 @@ type InstrumentParts = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn decode_instrument(
     id: InstrumentId,
     parts: InstrumentParts,
 ) -> Result<InstrumentRecord, StoreError> {
-    let (kind, symbol, title, denomination, settlement, quote, parent, reason) = parts;
+    let (kind, symbol, title, denomination, settlement, quote, parent, reason, metadata) = parts;
     let kind = kind
         .map(|value| {
             InstrumentKind::from_code(&value).ok_or_else(|| StoreError::NotFound {
@@ -2081,5 +2133,6 @@ fn decode_instrument(
         title,
         currencies,
         lineage,
+        metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
     })
 }

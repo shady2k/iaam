@@ -83,6 +83,7 @@ fn store() -> (SqliteStore, InstrumentId) {
             title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument created");
     store
@@ -186,6 +187,7 @@ async fn seed_report_position(
             title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .await
         .expect("instrument");
@@ -250,6 +252,7 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
             title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("market instrument");
     store

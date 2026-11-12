@@ -140,7 +140,11 @@ impl SqliteAdapter {
         F: FnOnce(&mut SqliteStore) -> Result<T, AppError> + Send + 'static,
     {
         let store = Arc::clone(&self.store);
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
+            let _entered = span.enter();
             let mut guard = match store.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -372,6 +376,7 @@ fn instrument_view(record: iaam_store::reference::InstrumentRecord) -> Instrumen
         denomination_currency: record.currencies.denomination.code().to_owned(),
         settlement_currency: record.currencies.settlement.code().to_owned(),
         quote_currency: record.currencies.quote.code().to_owned(),
+        metadata: record.metadata,
     }
 }
 
@@ -424,10 +429,17 @@ impl Store for SqliteAdapter {
     ) -> Result<Vec<Recorded>, AppError> {
         self.blocking(move |store| {
             let mut recorded = Vec::with_capacity(events.len());
-            for event in &events {
-                let outcome = store
-                    .append_event_in_order(event, identity_scope)
-                    .map_err(store_error)?;
+            for (row_index, event) in events.iter().enumerate() {
+                let span = tracing::info_span!("journal_append", row_index,
+                    event_id = %event.id.inner(), account_id = %event.account.inner());
+                let _entered = span.enter();
+                let outcome =
+                    store
+                        .append_event_in_order(event, identity_scope)
+                        .map_err(|error| {
+                            tracing::error!(error = %error, "journal append failed");
+                            store_error(error)
+                        })?;
                 recorded.push(match outcome {
                     Appended::Inserted { id } => Recorded::Inserted { id },
                     Appended::Duplicate { existing } => Recorded::Duplicate { existing },
@@ -1590,6 +1602,7 @@ impl InstrumentDirectory for SqliteAdapter {
             title,
             currencies,
             lineage,
+            metadata,
         } = record;
         self.blocking(move |store| {
             store
@@ -1600,9 +1613,38 @@ impl InstrumentDirectory for SqliteAdapter {
                     title,
                     currencies,
                     lineage,
+                    metadata,
                 })
                 .map_err(store_error)?;
             Ok(id)
+        })
+        .await
+    }
+
+    async fn register_instrument_with_isin(
+        &self,
+        record: InstrumentUpsert,
+        isin: String,
+        source: iaam_core::ids::SourceId,
+        on: Date,
+    ) -> Result<InstrumentId, AppError> {
+        self.blocking(move |store| {
+            store
+                .register_instrument_with_isin(
+                    &InstrumentRecord {
+                        id: record.id,
+                        kind: record.kind,
+                        symbol: record.symbol,
+                        title: record.title,
+                        currencies: record.currencies,
+                        lineage: record.lineage,
+                        metadata: record.metadata,
+                    },
+                    &isin,
+                    source,
+                    on,
+                )
+                .map_err(resolve_error)
         })
         .await
     }
@@ -1901,6 +1943,7 @@ fn build_tinkoff_channel(parts: ChannelParts) -> Arc<dyn BrokerChannel> {
         TinkoffClient::new(parts.environment, parts.token, parts.gateway),
         parts.source,
         parts.dictionary,
+        parts.instruments,
     ))
 }
 
@@ -2023,7 +2066,33 @@ impl BrokerChannelFactory for SqliteAdapter {
         // them — using the same approach already used for SQLite.
         let code = code.clone();
         let rows = self
-            .blocking(move |store| store.broker_operation_kinds(&code).map_err(store_error))
+            .blocking(move |store| {
+                if code.as_str() == "tinkoff" {
+                    let outcome = store
+                        .extend_broker_operation_kinds(
+                            &code,
+                            "embedded T-Invest full redemption",
+                            &iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                                .iter()
+                                .filter(|(source, _)| {
+                                    *source == "OPERATION_TYPE_BOND_REPAYMENT_FULL"
+                                })
+                                .map(|(source, kind)| BrokerOperationKind {
+                                    source_kind: (*source).to_owned(),
+                                    kind: (*kind).to_owned(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(store_error)?;
+                    tracing::info!(
+                        phase = "extend_operation_dictionary",
+                        added = outcome.added,
+                        already_known = outcome.already_known,
+                        "broker dictionary updated"
+                    );
+                }
+                store.broker_operation_kinds(&code).map_err(store_error)
+            })
             .await?;
         let (dictionary, unreadable) = OperationKindDictionary::build(rows);
         // A dictionary row not understood by this build means that the
@@ -2654,6 +2723,68 @@ mod tests {
             deadline,
             allowance: &ALLOWANCE,
         }
+    }
+
+    #[tokio::test]
+    async fn opening_existing_tinkoff_access_adds_redemption_without_overwriting_decisions() {
+        use crate::adapters::tinkoff::fake;
+        use crate::ports::BrokerDictionary;
+        use crate::ports::{BrokerEnvironment, BrokerVault};
+        let (gateway, _, _) = fake::gateway(Vec::new(), None);
+        let adapter = Arc::new(SqliteAdapter::with_broker_key(
+            SqliteStore::open_in_memory().unwrap(),
+            Some(Key::from_bytes([7; 32])),
+            gateway,
+        ));
+        let owner = OwnerId::new_random();
+        adapter
+            .add_access(
+                owner,
+                "tinkoff".to_owned(),
+                BrokerEnvironment::Prod,
+                zeroize::Zeroizing::new("invented-token".to_owned()),
+            )
+            .await
+            .unwrap();
+        adapter.blocking(|store| {
+            store.connection().execute("DELETE FROM broker_operation_kinds WHERE source_kind = 'OPERATION_TYPE_BOND_REPAYMENT_FULL'", []).map_err(|error| store_error(error.into()))?;
+            Ok(())
+        }).await.unwrap();
+        adapter.clone().open(owner, "tinkoff").await.unwrap();
+        let broker = BrokerCode::parse("tinkoff").unwrap();
+        assert_eq!(
+            adapter
+                .operation_kinds(&broker)
+                .await
+                .unwrap()
+                .get("OPERATION_TYPE_BOND_REPAYMENT_FULL")
+                .map(String::as_str),
+            Some("bond_redemption")
+        );
+        adapter
+            .blocking(|store| {
+                store
+                    .set_broker_operation_kind(
+                        &BrokerCode::parse("tinkoff").unwrap(),
+                        &BrokerOperationKind {
+                            source_kind: "OPERATION_TYPE_BOND_REPAYMENT_FULL".to_owned(),
+                            kind: "coupon".to_owned(),
+                        },
+                    )
+                    .map_err(store_error)
+            })
+            .await
+            .unwrap();
+        adapter.clone().open(owner, "tinkoff").await.unwrap();
+        assert_eq!(
+            adapter
+                .operation_kinds(&broker)
+                .await
+                .unwrap()
+                .get("OPERATION_TYPE_BOND_REPAYMENT_FULL")
+                .map(String::as_str),
+            Some("coupon")
+        );
     }
 
     #[test]

@@ -70,7 +70,9 @@ impl Environment {
             Self::Prod => true,
             Self::Sandbox => match method {
                 Method::BrokerReport | Method::DividendsForeignIssuer => false,
-                Method::Accounts | Method::Operations | Method::Portfolio => true,
+                Method::Accounts | Method::Operations | Method::Portfolio | Method::Instrument => {
+                    true
+                }
             },
         }
     }
@@ -86,6 +88,7 @@ pub enum Method {
     Accounts,
     Operations,
     Portfolio,
+    Instrument,
     BrokerReport,
     DividendsForeignIssuer,
 }

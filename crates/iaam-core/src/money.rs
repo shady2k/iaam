@@ -351,6 +351,37 @@ pub fn gross_for_fill(price: CalcMoney, quantity: Quantity) -> Result<CalcMoney,
     Ok(CalcMoney::new(product.value(), product.currency()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ReturnedPrincipalError {
+    #[error("returned principal and quantity must be positive")]
+    Nonpositive,
+    #[error("returned principal per unit cannot be represented exactly")]
+    Inexact,
+    #[error(transparent)]
+    Money(#[from] MoneyError),
+    #[error(transparent)]
+    Numeric(#[from] NumericError),
+}
+
+/// Derive returned principal per security from posted cash and source quantity.
+///
+/// The source's price is not evidence of returned principal. Division must be
+/// exact: a rounded quotient would turn posted cash into a different fact.
+pub fn returned_principal_per_unit(
+    principal: Money,
+    quantity: Quantity,
+) -> Result<PerUnitAmount, ReturnedPrincipalError> {
+    if principal.amount().raw() <= 0 || !quantity.0.is_positive() {
+        return Err(ReturnedPrincipalError::Nonpositive);
+    }
+    let exact = principal.to_exact()?.div(&quantity.0.to_exact()?)?;
+    let value = principal.to_calc_dec().checked_div(quantity.0)?;
+    if value.to_exact().ok() != Some(exact) {
+        return Err(ReturnedPrincipalError::Inexact);
+    }
+    Ok(PerUnitAmount::new(value, principal.currency()))
+}
+
 /// Calculated **per-unit** monetary value, not a posted amount.
 ///
 /// Issue face value and coupon per security are contractual, not debits from
@@ -458,6 +489,45 @@ mod tests {
             amount.checked_mul(dec("2")),
             Err(MoneyError::Numeric(NumericError::Overflow))
         ));
+    }
+
+    #[test]
+    fn returned_principal_uses_posted_cash_and_keeps_fine_precision() {
+        let principal = Money::new(PostedMinor::new(100), CurrencyCode::Usd);
+        assert_eq!(
+            returned_principal_per_unit(principal, Quantity(dec("8"))).unwrap(),
+            PerUnitAmount::new(dec("0.125"), CurrencyCode::Usd)
+        );
+        assert_eq!(
+            returned_principal_per_unit(principal, Quantity(dec("0.5")))
+                .unwrap()
+                .value(),
+            dec("2")
+        );
+    }
+
+    #[test]
+    fn returned_principal_refuses_rounding_and_nonpositive_inputs() {
+        let principal = Money::new(PostedMinor::new(100), CurrencyCode::Rub);
+        assert_eq!(
+            returned_principal_per_unit(principal, Quantity(dec("3"))),
+            Err(ReturnedPrincipalError::Inexact)
+        );
+        for quantity in ["0", "-1"] {
+            assert_eq!(
+                returned_principal_per_unit(principal, Quantity(dec(quantity))),
+                Err(ReturnedPrincipalError::Nonpositive)
+            );
+        }
+        for amount in [0, -100] {
+            assert_eq!(
+                returned_principal_per_unit(
+                    Money::new(PostedMinor::new(amount), CurrencyCode::Rub),
+                    Quantity(dec("1"))
+                ),
+                Err(ReturnedPrincipalError::Nonpositive)
+            );
+        }
     }
 
     // --- Per-unit value ---

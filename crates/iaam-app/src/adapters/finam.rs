@@ -7,19 +7,21 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use async_trait::async_trait;
 
 use iaam_broker::finam::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, FINAM_PARSER_VERSION, FinamClient,
-    FinamError, ParseError, parse_asset, parse_operations, parse_portfolio,
+    FinamError, ParseError, parse_asset_description, parse_operations, parse_portfolio,
 };
 use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, SourceId};
+#[cfg(test)]
 use iaam_core::instrument::AliasNamespace;
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
@@ -31,13 +33,18 @@ use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
 use time::{Date, OffsetDateTime};
 
-use crate::error::AppError;
+use crate::adapters::catalogue::resolve_or_record;
 use crate::ports::{
     BrokerChannel, BrokerError, BrokerRequestContext, InstrumentDirectory, ParsedOperations,
     PortfolioAsOf, PortfolioSnapshot, Quarantined,
 };
 
 const BROKER: &str = "finam";
+
+type CachedDescription = (
+    Instant,
+    Result<iaam_broker::BrokerInstrumentDescription, BrokerError>,
+);
 
 /// Broker channel implementation for Finam.
 pub struct FinamChannel {
@@ -52,16 +59,9 @@ pub struct FinamChannel {
     /// by external code the system already has (§4.7), asked by ISIN — never
     /// a registry of this channel's own.
     instruments: Arc<dyn InstrumentDirectory>,
-    /// The asset answers already paid for: symbol → the ISIN Finam's
-    /// description named, `None` when it named none. The channel is opened
-    /// per synchronisation and dropped after it, so this map is the sync's
-    /// scope: every distinct symbol of one sync costs one asset read, no
-    /// matter how many rows name it or which fetch asked first. A channel
-    /// reused past one sync keeps serving the answers it holds — they name
-    /// instruments, and the instrument an ISIN names is asked per date; the
-    /// response cache beside the database already bounds the wire reads of
-    /// one asset answer to the hour.
-    isins: Mutex<HashMap<String, Option<String>>>,
+    /// Complete asset descriptions already read during this sync. Both the
+    /// operations and portfolio paths reuse them before catalogue registration.
+    descriptions: Mutex<HashMap<String, CachedDescription>>,
 }
 
 impl FinamChannel {
@@ -79,7 +79,7 @@ impl FinamChannel {
             source,
             dictionary,
             instruments,
-            isins: Mutex::new(HashMap::new()),
+            descriptions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -296,16 +296,49 @@ impl Symbols<'_> {
 
     /// The instrument one symbol names as of one date: the asset read
     /// names the ISIN, the directory names the instrument. A symbol whose
-    /// description names no ISIN, and an ISIN no iaam instrument carries,
-    /// are the standing refusals; a directory that cannot be asked at all
-    /// fails the sync.
+    /// description names no ISIN is refused; a complete unknown instrument
+    /// is registered. A directory that cannot be asked fails the sync.
     async fn instrument(&self, symbol: &str, on: Date) -> Result<Resolution, BrokerError> {
-        let isin = match self
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "start",
+            strategy = "isin_directory",
+            requested = 1,
+            "broker sync phase"
+        );
+        let result = self.resolve_instrument(symbol, on).await;
+        let (resolved, unresolved, failed) = match &result {
+            Ok(Resolution::Resolved(_)) => (1, 0, 0),
+            Ok(Resolution::Unresolved(reason)) => {
+                tracing::debug!(
+                    phase = "resolve_instruments",
+                    symbol,
+                    reason,
+                    "broker instrument refused"
+                );
+                (0, 1, 0)
+            }
+            Err(_) => (0, 0, 1),
+        };
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "complete",
+            strategy = "isin_directory",
+            resolved,
+            unresolved,
+            failed,
+            "broker sync phase complete"
+        );
+        result
+    }
+
+    async fn resolve_instrument(&self, symbol: &str, on: Date) -> Result<Resolution, BrokerError> {
+        let description = match self
             .channel
-            .isin_of(symbol, self.broker_account, self.context)
+            .description_of(symbol, self.broker_account, self.context)
             .await
         {
-            Ok(isin) => isin,
+            Ok(description) => description,
             // A symbol Finam itself cannot describe is that row's problem,
             // not the sync's: the asset answer was refused or could not be
             // read, and the reason says what the broker answered. The row is
@@ -334,92 +367,87 @@ impl Symbols<'_> {
                 | BrokerError::ScopeNotReadOnly { .. }),
             ) => return Err(error),
         };
-        let Some(isin) = isin else {
-            return Ok(Resolution::Unresolved(unresolved_symbol_reason(
-                symbol, None,
-            )));
-        };
-        match self
-            .channel
-            .instruments
-            .resolve(AliasNamespace::Isin.code(), &isin, on)
-            .await
+        if description
+            .isin
+            .as_deref()
+            .is_none_or(|isin| isin.trim().is_empty())
         {
-            Ok(instrument) => Ok(Resolution::Resolved(instrument)),
-            Err(AppError::NotFound { .. }) => Ok(Resolution::Unresolved(unresolved_symbol_reason(
-                symbol,
-                Some(&isin),
-            ))),
-            Err(error) => Err(BrokerError::Adapter {
-                broker: BROKER.to_owned(),
-                detail: format!("the instrument directory refused ISIN {isin} on {on}: {error}"),
-            }),
+            return Ok(Resolution::Unresolved(unresolved_symbol_reason(symbol)));
         }
+        resolve_or_record(
+            self.channel.instruments.as_ref(),
+            &description,
+            self.channel.source,
+            on,
+        )
+        .await
+        .map(Resolution::Resolved)
+        .map_err(|error| BrokerError::Adapter {
+            broker: BROKER.to_owned(),
+            detail: format!("the instrument directory could not register symbol {symbol}: {error}"),
+        })
     }
 }
 
-/// The refusal a row carries when its symbol does not become an iaam
-/// instrument: what is missing, what the asset description named, and who
-/// supplies the missing instrument — the owner records the instrument
-/// carrying that ISIN, and the same range syncs again.
-fn unresolved_symbol_reason(symbol: &str, isin: Option<&str>) -> String {
-    match isin {
-        None => format!(
-            "symbol {symbol} is not resolved to an instrument: Finam's asset \
-             description (GET /v1/assets/{symbol}) names no ISIN — record the \
-             instrument with the ISIN it actually carries, then sync this range again"
-        ),
-        Some(isin) => format!(
-            "symbol {symbol} is not resolved to an instrument: it names ISIN {isin} \
-             and no iaam instrument carries that ISIN — record the instrument \
-             carrying ISIN {isin}, then sync this range again"
-        ),
-    }
+/// A description without a stable identity cannot register an instrument.
+fn unresolved_symbol_reason(symbol: &str) -> String {
+    format!(
+        "symbol {symbol} is not resolved to an instrument: Finam's asset description names no ISIN"
+    )
 }
 
 impl FinamChannel {
-    /// The ISIN Finam's asset description names for the symbol, one asset
-    /// read per distinct symbol per sync: the first ask reads the wire and
-    /// remembers, every later ask of the same symbol reuses the answer.
-    /// The lock guards reads and stores only; the read itself is a network
-    /// call and never holds it.
-    async fn isin_of(
+    /// Cache complete descriptions for this sync, not just their identity.
+    async fn description_of(
         &self,
         symbol: &str,
         broker_account: &str,
         context: BrokerRequestContext<'_>,
-    ) -> Result<Option<String>, BrokerError> {
-        if let Some(isin) = self.cached_isin(symbol) {
-            return Ok(isin);
-        }
-        let body = bounded(
-            context.deadline,
-            "the Finam asset request",
-            self.client
-                .get_asset(symbol, broker_account, context.allowance),
-        )
-        .await?;
-        let isin = parse_asset(&body).map_err(parse_error)?;
-        self.cache_isin(symbol, isin.clone());
-        Ok(isin)
-    }
-
-    /// The remembered ISIN, taken even through a poison: every writer
-    /// stores one whole answer, so the lock is recovered from rather than
-    /// panicked on.
-    fn cached_isin(&self, symbol: &str) -> Option<Option<String>> {
-        self.isins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    ) -> Result<iaam_broker::BrokerInstrumentDescription, BrokerError> {
+        let mut descriptions = self.descriptions.lock().await;
+        if let Some((_, description)) = descriptions
             .get(symbol)
-            .cloned()
-    }
-
-    fn cache_isin(&self, symbol: &str, isin: Option<String>) {
-        self.isins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(symbol.to_owned(), isin);
+            .filter(|(read_at, _)| read_at.elapsed() < Duration::from_secs(3_600))
+        {
+            return description.clone();
+        }
+        tracing::info!(
+            phase = "describe_instrument",
+            status = "start",
+            requested = 1,
+            "broker catalogue description"
+        );
+        let description = async {
+            let body = bounded(
+                context.deadline,
+                "the Finam asset request",
+                self.client
+                    .get_asset(symbol, broker_account, context.allowance),
+            )
+            .await?;
+            parse_asset_description(&body).map_err(parse_error)
+        }
+        .await;
+        match &description {
+            Ok(_) => tracing::info!(
+                phase = "describe_instrument",
+                status = "complete",
+                described = 1,
+                "broker catalogue description"
+            ),
+            Err(error) => {
+                tracing::debug!(phase = "describe_instrument", symbol, reason = %error, "broker instrument description failed")
+            }
+        }
+        // Row-local failures are remembered too; source outages and budget
+        // failures remain retryable rather than becoming cached descriptions.
+        if matches!(
+            &description,
+            Ok(_) | Err(BrokerError::Refused { .. } | BrokerError::Unparsable { .. })
+        ) {
+            descriptions.insert(symbol.to_owned(), (Instant::now(), description.clone()));
+        }
+        description
     }
 }
 
@@ -462,6 +490,23 @@ async fn adapt_operations(
             });
             continue;
         }
+        // INCOME is a source category, not one economic kind. Only its
+        // exact transaction name establishes which fact can be recorded.
+        let named_income = if operation.source_kind == "INCOME" {
+            match income_kind(&operation) {
+                Ok(kind) => Some(kind),
+                Err(reason) => {
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions: [Dimension::Cash, Dimension::Income].into_iter().collect(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if let Some(reason) = securities_transfer_reason(&kind) {
             quarantined.push(Quarantined {
                 raw,
@@ -470,11 +515,17 @@ async fn adapt_operations(
             });
             continue;
         }
-        let dimensions = dimensions_for_kind(&kind);
-        let converted = if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
+        let dimensions = if named_income.is_some() {
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
+        } else {
+            dimensions_for_kind(&kind)
+        };
+        let converted = if named_income.is_none()
+            && matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell)
+        {
             trade_operation(account, operation, kind, symbols).await
         } else {
-            operation_to_submitted(account, operation, kind, symbols).await
+            operation_to_submitted(account, operation, kind, named_income, symbols).await
         };
         match converted.map_err(|error| error.with_dimensions(dimensions)) {
             Ok(operation) => accepted.push(operation),
@@ -496,9 +547,24 @@ async fn adapt_operations(
         }
     }
     Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted,
         quarantined,
     })
+}
+
+/// Finam's generic income category needs the source's exact economic name.
+fn income_kind(operation: &ChannelOperation) -> Result<IncomeKind, String> {
+    match operation.transaction_name.as_deref() {
+        Some("Купонный доход") => Ok(IncomeKind::Coupon),
+        Some("Дивиденды") => Ok(IncomeKind::Dividend),
+        Some("Доход по предоставлениям займа") => {
+            Ok(IncomeKind::SecuritiesLendingIncome)
+        }
+        Some(name) => Err(format!("unsupported Finam INCOME transaction_name: {name}")),
+        None => Err("Finam INCOME does not contain transaction_name".to_owned()),
+    }
 }
 
 /// Turns the channel's portfolio answer into a snapshot.
@@ -845,95 +911,112 @@ async fn operation_to_submitted(
     account: AccountId,
     operation: ChannelOperation,
     kind: ChannelOperationKind,
+    named_income: Option<IncomeKind>,
     symbols: &Symbols<'_>,
 ) -> Result<SubmittedOperation, RowRefusal> {
-    let kind = match kind {
-        ChannelOperationKind::Buy | ChannelOperationKind::Sell => {
-            return Err(RowRefusal::Adapter(
-                "trading operations are converted from their trade fields".to_owned(),
-            ));
+    let kind = if let Some(income_kind) = named_income {
+        let (gross_minor, currency) = required_money(operation.payment, "change")?;
+        if gross_minor <= 0 {
+            return Err(row_unparsable("income requires positive change"));
         }
-        // A coupon and a dividend must not be collapsed into a single receipt: the
-        // journal stores the kind, and losing it here means losing it forever —
-        // the event is immutable.
-        kind @ (ChannelOperationKind::Dividend | ChannelOperationKind::Coupon) => {
-            let (gross_minor, currency) = required_money(operation.payment, "change")?;
-            let income_kind = match kind {
-                ChannelOperationKind::Coupon => IncomeKind::Coupon,
-                ChannelOperationKind::Dividend => IncomeKind::Dividend,
-                // The outer pattern has already narrowed the possibilities. This
-                // branch is unreachable and must fail loudly, rather than
-                // substitute a dividend.
-                other => {
-                    return Err(RowRefusal::Adapter(format!(
-                        "income kind mismatch: {other:?}"
-                    )));
+        OperationKind::Income {
+            instrument: match income_kind {
+                IncomeKind::SecuritiesLendingIncome => None,
+                _ => Some(symbols.required(&operation).await?),
+            },
+            gross_minor,
+            currency,
+            kind: Some(income_kind),
+        }
+    } else {
+        match kind {
+            ChannelOperationKind::Buy | ChannelOperationKind::Sell => {
+                return Err(RowRefusal::Adapter(
+                    "trading operations are converted from their trade fields".to_owned(),
+                ));
+            }
+            // A coupon and a dividend must not be collapsed into a single receipt: the
+            // journal stores the kind, and losing it here means losing it forever —
+            // the event is immutable.
+            kind @ (ChannelOperationKind::Dividend | ChannelOperationKind::Coupon) => {
+                let (gross_minor, currency) = required_money(operation.payment, "change")?;
+                let income_kind = match kind {
+                    ChannelOperationKind::Coupon => IncomeKind::Coupon,
+                    ChannelOperationKind::Dividend => IncomeKind::Dividend,
+                    // The outer pattern has already narrowed the possibilities. This
+                    // branch is unreachable and must fail loudly, rather than
+                    // substitute a dividend.
+                    other => {
+                        return Err(RowRefusal::Adapter(format!(
+                            "income kind mismatch: {other:?}"
+                        )));
+                    }
+                };
+                OperationKind::Income {
+                    instrument: symbols.optional(&operation).await?,
+                    gross_minor,
+                    currency,
+                    kind: Some(income_kind),
                 }
-            };
-            OperationKind::Income {
-                instrument: symbols.optional(&operation).await?,
-                gross_minor,
-                currency,
-                kind: Some(income_kind),
             }
-        }
-        ChannelOperationKind::Commission => {
-            let (amount_minor, currency) = required_money(operation.payment, "change")?;
-            OperationKind::Fee {
-                amount_minor,
-                currency,
-                origin: FeeOrigin::Brokerage,
+            ChannelOperationKind::Commission => {
+                let (amount_minor, currency) = required_money(operation.payment, "change")?;
+                OperationKind::Fee {
+                    amount_minor,
+                    currency,
+                    origin: FeeOrigin::Brokerage,
+                }
             }
-        }
-        ChannelOperationKind::Deposit => {
-            let (amount_minor, currency) = required_money(operation.payment, "change")?;
-            OperationKind::Deposit {
-                amount_minor,
-                currency,
+            ChannelOperationKind::Deposit => {
+                let (amount_minor, currency) = required_money(operation.payment, "change")?;
+                OperationKind::Deposit {
+                    amount_minor,
+                    currency,
+                }
             }
-        }
-        ChannelOperationKind::Withdrawal => {
-            let (amount_minor, currency) = required_money(operation.payment, "change")?;
-            OperationKind::Withdrawal {
-                amount_minor,
-                currency,
+            ChannelOperationKind::Withdrawal => {
+                let (amount_minor, currency) = required_money(operation.payment, "change")?;
+                OperationKind::Withdrawal {
+                    amount_minor,
+                    currency,
+                }
             }
-        }
-        ChannelOperationKind::SecuritiesTransferIn
-        | ChannelOperationKind::SecuritiesTransferOut => {
-            return Err(row_unparsable(
-                "securities moved without a cash movement: the transfer is not a cash fact",
-            ));
-        }
-        ChannelOperationKind::Transfer => {
-            return Err(RowRefusal::Row {
-                reason: "transfer does not contain a recipient account".to_owned(),
-                dimensions: BTreeSet::new(),
-            });
-        }
-        // Amortisation and redemption are corporate actions, not
-        // owner operations: they have their own representation and endpoint
-        // (POST /v1/ingest/journal-events). The channel reports the payment
-        // amount, but not the returned face value per unit or the custody
-        // location; without them the fact cannot be constructed, and
-        // substituting a guess would record something that never happened in
-        // the append-only journal.
-        ChannelOperationKind::BondAmortisation => {
-            return Err(row_unparsable(
-                "bond amortisation: the channel does not report the returned face value per unit \
+            ChannelOperationKind::SecuritiesTransferIn
+            | ChannelOperationKind::SecuritiesTransferOut => {
+                return Err(row_unparsable(
+                    "securities moved without a cash movement: the transfer is not a cash fact",
+                ));
+            }
+            ChannelOperationKind::Transfer => {
+                return Err(RowRefusal::Row {
+                    reason: "transfer does not contain a recipient account".to_owned(),
+                    dimensions: BTreeSet::new(),
+                });
+            }
+            // Amortisation and redemption are corporate actions, not
+            // owner operations: they have their own representation and endpoint
+            // (POST /v1/ingest/journal-events). The channel reports the payment
+            // amount, but not the returned face value per unit or the custody
+            // location; without them the fact cannot be constructed, and
+            // substituting a guess would record something that never happened in
+            // the append-only journal.
+            ChannelOperationKind::BondAmortisation => {
+                return Err(row_unparsable(
+                    "bond amortisation: the channel does not report the returned face value per unit \
                  or custody location — the fact is entered via the journal endpoint",
-            ));
-        }
-        ChannelOperationKind::BondRedemption => {
-            return Err(row_unparsable(
-                "bond redemption: the channel does not report the returned face value per unit \
+                ));
+            }
+            ChannelOperationKind::BondRedemption => {
+                return Err(row_unparsable(
+                    "bond redemption: the channel does not report the returned face value per unit \
                  or custody location — the fact is entered via the journal endpoint",
-            ));
-        }
-        ChannelOperationKind::Other(kind) => {
-            return Err(row_unparsable(format!(
-                "unsupported operation kind: {kind}"
-            )));
+                ));
+            }
+            ChannelOperationKind::Other(kind) => {
+                return Err(row_unparsable(format!(
+                    "unsupported operation kind: {kind}"
+                )));
+            }
         }
     };
 
@@ -1092,6 +1175,7 @@ mod tests {
                         quote: CurrencyCode::Rub,
                     },
                     lineage: None,
+                    metadata: None,
                 })
                 .await
                 .expect("instrument recorded");
@@ -1148,7 +1232,21 @@ mod tests {
     const ISIN: &str = "RU000AFIXTUR";
 
     fn asset_answer() -> Answer {
-        Answer::status(200, r#"{"isin":"RU000AFIXTUR"}"#)
+        asset_with_isin(ISIN)
+    }
+
+    fn asset_with_isin(isin: &str) -> Answer {
+        Answer::status(
+            200,
+            &json!({
+                "isin": isin,
+                "ticker": "FIXT",
+                "name": "Fixture Share",
+                "type": "STOCK",
+                "quote_currency": "RUB"
+            })
+            .to_string(),
+        )
     }
 
     /// An invented June 2025 page: a dividend with an instrument, a purchase
@@ -1311,6 +1409,260 @@ mod tests {
         // The fee row printed no grouping of its own: absence stays absent.
         assert_eq!(parsed.accepted[2].source_category, None);
         assert_eq!(parsed.accepted[2].source_kind.as_deref(), Some("FEE"));
+    }
+
+    #[tokio::test]
+    async fn named_income_coupon_resolves_through_the_catalogue() {
+        let body = json!({"transactions": [{
+            "id": "invented-income-coupon",
+            "timestamp": "2025-06-10T10:00:00Z",
+            "category": "INCOME",
+            "symbol": SYMBOL,
+            "change": {"currency_code": "RUB", "units": "17", "nanos": 250_000_000},
+            "transaction_category": "ACCRUALS",
+            "transaction_name": "Купонный доход"
+        }]})
+        .to_string();
+        let (instruments, expected) = directory(&[ISIN]).await;
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body), asset_answer()], None).0,
+            instruments,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("income page parsed");
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.accepted.len(), 1);
+        let operation = &parsed.accepted[0];
+        assert!(matches!(operation.kind, OperationKind::Income {
+            instrument: Some(instrument), gross_minor: 1_725, currency: CurrencyCode::Rub,
+            kind: Some(IncomeKind::Coupon),
+        } if instrument == expected[0]));
+        assert_eq!(operation.source_kind.as_deref(), Some("INCOME"));
+        assert_eq!(operation.source_category.as_deref(), Some("ACCRUALS"));
+        assert_eq!(operation.description.as_deref(), Some("Купонный доход"));
+        assert_eq!(
+            operation.source_operation_id.as_deref(),
+            Some("invented-income-coupon")
+        );
+        assert_eq!(operation.dates.trade, Some(date!(2025 - 06 - 10)));
+    }
+
+    #[tokio::test]
+    async fn named_income_dividend_resolves_through_the_catalogue() {
+        let body = json!({"transactions": [{
+            "id": "invented-income-dividend",
+            "timestamp": "2025-06-10T10:00:00Z",
+            "category": "INCOME",
+            "symbol": SYMBOL,
+            "change": {"currency_code": "RUB", "units": "17", "nanos": 250_000_000},
+            "transaction_category": "ACCRUALS",
+            "transaction_name": "Дивиденды"
+        }]})
+        .to_string();
+        let (instruments, expected) = directory(&[ISIN]).await;
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body), asset_answer()], None).0,
+            instruments,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("income page parsed");
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.accepted.len(), 1);
+        let operation = &parsed.accepted[0];
+        assert!(matches!(operation.kind, OperationKind::Income {
+            instrument: Some(instrument), gross_minor: 1_725, currency: CurrencyCode::Rub,
+            kind: Some(IncomeKind::Dividend),
+        } if instrument == expected[0]));
+        assert_eq!(operation.source_kind.as_deref(), Some("INCOME"));
+        assert_eq!(operation.source_category.as_deref(), Some("ACCRUALS"));
+        assert_eq!(operation.description.as_deref(), Some("Дивиденды"));
+        assert_eq!(
+            operation.source_operation_id.as_deref(),
+            Some("invented-income-dividend")
+        );
+        assert_eq!(operation.dates.trade, Some(date!(2025 - 06 - 10)));
+    }
+
+    #[tokio::test]
+    async fn named_dividend_requires_exact_name_and_a_resolved_symbol() {
+        let rows = [
+            json!({
+                "id": "invented-dividend-spaced", "transaction_name": "Дивиденды ",
+                "symbol": SYMBOL,
+            }),
+            json!({
+                "id": "invented-dividend-case", "transaction_name": "дивиденды",
+                "symbol": SYMBOL,
+            }),
+            json!({
+                "id": "invented-dividend-no-symbol", "transaction_name": "Дивиденды",
+            }),
+            json!({
+                "id": "invented-dividend-unresolved", "transaction_name": "Дивиденды",
+                "symbol": SYMBOL,
+            }),
+        ]
+        .map(|mut row| {
+            row["timestamp"] = json!("2025-06-10T10:00:00Z");
+            row["category"] = json!("INCOME");
+            row["change"] = json!({"currency_code": "RUB", "units": "17", "nanos": 0});
+            row
+        });
+        let body = json!({"transactions": rows}).to_string();
+        // Only the exact name with a symbol reaches the catalogue, whose
+        // invented description cannot establish the instrument's identity.
+        let channel = channel(
+            fake::gateway(
+                vec![session_answer(), page(&body), asset_with_isin("")],
+                None,
+            )
+            .0,
+            directory(&[]).await.0,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("dividend refusals are row-local");
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(parsed.quarantined.len(), rows.len());
+        for (refused, row) in parsed.quarantined.iter().zip(&rows) {
+            assert_eq!(refused.raw, *row);
+            assert_eq!(
+                refused.dimensions,
+                [Dimension::Cash, Dimension::Income].into_iter().collect()
+            );
+        }
+        for index in [0, 1] {
+            assert!(
+                parsed.quarantined[index]
+                    .reason
+                    .contains("unsupported Finam INCOME")
+            );
+        }
+        assert!(parsed.quarantined[2].reason.contains("symbol"));
+        assert!(parsed.quarantined[3].reason.contains("no ISIN"));
+    }
+
+    #[tokio::test]
+    async fn named_securities_lending_income_needs_no_symbol() {
+        let row = json!({
+            "id": "invented-lending-income",
+            "timestamp": "2025-06-10T10:00:00Z", "category": "INCOME",
+            "change": {"currency_code": "RUB", "units": "23", "nanos": 0},
+            "transaction_name": "Доход по предоставлениям займа"
+        });
+        let body = json!({"transactions": [row]}).to_string();
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body)], None).0,
+            directory(&[]).await.0,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("lending income parses without a catalogue request");
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.accepted.len(), 1);
+        assert!(matches!(
+            parsed.accepted[0].kind,
+            OperationKind::Income {
+                instrument: None,
+                gross_minor: 2300,
+                currency: CurrencyCode::Rub,
+                kind: Some(IncomeKind::SecuritiesLendingIncome),
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsupported_income_names_and_coupon_without_symbol_stay_refused() {
+        let names = [
+            Some("Доход по предоставлениям займа "),
+            Some("Invented income"),
+            Some("Купонный доход "),
+            Some("Купонный доход"),
+            None,
+        ];
+        let rows: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                json!({
+                    "id": format!("invented-income-{index}"),
+                    "timestamp": "2025-06-10T10:00:00Z",
+                    "category": "INCOME",
+                    "change": {"currency_code": "RUB", "units": "17", "nanos": 0},
+                    "transaction_name": name,
+                })
+            })
+            .collect();
+        let body = json!({"transactions": rows}).to_string();
+        // No asset answer: refused names and absent symbols need no catalogue read.
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body)], None).0,
+            directory(&[]).await.0,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("income refusals are row-local");
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(parsed.quarantined.len(), names.len());
+        for (index, refused) in parsed.quarantined.iter().enumerate() {
+            assert_eq!(refused.raw["id"], json!(format!("invented-income-{index}")));
+            assert_eq!(refused.raw["transaction_name"], json!(names[index]));
+            assert_eq!(
+                refused.dimensions,
+                [Dimension::Cash, Dimension::Income].into_iter().collect()
+            );
+        }
+        assert!(
+            parsed.quarantined[0]
+                .reason
+                .contains("Доход по предоставлениям займа")
+        );
+        for index in [1, 2] {
+            assert!(
+                parsed.quarantined[index]
+                    .reason
+                    .contains(names[index].expect("named row"))
+            );
+        }
+        assert!(parsed.quarantined[3].reason.contains("symbol"));
+        assert!(parsed.quarantined[4].reason.contains("transaction_name"));
     }
 
     #[tokio::test]
@@ -1989,7 +2341,7 @@ mod tests {
                 vec![
                     session_answer(),
                     page(&body),
-                    Answer::status(200, r#"{"name":"Fixture Share"}"#),
+                    Answer::status(200, r#"{"ticker":"FIXT","name":"Fixture Share","quote_currency":"RUB","type":"STOCK"}"#),
                 ],
                 None,
             )
@@ -2030,11 +2382,10 @@ mod tests {
         );
     }
 
-    /// An ISIN no iaam instrument carries is the second standing refusal:
-    /// the reason names the ISIN so the owner can record the instrument
-    /// carrying it and sync the same range again.
+    /// A complete description registers an unknown instrument before its
+    /// position claim is published.
     #[tokio::test]
-    async fn an_isin_no_instrument_carries_is_set_aside_with_the_isin_named() {
+    async fn an_unknown_isin_is_registered_before_the_position_claim() {
         let body = json!({
             "cash": [ { "units": "100", "nanos": 0, "currencyCode": "rub" } ],
             "positions": [
@@ -2042,11 +2393,12 @@ mod tests {
             ],
         })
         .to_string();
+        let instruments = directory(&[]).await.0;
         let channel = channel(
             fake::gateway(vec![session_answer(), page(&body), asset_answer()], None).0,
             // The directory holds no instrument under the ISIN the asset
             // description names.
-            directory(&[]).await.0,
+            Arc::clone(&instruments),
         );
 
         let snapshot = channel
@@ -2059,15 +2411,21 @@ mod tests {
             .await
             .expect("the portfolio is parsed");
 
-        assert_eq!(snapshot.claims.len(), 1, "{:?}", snapshot.claims);
-        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
-        let refused = &snapshot.refused[0];
-        assert_eq!(refused.raw["symbol"], json!("SBER@MISX"), "{refused:?}");
-        assert!(
-            refused.reason.contains(ISIN) && refused.reason.contains("record the instrument"),
-            "{}",
-            refused.reason
-        );
+        assert_eq!(snapshot.claims.len(), 2, "{:?}", snapshot.claims);
+        assert!(snapshot.refused.is_empty(), "{:?}", snapshot.refused);
+        let id = instruments
+            .resolve("isin", ISIN, date!(2025 - 06 - 30))
+            .await
+            .expect("broker instrument registered");
+        assert!(snapshot.claims.iter().any(|claim| matches!(claim,
+            ControlClaim::PositionQuantity { instrument, .. } if *instrument == id)));
+        let recorded = instruments
+            .instrument(id)
+            .await
+            .expect("directory read")
+            .expect("instrument exists");
+        assert_eq!(recorded.title, "Fixture Share");
+        assert_eq!(recorded.symbol, "FIXT");
     }
 
     /// One asset read per distinct symbol per sync: the operations fetch and
@@ -2113,8 +2471,8 @@ mod tests {
                 vec![
                     session_answer(),
                     page(&operations),
-                    Answer::status(200, format!(r#"{{"isin":"{FIXT_ISIN}"}}"#).as_str()),
-                    Answer::status(200, format!(r#"{{"isin":"{OTHR_ISIN}"}}"#).as_str()),
+                    asset_with_isin(FIXT_ISIN),
+                    asset_with_isin(OTHR_ISIN),
                     page(&portfolio),
                 ],
                 None,
@@ -2233,7 +2591,7 @@ mod tests {
                 vec![
                     session_answer(),
                     page(&operations),
-                    Answer::status(200, format!(r#"{{"isin":"{GOOD_ISIN}"}}"#).as_str()),
+                    asset_with_isin(GOOD_ISIN),
                     page(&portfolio),
                 ],
                 None,
@@ -2328,7 +2686,7 @@ mod tests {
                 vec![
                     session_answer(),
                     page(&operations),
-                    Answer::status(200, format!(r#"{{"isin":"{GOOD_ISIN}"}}"#).as_str()),
+                    asset_with_isin(GOOD_ISIN),
                 ],
                 None,
             )
@@ -2364,6 +2722,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn concurrent_and_rejected_descriptions_are_read_once_until_the_cache_expires() {
+        let channel = channel(
+            fake::gateway(
+                vec![
+                    session_answer(),
+                    asset_answer(),
+                    Answer::status(200, "not json"),
+                    asset_answer(),
+                ],
+                None,
+            )
+            .0,
+            directory(&[]).await.0,
+        );
+        let (first, second) = tokio::join!(
+            channel.description_of(SYMBOL, "invented-account", broker_context(None)),
+            channel.description_of(SYMBOL, "invented-account", broker_context(None)),
+        );
+        assert_eq!(first.expect("description").isin, Some(ISIN.to_owned()));
+        assert_eq!(
+            second.expect("cached description").isin,
+            Some(ISIN.to_owned())
+        );
+        let first_error = channel
+            .description_of("BAD@MISX", "invented-account", broker_context(None))
+            .await
+            .expect_err("invalid description");
+        let second_error = channel
+            .description_of("BAD@MISX", "invented-account", broker_context(None))
+            .await
+            .expect_err("cached invalid description");
+        assert_eq!(first_error, second_error);
+        channel
+            .descriptions
+            .lock()
+            .await
+            .get_mut(SYMBOL)
+            .expect("cached description")
+            .0 = Instant::now() - Duration::from_secs(3_601);
+        assert_eq!(
+            channel
+                .description_of(SYMBOL, "invented-account", broker_context(None))
+                .await
+                .expect("expired description refreshed")
+                .isin,
+            Some(ISIN.to_owned())
+        );
+    }
+
     /// The asset answer that should name a position's ISIN arrives
     /// unreadable: the row is set aside with its reason and its original
     /// JSON instead of stopping the sync, and the rest of the answer still
@@ -2387,7 +2795,7 @@ mod tests {
                 vec![
                     session_answer(),
                     page(&portfolio),
-                    Answer::status(200, format!(r#"{{"isin":"{GOOD_ISIN}"}}"#).as_str()),
+                    asset_with_isin(GOOD_ISIN),
                     Answer::status(200, "not json at all"),
                 ],
                 None,

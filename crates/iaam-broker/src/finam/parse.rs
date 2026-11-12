@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
 /// Finam Trade API response parser version.
-pub const FINAM_PARSER_VERSION: &str = "finam-api/1";
+pub const FINAM_PARSER_VERSION: &str = "finam-api/4";
 
 /// Error while parsing a Finam response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -227,6 +227,93 @@ pub fn parse_asset(body: &str) -> Result<Option<String>, ParseError> {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     ))
+}
+
+/// Parse Finam's full asset reference data without inventing absent metadata.
+pub fn parse_asset_description(
+    body: &str,
+) -> Result<crate::BrokerInstrumentDescription, ParseError> {
+    use iaam_core::instrument::InstrumentKind;
+    let asset: Value = parse_json(body)?;
+    let required = |field: &'static str| -> Result<String, ParseError> {
+        asset
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(ParseError::MissingField { field })
+    };
+    let optional = |field: &str| {
+        asset
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let kind = match optional("type")
+        .as_deref()
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("STOCK" | "SHARE" | "EQUITIES") => Some(InstrumentKind::Share),
+        Some("BOND" | "BONDS") => Some(InstrumentKind::Bond),
+        Some("ETF") => Some(InstrumentKind::Etf),
+        Some("FUNDS") => Some(InstrumentKind::MutualFund),
+        Some("CURRENCY" | "CURRENCIES") => Some(InstrumentKind::Currency),
+        _ => None,
+    };
+    let lot = asset
+        .get("lot_size")
+        .map(|value| {
+            asset_decimal(value, "lot_size")
+                .ok()
+                .and_then(|value| value.inner().normalize().to_string().parse::<u32>().ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| ParseError::InvalidField {
+                    field: "lot_size",
+                    value: value.to_string(),
+                })
+        })
+        .transpose()?;
+    // The catalogue has no price-step field. Read the source decimal without
+    // confusing its precision with the separate `decimals` field.
+    if let Some(step) = asset.get("min_step") {
+        asset_decimal(step, "min_step")?;
+    }
+    let price_decimals = asset
+        .get("decimals")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| ParseError::InvalidField {
+                    field: "decimals",
+                    value: value.to_string(),
+                })
+        })
+        .transpose()?;
+    Ok(crate::BrokerInstrumentDescription {
+        isin: optional("isin"),
+        ticker: required("ticker")?,
+        name: required("name")?,
+        kind,
+        currency: parse_currency(&required("quote_currency")?)?,
+        mic: optional("mic"),
+        board: optional("board"),
+        lot,
+        price_decimals,
+    })
+}
+
+fn asset_decimal(value: &Value, field: &'static str) -> Result<Dec, ParseError> {
+    let text = value
+        .as_str()
+        .or_else(|| value.get("value").and_then(Value::as_str));
+    text.and_then(|text| serde_json::from_value(Value::String(text.to_owned())).ok())
+        .ok_or_else(|| ParseError::InvalidField {
+            field,
+            value: value.to_string(),
+        })
 }
 
 fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {

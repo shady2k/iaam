@@ -82,6 +82,7 @@ async fn journal_events_still_refuse_an_event_naming_a_custody_the_owner_does_no
             title: "TESTSHARE".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("seed instrument");
     let adapter = Arc::new(SqliteAdapter::new(store));

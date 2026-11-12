@@ -103,6 +103,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
              DROP TABLE broker_account_bindings; \
              DROP TABLE broker_egress; \
              DROP TABLE sync_refusals; \
+             ALTER TABLE instruments DROP COLUMN metadata; \
              PRAGMA user_version = 1;",
         )
         .expect("winding the database back to version 1");
@@ -236,6 +237,7 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
              DROP TABLE broker_account_bindings; \
              DROP TABLE broker_egress; \
              DROP TABLE sync_refusals; \
+             ALTER TABLE instruments DROP COLUMN metadata; \
              PRAGMA user_version = 2;",
         )
         .expect("winding the database back to version 2");
@@ -293,6 +295,7 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
         .connection()
         .execute_batch(
             "DROP TABLE sync_refusals; \
+             ALTER TABLE instruments DROP COLUMN metadata; \
              PRAGMA user_version = 8;",
         )
         .expect("winding the database back to version 8");
@@ -364,4 +367,192 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
             .is_empty(),
         "the refusal settled through the migrated table"
     );
+}
+
+#[test]
+fn version_ten_redemption_rows_survive_optional_custody_migration() {
+    let store = SqliteStore::open_in_memory().expect("open");
+    let conn = store.connection();
+    let legacy = include_str!("../migrations/0001_schema.sql");
+    let start = legacy
+        .find("CREATE TABLE event_corporate_action (")
+        .unwrap();
+    let end = start + legacy[start..].find(") STRICT;").unwrap() + ") STRICT;".len();
+    conn.execute_batch("DROP TABLE event_corporate_action;")
+        .unwrap();
+    conn.execute_batch(&legacy[start..end]).unwrap();
+    conn.execute_batch(
+        "INSERT INTO accounts (id, owner, title, created_at) VALUES ('a', 'o', 'Account', '2026-01-01T00:00:00Z');
+         INSERT INTO instruments (id, kind, symbol, title, denomination_currency, settlement_currency, quote_currency, created_at) VALUES ('i', 'bond', 'BOND', 'Bond', 'RUB', 'RUB', 'RUB', '2026-01-01T00:00:00Z');
+         INSERT INTO custody_places (id, owner, title, origin, created_at) VALUES ('c', 'o', 'Custody', 'declared', '2026-01-01T00:00:00Z');
+         INSERT INTO events (id, owner, account, kind, effective_date, sequence, confidence, relation_kind, recorded_at, source, raw_hash, parser_version)
+         VALUES ('e', 'o', 'a', 'corporate_action', '2026-01-02', 1, 'known', 'none', '2026-01-02T00:00:00Z', 'file', 'hash', 'v1');
+         INSERT INTO event_corporate_action (event, action_kind, instrument, custody, quantity, principal_returned_per_unit_value, principal_returned_per_unit_currency, effective_date)
+         VALUES ('e', 'redemption', 'i', 'c', '10', '1000', 'RUB', '2026-01-02');
+         PRAGMA user_version = 10;"
+    ).unwrap();
+    migrate(conn).expect("migrate populated version ten");
+    let custody: Option<String> = conn
+        .query_row(
+            "SELECT custody FROM event_corporate_action WHERE event = 'e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(custody.as_deref(), Some("c"));
+    conn.execute(
+        "UPDATE event_corporate_action SET custody = NULL WHERE event = 'e'",
+        [],
+    )
+    .expect("redemption accepts no custody");
+    assert!(
+        conn.execute(
+            "UPDATE event_corporate_action SET action_kind = 'conversion' WHERE event = 'e'",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(user_version(&store), SCHEMA_VERSION);
+}
+
+#[test]
+fn version_eleven_income_rows_and_rule_history_survive_the_widened_checks() {
+    use rusqlite::{Connection, types::Value};
+
+    fn rows(conn: &Connection, table: &str) -> Vec<Vec<Value>> {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    let conn = Connection::open_in_memory().unwrap();
+    for (version, sql) in iaam_store::schema::MIGRATIONS {
+        if version <= 11 {
+            conn.execute_batch(sql).unwrap();
+        }
+    }
+    conn.execute_batch(
+        "PRAGMA user_version = 11;
+         PRAGMA foreign_keys = ON;
+         INSERT INTO accounts (id, owner, title, created_at)
+         VALUES ('a', 'o', 'Account', '2026-01-01T00:00:00Z');
+         INSERT INTO instruments (id, kind, symbol, title, denomination_currency, settlement_currency, quote_currency, created_at)
+         VALUES ('i', 'bond', 'BOND', 'Bond', 'RUB', 'RUB', 'RUB', '2026-01-01T00:00:00Z');"
+    ).unwrap();
+    for (index, kind) in [
+        None,
+        Some("coupon"),
+        Some("dividend"),
+        Some("deposit_interest"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let event = format!("e{index}");
+        conn.execute(
+            "INSERT INTO events (id, owner, account, kind, effective_date, sequence, confidence, relation_kind, recorded_at, source, raw_hash, parser_version)
+             VALUES (?1, 'o', 'a', 'income', '2026-01-02', ?2, 'known', 'none', '2026-01-02T00:00:00Z', 'file', ?1, 'v1')",
+            rusqlite::params![event, i64::try_from(index).unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO event_income (event, instrument, income_kind) VALUES (?1, 'i', ?2)",
+            rusqlite::params![event, kind],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO classification_rules (id, owner, version, description_contains, outcome_kind, income_kind, created_at, retired_at, replaces)
+             VALUES (?1, 'o', ?2, 'Income', 'income', ?3, '2026-01-01T00:00:00Z', ?4, ?5)",
+            rusqlite::params![format!("r{index}"), i64::try_from(index + 1).unwrap(), kind,
+                (index < 3).then_some("2026-01-02T00:00:00Z"),
+                index.checked_sub(1).map(|previous| format!("r{previous}"))],
+        ).unwrap();
+    }
+    let income_before = rows(&conn, "event_income");
+    let rules_before = rows(&conn, "classification_rules");
+    assert!(
+        conn.execute(
+            "UPDATE event_income SET income_kind = 'securities_lending_income'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE classification_rules SET income_kind = 'securities_lending_income'",
+            []
+        )
+        .is_err()
+    );
+
+    migrate(&conn).expect("migrate populated version eleven");
+
+    assert_eq!(rows(&conn, "event_income"), income_before);
+    assert_eq!(rows(&conn, "classification_rules"), rules_before);
+    conn.execute(
+        "UPDATE event_income SET income_kind = 'securities_lending_income' WHERE event = 'e0'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE classification_rules SET income_kind = 'securities_lending_income' WHERE id = 'r3'",
+        [],
+    )
+    .unwrap();
+    for table in ["event_income", "classification_rules"] {
+        assert!(
+            conn.execute(
+                &format!("UPDATE {table} SET income_kind = 'unknown_kind'"),
+                []
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        conn.execute(
+            "UPDATE classification_rules SET outcome_kind = 'external_flow' WHERE id = 'r3'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE classification_rules SET description_contains = NULL WHERE id = 'r3'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE classification_rules SET version = 1 WHERE id = 'r3'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE event_income SET instrument = 'missing' WHERE event = 'e0'",
+            []
+        )
+        .is_err()
+    );
+    let indexes: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN ('classification_rules_by_version', 'classification_rules_by_owner')", [], |row| row.get(0)).unwrap();
+    assert_eq!(indexes, 2);
+    let violations: i64 = conn
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
 }

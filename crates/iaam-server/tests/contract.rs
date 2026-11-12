@@ -106,6 +106,8 @@ impl BrokerChannel for EmptyChannel {
         _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: Vec::new(),
             quarantined: Vec::new(),
         })
@@ -157,6 +159,8 @@ impl BrokerChannel for PopulatedChannel {
         _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: vec![SubmittedOperation {
                 account,
                 kind: OperationKind::Deposit {
@@ -266,6 +270,7 @@ fn seed_instrument_id(path: &std::path::Path, id: InstrumentId, symbol: &str) {
             title: format!("Instrument {symbol}"),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("journal instrument");
 }
@@ -597,6 +602,7 @@ async fn finam_sync_harness(script: Vec<String>) -> Harness {
             title: "Invented issuer".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("invented instrument");
     store
@@ -827,6 +833,7 @@ async fn seed_market(harness: &Harness) {
             title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("market instrument");
 
@@ -981,6 +988,7 @@ async fn seed_bond_market(harness: &Harness) {
             title: "Test bond".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("bond market instrument");
     store
@@ -1213,11 +1221,9 @@ async fn health_is_public_and_reports_the_projection_version() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Version 8: version 7 removed the face value from the lot and made the
-    // prefix fingerprint cover the event contents; version 8 orders events
-    // within a day by the source's time. Snapshots from either earlier version
-    // are incompatible and trigger a full recalculation.
-    assert_eq!(body["projection_version"], 8);
+    // Version 9 retains income totals by account, kind and currency.
+    // Earlier snapshots must rebuild rather than omit historical income.
+    assert_eq!(body["projection_version"], 9);
 }
 
 #[tokio::test]
@@ -1771,6 +1777,32 @@ async fn the_stage_one_question_is_answered_end_to_end() {
 }
 
 #[tokio::test]
+async fn instrument_post_retains_broker_metadata_in_its_get_view() {
+    let harness = harness().await;
+    let metadata = json!({"mic": "XTEST", "board": "TEST", "lot": 10, "price_decimals": 4});
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/instruments", &harness.owner_token, &json!({
+            "kind": "share", "symbol": "TEST", "title": "Invented instrument",
+            "denomination_currency": "RUB", "settlement_currency": "RUB", "quote_currency": "RUB",
+            "metadata": metadata
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["metadata"], metadata);
+    let (status, loaded) = call(
+        &harness.router,
+        get(
+            &format!("/v1/instruments/{}", created["id"].as_str().expect("id")),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["metadata"], metadata);
+}
+
+#[tokio::test]
 async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     let (harness, path) = harness_on_disk().await;
     let (status, instrument_response) = call(
@@ -1981,6 +2013,7 @@ async fn seed_share_quote(harness: &Harness) {
             title: "Share One".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("market instrument");
 
@@ -2225,6 +2258,78 @@ async fn the_openapi_document_declares_bearer_security() {
         .expect("security scheme description");
     assert!(description.contains("iaam claim --label <label>"));
     assert!(description.contains("no API route issues one"));
+}
+
+#[tokio::test]
+async fn securities_lending_income_is_published_in_openapi_and_accepted_by_ingest() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        spec["components"]["schemas"]["IncomeKindDto"]["enum"],
+        json!([
+            "coupon",
+            "dividend",
+            "deposit_interest",
+            "securities_lending_income"
+        ])
+    );
+    assert!(
+        spec["components"]["schemas"]["EarningSourceAmountDto"]["properties"]
+            .get("income_kind")
+            .is_some()
+    );
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "income",
+                    "kind": "securities_lending_income",
+                    "amount": "12.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-08-20" }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let (status, contour) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Lending income", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour}");
+    let contour = contour["contour"].as_str().expect("contour");
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour}&currency=RUB&as_of=2026-08-26"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(
+        report["income_by_kind"]["value"],
+        json!([{
+            "kind": "securities_lending_income",
+            "amount": { "amount": "12.00", "currency": "RUB" }
+        }]),
+        "{report}"
+    );
 }
 
 #[tokio::test]
@@ -6634,7 +6739,14 @@ async fn the_finam_sync_route_records_operations_from_the_finam_channel() {
         finam_session_token(),
         finam_sessions_details(),
         finam_transactions_page(),
-        json!({ "isin": FINAM_ISIN }).to_string(),
+        json!({
+            "isin": FINAM_ISIN,
+            "ticker": "IZPA",
+            "name": "Invented contract share",
+            "type": "COMMON_STOCK",
+            "quote_currency": "RUB"
+        })
+        .to_string(),
         finam_portfolio(),
     ])
     .await;
@@ -6878,6 +6990,7 @@ fn seed_directory(store: &SqliteStore) -> InstrumentId {
             title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument");
     store
@@ -7007,6 +7120,7 @@ async fn a_two_word_namespace_resolves_under_the_spelling_the_contract_publishes
             title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument");
     store
@@ -12430,6 +12544,8 @@ impl BrokerChannel for TwinRowsChannel {
             counterparty: None,
         };
         Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: vec![row("twin-a"), row("twin-b")],
             quarantined: Vec::new(),
         })
@@ -34833,6 +34949,7 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
             title: "Test Share".to_owned(),
             currencies: CurrencyRoles::uniform(usd),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument");
     SqliteAdapter::new(SqliteStore::open(&path).expect("custody connection"))
@@ -35754,6 +35871,8 @@ impl BrokerChannel for RecordingChannel {
             .unwrap_or_else(|error| error.into_inner())
             .push(broker_account.to_owned());
         Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: vec![SubmittedOperation {
                 account,
                 kind: OperationKind::Deposit {

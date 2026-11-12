@@ -500,6 +500,7 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
                 Some(IncomeKind::Coupon) => Some("coupon"),
                 Some(IncomeKind::Dividend) => Some("dividend"),
                 Some(IncomeKind::DepositInterest) => Some("deposit_interest"),
+                Some(IncomeKind::SecuritiesLendingIncome) => Some("securities_lending_income"),
             },
         },
         Classification::Fee { origin } => ClassifiedAs {
@@ -579,6 +580,7 @@ pub fn outcome_from(
                 Some("coupon") => Some(IncomeKind::Coupon),
                 Some("dividend") => Some(IncomeKind::Dividend),
                 Some("deposit_interest") => Some(IncomeKind::DepositInterest),
+                Some("securities_lending_income") => Some(IncomeKind::SecuritiesLendingIncome),
                 Some(actual) => Err(invalid_income_kind(actual))?,
             },
         }),
@@ -1050,6 +1052,19 @@ mod tests {
             .matcher
             .matches(&subject),
             "a rule naming the source's own category must match on recompute"
+        );
+    }
+
+    #[test]
+    fn securities_lending_income_round_trips_through_rule_outcomes() {
+        let expected = Classification::Income {
+            kind: Some(IncomeKind::SecuritiesLendingIncome),
+        };
+        let outcome = classified_as(expected);
+        assert_eq!(outcome.income_kind, Some("securities_lending_income"));
+        assert_eq!(
+            outcome_from(outcome.kind, None, outcome.origin, outcome.income_kind).unwrap(),
+            expected
         );
     }
 

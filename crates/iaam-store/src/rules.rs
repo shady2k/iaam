@@ -9,7 +9,7 @@
 //! tagged outcome are typed columns, not a serialised blob: the store validates
 //! and stores each field on its own, and the database's `CHECK` constraints
 //! enforce the closed vocabulary (an outcome kind out of the six, a fee origin
-//! out of its five, an income kind out of its three) and the shape rule — a
+//! out of its five, an income kind out of its four) and the shape rule — a
 //! condition that asks about nothing cannot be stored at all.
 
 use iaam_core::ids::{AccountId, ClassificationRuleId, OwnerId};

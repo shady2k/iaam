@@ -1028,6 +1028,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zeroize",
 ]
@@ -1099,6 +1100,7 @@ dependencies = [
  "percent-encoding",
  "reqwest",
  "rustix",
+ "serde_json",
  "sha2",
  "thiserror",
  "tokio",
@@ -1198,6 +1200,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "time",
+ "tracing",
  "uuid",
 ]
 

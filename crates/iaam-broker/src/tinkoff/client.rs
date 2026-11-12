@@ -140,6 +140,22 @@ impl GetOperationsByCursorRequest {
     }
 }
 
+/// Identifier namespace accepted by `GetInstrumentBy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstrumentIdType {
+    Uid,
+    Figi,
+}
+
+impl InstrumentIdType {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Uid => "INSTRUMENT_ID_TYPE_UID",
+            Self::Figi => "INSTRUMENT_ID_TYPE_FIGI",
+        }
+    }
+}
+
 /// HTTP client for T-Invest REST API methods.
 ///
 /// Sends every request through the process's one outbound gateway, which
@@ -166,6 +182,24 @@ impl TinkoffClient {
         self.post(ACCOUNTS, json!({}), None, allowance)
             .await
             .map(|(body, _)| body)
+    }
+
+    /// Read reference data by the identifier the broker supplied.
+    pub async fn get_instrument(
+        &self,
+        id: &str,
+        id_type: InstrumentIdType,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            INSTRUMENT,
+            json!({ "idType": id_type.code(), "id": id }),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
     }
 
     /// Return the raw portfolio body from `OperationsService/GetPortfolio`,
@@ -282,6 +316,11 @@ const ACCOUNTS: ReadCall = ReadCall {
 const PORTFOLIO: ReadCall = ReadCall {
     method: Method::Portfolio,
     path: "OperationsService/GetPortfolio",
+};
+
+const INSTRUMENT: ReadCall = ReadCall {
+    method: Method::Instrument,
+    path: "InstrumentsService/GetInstrumentBy",
 };
 
 const OPERATIONS: ReadCall = ReadCall {
@@ -532,6 +571,31 @@ mod tests {
 
     fn sent(paths: &Mutex<Vec<String>>) -> usize {
         paths.lock().expect("paths").len()
+    }
+
+    #[tokio::test]
+    async fn instrument_lookup_uses_the_selected_environment_and_shared_gateway() {
+        for environment in [Environment::Prod, Environment::Sandbox] {
+            let (client, paths, _) = client_in(environment, vec![answer(200, "{}")]);
+            client
+                .get_instrument(
+                    "invented-uid",
+                    InstrumentIdType::Uid,
+                    None,
+                    &RequestAllowance::new(1),
+                )
+                .await
+                .expect("instrument lookup succeeds");
+            assert_eq!(
+                *paths.lock().expect("paths"),
+                [format!(
+                    "{}/{PACKAGE}.InstrumentsService/GetInstrumentBy",
+                    environment.base_url()
+                )]
+            );
+        }
+        assert_eq!(InstrumentIdType::Uid.code(), "INSTRUMENT_ID_TYPE_UID");
+        assert_eq!(InstrumentIdType::Figi.code(), "INSTRUMENT_ID_TYPE_FIGI");
     }
 
     #[tokio::test]

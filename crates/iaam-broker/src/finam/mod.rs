@@ -11,6 +11,6 @@ pub mod parse;
 pub use client::{FinamClient, FinamError};
 pub use parse::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, FINAM_PARSER_VERSION, ParseError,
-    ParsedPortfolio, RefusedPosition, UnresolvedPosition, parse_asset, parse_operations,
-    parse_portfolio,
+    ParsedPortfolio, RefusedPosition, UnresolvedPosition, parse_asset, parse_asset_description,
+    parse_operations, parse_portfolio,
 };

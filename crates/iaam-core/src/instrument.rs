@@ -10,6 +10,15 @@ use time::Date;
 use crate::ids::InstrumentId;
 use crate::money::CurrencyCode;
 
+/// Broker-supplied trading metadata, retained without inferring missing values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentMetadata {
+    pub mic: Option<String>,
+    pub board: Option<String>,
+    pub lot: Option<u32>,
+    pub price_decimals: Option<u8>,
+}
+
 /// Instrument kind. An immutable property: a share does not become a bond.
 ///
 /// This is an exhaustive `enum`, following [`CurrencyCode`]: adding a kind

@@ -1624,6 +1624,7 @@ mod tests {
                     title: "Test Share".to_owned(),
                     currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
                     lineage: None,
+                    metadata: None,
                 })
                 .await
                 .expect("instrument registered");

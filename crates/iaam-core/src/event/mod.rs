@@ -274,8 +274,8 @@ impl Event {
             },
             EventKind::CorporateAction { action } => match action {
                 CorporateAction::PartialRedemption { custody, .. }
-                | CorporateAction::Redemption { custody, .. }
                 | CorporateAction::Conversion { custody, .. } => found.push(*custody),
+                CorporateAction::Redemption { custody, .. } => found.extend(*custody),
             },
             EventKind::OfferExercise { action } => match action {
                 OfferExerciseAction::Settled { custody, .. } => found.push(*custody),
@@ -778,12 +778,14 @@ impl Event {
                     name,
                     &[
                         principal_leg(self.account, *instrument, *compensation),
-                        security_leg(
-                            self.account,
-                            *custody,
-                            *instrument,
-                            Quantity(quantity.0.checked_neg()?),
-                        ),
+                        LegExpectation {
+                            kind: LegKind::SecurityQuantity,
+                            account: self.account,
+                            custody: *custody,
+                            instrument: Some(*instrument),
+                            money: None,
+                            quantity: Some(Quantity(quantity.0.checked_neg()?)),
+                        },
                     ],
                 )
             }
@@ -1558,7 +1560,7 @@ mod tests {
                 EventKind::CorporateAction {
                     action: CorporateAction::Redemption {
                         instrument: self.instrument,
-                        custody: self.custody,
+                        custody: Some(self.custody),
                         quantity: qty(10),
                         principal_returned_per_unit: Self::per_unit("800"),
                         compensation: rub(1_000_000),

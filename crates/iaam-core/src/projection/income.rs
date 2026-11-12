@@ -14,12 +14,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Date;
 
+use crate::contour::ContourDefinition;
 use crate::event::Event;
 use crate::event::corporate_action::CorporateAction;
 use crate::event::kind::{EventKind, IncomeKind};
 use crate::event::offer::OfferExerciseAction;
-use crate::ids::EventId;
+use crate::ids::{AccountId, EventId};
 use crate::money::Money;
+use crate::money::{CurrencyCode, PostedMinor};
 use crate::projection::lots::LotKey;
 use crate::rules::PostingKind;
 
@@ -59,6 +61,8 @@ pub enum IncomeError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomeLedger {
     entries: BTreeMap<LotKey, Entry>,
+    #[serde(default)]
+    totals: BTreeMap<(AccountId, Option<IncomeKind>, CurrencyCode), PostedMinor>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +92,31 @@ impl IncomeLedger {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Income received inside the contour, grouped by economic kind and native
+    /// currency. Unknown kinds remain explicit; currencies are never converted
+    /// or added together. These totals are independent of scheduled bond facts.
+    pub fn income_by_kind(
+        &self,
+        contour: &ContourDefinition,
+    ) -> Result<Vec<(Option<IncomeKind>, Money)>, IncomeError> {
+        let mut totals = BTreeMap::<(Option<IncomeKind>, CurrencyCode), PostedMinor>::new();
+        for ((account, kind, currency), amount) in &self.totals {
+            if !contour.contains(*account) {
+                continue;
+            }
+            let total = totals
+                .entry((*kind, *currency))
+                .or_insert(PostedMinor::new(0));
+            *total = total
+                .checked_add(*amount)
+                .ok_or(crate::money::MoneyError::Overflow)?;
+        }
+        Ok(totals
+            .into_iter()
+            .map(|((kind, currency), amount)| (kind, Money::new(amount, currency)))
+            .collect())
     }
 
     /// The date the money was received.
@@ -129,6 +158,15 @@ impl IncomeLedger {
     /// “no” for them — and the missing fact would surface not as a build error, but as a false
     /// reconciliation alarm for the owner.
     pub fn apply(&mut self, event: &Event) -> Result<(), IncomeError> {
+        if let EventKind::Income { gross, kind, .. } = &event.kind {
+            let total = self
+                .totals
+                .entry((event.account, *kind, gross.currency()))
+                .or_insert(PostedMinor::new(0));
+            *total = total
+                .checked_add(gross.amount())
+                .ok_or(crate::money::MoneyError::Overflow)?;
+        }
         match &event.kind {
             EventKind::Income {
                 instrument: Some(instrument),
@@ -304,9 +342,13 @@ impl IncomeLedger {
                     },
                 );
             }
-            // Dividends, deposit interest and cashback do not appear in the
-            // bond schedule: there is nothing to confirm with them.
-            Some(IncomeKind::Dividend | IncomeKind::DepositInterest) => {}
+            // Dividends, deposit interest and securities lending income do not
+            // appear in the bond schedule: there is nothing to confirm with them.
+            Some(
+                IncomeKind::Dividend
+                | IncomeKind::DepositInterest
+                | IncomeKind::SecuritiesLendingIncome,
+            ) => {}
             None => self.mark(key, IncomeGap::IncomeKindUnknown),
         }
     }
@@ -588,6 +630,75 @@ mod tests {
     }
 
     #[test]
+    fn securities_lending_income_does_not_confirm_a_coupon_or_create_an_unknown_gap() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+        for (kind, amount) in [
+            (IncomeKind::Coupon, 100),
+            (IncomeKind::SecuritiesLendingIncome, 500),
+        ] {
+            ledger
+                .apply(&income(
+                    account,
+                    Some(instrument),
+                    date!(2026 - 03 - 18),
+                    Some(kind),
+                    amount,
+                ))
+                .expect("income is accepted");
+        }
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        let postings = ledger.postings(&key);
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].kind, PostingKind::Coupon);
+        assert_eq!(postings[0].amount, rub(100));
+        assert_eq!(ledger.gap(&key), None);
+    }
+
+    #[test]
+    fn income_totals_keep_unknown_kinds_and_currencies_separate() {
+        let account = AccountId::new_random();
+        let contour = ContourDefinition::new(
+            crate::contour::ContourId::new_random(),
+            crate::contour::ContourVersion(1),
+            [account],
+        );
+        let mut ledger = IncomeLedger::default();
+        for (kind, currency) in [
+            (None, CurrencyCode::Rub),
+            (Some(IncomeKind::SecuritiesLendingIncome), CurrencyCode::Rub),
+            (Some(IncomeKind::SecuritiesLendingIncome), CurrencyCode::Usd),
+        ] {
+            let gross = Money::new(PostedMinor::new(100), currency);
+            ledger
+                .apply(&event_with(
+                    account,
+                    date!(2026 - 03 - 18),
+                    1,
+                    EventKind::Income {
+                        instrument: None,
+                        gross,
+                        kind,
+                    },
+                    vec![Leg::cash(account, gross)],
+                ))
+                .expect("income applies");
+        }
+        let rows = ledger.income_by_kind(&contour).expect("fits");
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&(None, rub(100))));
+        assert!(rows.contains(&(Some(IncomeKind::SecuritiesLendingIncome), rub(100))));
+        assert!(rows.contains(&(
+            Some(IncomeKind::SecuritiesLendingIncome),
+            Money::new(PostedMinor::new(100), CurrencyCode::Usd)
+        )));
+    }
+
+    #[test]
     fn income_without_an_instrument_has_nothing_to_reconcile_against() {
         let account = AccountId::new_random();
         let mut ledger = IncomeLedger::default();
@@ -718,7 +829,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::Redemption {
                     instrument,
-                    custody: CustodyId::new_random(),
+                    custody: Some(CustodyId::new_random()),
                     quantity: qty(10),
                     principal_returned_per_unit: per_unit("100"),
                     compensation,

@@ -492,6 +492,7 @@ mod tests {
                 title: "Test bond".to_owned(),
                 currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .expect("instrument");
         let observed_at = "2026-08-27T12:00:00Z";

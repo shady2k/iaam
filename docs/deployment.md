@@ -1102,30 +1102,109 @@ database holds. Deleting or emptying that pair after the first enabling
 spends the day (§2.1); the command then refuses with the ceiling it finds,
 and nothing restores the allowance.
 
-### 6.9 How Finam symbols become instruments
+### 6.9 How broker descriptions fill the instrument catalogue
 
-Finam names an instrument `TICKER@MIC` (`SBER@MISX`); iaam identifies one by
-its own identifier and its external codes. A sync closes that gap through
-the broker's own asset description: for every distinct symbol of the sync —
-position rows and operations alike — the channel reads `GET
-/v1/assets/{symbol}?account_id=<the broker account>` once (the live API
-answers a bare asset read with 400 `Invalid arguments: account_id`, found
-by the walk on 2026-10-04), takes the ISIN the description names, and asks
-the instrument directory which instrument carries that ISIN. The position or
-operation then names that instrument. The asset read is budgeted like every
-Finam call (half of the documented 200 per minute), and the answer is cached
-beside the database like every read, so one symbol costs one wire request
-per hour however many rows and syncs name it. A symbol whose asset
-description Finam refuses or that cannot be read is that row's problem, not
-the sync's: the row is set aside with the broker's message as its reason.
+Both brokers resolve securities by **ISIN**, not by a broker's private
+instrument identifier. For each distinct security named by operations or
+portfolio positions, the sync reads the broker's instrument description,
+looks up its ISIN in the instance catalogue, and records the instrument when
+that ISIN is missing. It uses the same instrument-directory write path as
+`POST /v1/instruments`, then records the ISIN alias and uses the resulting
+iaam instrument identifier in journal rows. The same ISIN through Finam and
+T-Invest therefore names one instrument. Registration and the ISIN alias are written in one transaction, so repeated
+or concurrent rows do not create duplicate instruments or partial records.
 
-Two cases stay visible refusals instead of becoming guesses, and the sync's
-outcome lists them row by row with the original JSON: the asset description
-names **no ISIN** for the symbol, or the ISIN is carried by **no instrument
-recorded here**. Both are fixed the same way — record the instrument with
-the ISIN it actually carries (the refusal quotes the ISIN when there is
-one), and sync the same range again. Until then those rows assert nothing:
-the rest of the snapshot and the other operations import regardless.
+Finam describes `TICKER@MIC` symbols through
+`GET /v1/assets/{symbol}?account_id=<the broker account>`. T-Invest describes
+UIDs or FIGIs through
+`POST /rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy`
+on the client's selected production or sandbox host. The broker UID is only
+a lookup key; it is never used as an iaam instrument identifier.
+
+New records retain the description's ISIN, ticker, name, supported instrument
+kind and currency, plus MIC, board, lot and price decimals where supplied.
+Existing instruments are reused rather than overwritten. Broker descriptions
+supply no historical start date for an ISIN, so new ISIN aliases have an
+open-ended interval starting at 0001-01-01; this avoids
+creating a second instrument when an earlier range is synced later.
+
+Every description read uses the outbound gateway and its one-hour response
+cache. Repeated rows in one sync share the description, including operations
+and portfolio positions. Finam retains its existing half-limit budget.
+T-Invest InstrumentsService has a documented limit of 200 requests per minute;
+iaam uses 100 per minute on each environment, half that limit, without raising
+any existing budget. See the broker's
+[request limits](https://developer.tbank.ru/invest/intro/intro/limits).
+These are hard ceilings, not a promise of the broker's current allowance:
+T-Invest can apply dynamic limits shared by the owner's accounts and tools.
+Description requests also consume the sync's existing hard request allowance.
+
+Every broker status line logs the numeric `x-ratelimit-limit`,
+`x-ratelimit-remaining` and `x-ratelimit-reset` fields at `info`, including
+`429` answers and answers whose body subsequently fails. Missing or malformed
+fields carry no numeric value; no arbitrary response header or body is logged.
+Non-2xx broker answers also log a `warn` event with status, numeric rate-limit
+fields, the parsed `Retry-After`, tracking/request id, and bounded error
+`code`, `message` and `description` fields (at most 128 UTF-8 bytes each).
+Only these error fields are read; credentials are redacted, and neither request bodies nor arbitrary error
+payloads are logged. T-Invest's `x-tracking-id` takes precedence over the
+other request-id headers.
+When remaining is zero, the next call sharing that budget waits the reset
+seconds from the status-line observation. T-Invest's
+[header documentation](https://github.com/RussianInvestments/investAPI/blob/main/src/docs/grpc.md)
+defines reset as seconds until the counter resets. The wait is per service for
+T-Invest and per method for Finam. The same selected headers are read when
+Finam supplies them; no undocumented Finam-specific header is assumed.
+A wait beyond the call's deadline refuses the call before sending. As with
+other server-named waits, waits over fifteen minutes are refused for later
+retry, not shortened. Header pacing is in-process; the existing host-wide `429`
+pauses remain durable in the outbound tally. Cached responses do not restart a header wait. Headers
+can delay a call, never raise a budget, shorten another pause, or bypass the
+one-second spacing, request allowance or rolling-day ceiling.
+
+A T-Invest `GetInstrumentBy` 404 is an instrument-level refusal. It does not
+pause the host through a named delay or a reset header, or count toward the
+three-4xx host closure; other broker 4xx rules remain unchanged. Its broker message is retained with the affected rows.
+A broker 429 with a named `Retry-After` can be waited out and retried within
+the call's deadline. The effective wait still includes the durable minimum
+60-second host pause: a two-second header does not bypass that minimum.
+A second 429 within ten minutes still closes the host for thirty minutes,
+including when the first 429 was waited out successfully.
+
+A description that names no ISIN, is refused, or cannot be read still sets
+aside the affected rows with their original payload and a reason, including
+the broker's refusal message. Other rows continue. New catalogue steps log
+counts at `info`; each set-aside row logs its reason at `debug`. These logs
+contain neither monetary amounts nor tokens.
+
+T-Invest operation fetching also reports the number of pages and source items
+received. Its final accounting separates accepted **source rows**, quarantined
+source rows and reductions by reason. These counts balance as
+`received = source_rows_accepted + quarantined + reduced`. The number of
+emitted operations is separate: an order with several execution fills can
+emit several operations from one source row.
+
+The current adapter does not merge parent orders or fold child operations,
+and it does not discard non-executed rows as a filter. Unusable states are
+quarantined. A trade with no execution fills can emit no operations; this
+existing reduction is logged as `no_execution_trades`. No mapping or
+filtering rule is changed by the accounting logs. Each reduced row logs its
+source operation id, source type and fixed reason code at `debug`; quarantine
+counts are also broken down by reason.
+
+Possible-duplicate diagnostics name the deduplication level (`5` for the
+probabilistic hint) and the present canonical fingerprint fields that matched. This is fingerprint equality, not an
+independent field-by-field match, and it does not discard the operation.
+The diagnostics contain field names, never their values or the fingerprint.
+Within one broker API channel and account, different source operation keys
+identify distinct operations even when their fingerprints match. A repeated
+key still identifies a duplicate. Fingerprint hints remain across sources or
+when either operation has no source key. The canonical fingerprint is unchanged.
+Verdict diagnostics include a fixed `rule`: `key_match`,
+`distinct_source_keys_within_channel`, `fingerprint_across_sources`, or
+`no_match` when no comparison matches.
+Enable the relevant application's `debug` logging to inspect individual rows;
+aggregate operation counts are available at `info`.
 
 ---
 

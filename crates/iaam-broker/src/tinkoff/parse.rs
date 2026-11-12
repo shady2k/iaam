@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/3";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/6";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -143,8 +143,8 @@ pub struct ChannelOperation {
     pub accrued_interest: Option<ChannelMoney>,
     /// Monetary effect of the operation.
     pub payment: Option<ChannelMoney>,
-    /// Price of one unit.
-    pub price: Option<ChannelMoney>,
+    /// Exact price of one unit, without rounding to currency minor units.
+    pub price: Option<CalcMoney>,
     /// Operation commission.
     pub commission: Option<CalcMoney>,
     /// Stable key for the first deduplication stage.
@@ -177,6 +177,61 @@ pub struct OperationsPage {
     pub has_next: bool,
     /// Cursor to use for the next page, when one is available.
     pub next_cursor: Option<String>,
+}
+
+/// Parse the reference data returned by `InstrumentsService/GetInstrumentBy`.
+pub fn parse_instrument(body: &str) -> Result<crate::BrokerInstrumentDescription, ParseError> {
+    use iaam_core::instrument::InstrumentKind;
+    let response: Value = parse_json(body)?;
+    let instrument = response.get("instrument").ok_or(ParseError::MissingField {
+        field: "instrument",
+    })?;
+    let required = |field: &'static str| -> Result<String, ParseError> {
+        instrument
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(ParseError::MissingField { field })
+    };
+    let optional = |field: &str| {
+        instrument
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let kind = match optional("instrumentType").as_deref() {
+        Some("share") => Some(InstrumentKind::Share),
+        Some("bond") => Some(InstrumentKind::Bond),
+        Some("etf") => Some(InstrumentKind::Etf),
+        Some("currency") => Some(InstrumentKind::Currency),
+        _ => None,
+    };
+    let lot = instrument
+        .get("lot")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| ParseError::InvalidField {
+                    field: "lot",
+                    value: value.to_string(),
+                })
+        })
+        .transpose()?;
+    Ok(crate::BrokerInstrumentDescription {
+        isin: optional("isin"),
+        ticker: required("ticker")?,
+        name: required("name")?,
+        kind,
+        currency: parse_currency(&required("currency")?)?,
+        mic: None,
+        board: optional("classCode"),
+        lot,
+        price_decimals: None,
+    })
 }
 
 /// Parse one `GetOperationsByCursor` response page without network access.
@@ -587,7 +642,7 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         &mut rejection,
     );
     let price = keep_or_reject(
-        parse_optional_money(item.price.as_ref(), "price"),
+        parse_optional_calc_money(item.price.as_ref(), "price"),
         &mut rejection,
     );
     let commission = keep_or_reject(

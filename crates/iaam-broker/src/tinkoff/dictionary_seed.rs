@@ -16,12 +16,9 @@
 //! A missing synonym here is a code that would silently become unknown after
 //! migration, and imports would stop parsing what they parsed yesterday.
 //!
-//! Amortisation and redemption are intentionally absent: the contract
-//! declares their codes (`OPERATION_TYPE_BOND_REPAYMENT`,
-//! `OPERATION_TYPE_BOND_REPAYMENT_FULL`), but the channel reports neither the
-//! returned principal per unit nor its storage location, so no fact can be
-//! built from them. The owner can add them by decision once the necessary data
-//! exists.
+//! Full bond repayment is a redemption: the payment returns principal and
+//! the reported quantity leaves the position. It is not investment income.
+//! Partial repayment is not seeded here until its journal mapping is available.
 
 /// “Channel code → kind name” pairs for initial seeding.
 pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
@@ -36,6 +33,7 @@ pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
     ("OPERATION_TYPE_DIVIDEND", "dividend"),
     ("OPERATION_TYPE_DIV_EXT", "dividend"),
     ("OPERATION_TYPE_COUPON", "coupon"),
+    ("OPERATION_TYPE_BOND_REPAYMENT_FULL", "bond_redemption"),
     ("OPERATION_TYPE_BROKER_FEE", "commission"),
     ("OPERATION_TYPE_SERVICE_FEE", "commission"),
     ("OPERATION_TYPE_MARGIN_FEE", "commission"),
@@ -117,6 +115,16 @@ mod tests {
         ] {
             assert_eq!(dictionary.kind_of(code), expected, "{code}");
         }
+    }
+
+    #[test]
+    fn full_bond_repayment_is_seeded_as_redemption_not_income() {
+        let (dictionary, _) =
+            OperationKindDictionary::build(TINKOFF_OPERATION_KINDS.iter().copied());
+        assert_eq!(
+            dictionary.kind_of("OPERATION_TYPE_BOND_REPAYMENT_FULL"),
+            ChannelOperationKind::BondRedemption
+        );
     }
 
     #[test]

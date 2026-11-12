@@ -57,9 +57,11 @@ async fn the_server_records_every_request_in_order() {
 
 #[tokio::test]
 async fn a_rate_limit_status_survives_a_truncated_body() {
-    let server = LoopbackServer::start([
-        LoopbackReply::truncated_body(429, "partial").with_header("Retry-After", "60")
-    ])
+    let server = LoopbackServer::start([LoopbackReply::truncated_body(429, "partial")
+        .with_header("Retry-After", "60")
+        .with_header("x-ratelimit-limit", "30")
+        .with_header("x-ratelimit-remaining", "0")
+        .with_header("x-ratelimit-reset", "17")])
     .expect("loopback server");
     let client = HttpClientHarness::new(&server);
     let request = HttpRequest::get(Destination::MoexIss, "/reset");
@@ -72,6 +74,9 @@ async fn a_rate_limit_status_survives_a_truncated_body() {
     assert_eq!(response.status, 429);
     assert_eq!(response.body, b"partial");
     assert_eq!(response.retry_after, Some(Duration::from_secs(60)));
+    assert_eq!(response.rate_limit, Some(30));
+    assert_eq!(response.rate_remaining, Some(0));
+    assert_eq!(response.rate_reset, Some(17));
     assert_eq!(server.requests_received(), 1);
 }
 
@@ -201,6 +206,23 @@ async fn the_request_id_is_the_first_present_of_the_common_names() {
             .expect("answered");
         assert_eq!(response.request_id.as_deref(), Some(wanted));
     }
+}
+
+#[tokio::test]
+async fn malformed_rate_headers_do_not_escape_as_loggable_text() {
+    let server = LoopbackServer::start([LoopbackReply::complete(200, "plain")
+        .with_header("x-ratelimit-limit", "Bearer private")
+        .with_header("x-ratelimit-remaining", "-1")
+        .with_header("x-ratelimit-reset", "+17")])
+    .expect("loopback server");
+    let client = HttpClientHarness::new(&server);
+    let response = client
+        .send(&HttpRequest::get(Destination::TinkoffProd, "/plain"))
+        .await
+        .expect("answer");
+    assert_eq!(response.rate_limit, None);
+    assert_eq!(response.rate_remaining, None);
+    assert_eq!(response.rate_reset, None);
 }
 
 #[tokio::test]

@@ -702,6 +702,7 @@ mod tests {
                     title: "Test Bond".to_owned(),
                     currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                     lineage: None,
+                    metadata: None,
                 })
                 .expect("instrument created");
             store

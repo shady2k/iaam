@@ -247,7 +247,7 @@ fn every_kind() -> Vec<Event> {
             EventKind::CorporateAction {
                 action: CorporateAction::Redemption {
                     instrument,
-                    custody,
+                    custody: Some(custody),
                     quantity: qty(10),
                     principal_returned_per_unit: per_unit("800.0000"),
                     compensation: rub(800_000),

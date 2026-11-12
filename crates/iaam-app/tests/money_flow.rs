@@ -358,6 +358,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
             title: "Test Bond".to_owned(),
             currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .await
         .unwrap_or_else(|error| panic!("insert instrument: {error}"));

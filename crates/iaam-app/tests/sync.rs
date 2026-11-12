@@ -249,8 +249,39 @@ fn seed_instrument(store: &SqliteStore, instrument: InstrumentId, symbol: &str) 
             title: symbol.to_owned(),
             currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .unwrap_or_else(|error| panic!("seed instrument: {error}"));
+    store
+        .record_alias(&iaam_store::reference::AliasRecord {
+            namespace: iaam_core::instrument::AliasNamespace::Isin,
+            value: invented_isin(instrument),
+            instrument,
+            interval: iaam_core::instrument::AliasInterval {
+                valid_from: date!(2026 - 01 - 01),
+                valid_to: None,
+            },
+            source: SourceId::new_random(),
+        })
+        .unwrap_or_else(|error| panic!("seed instrument ISIN: {error}"));
+}
+
+fn invented_isin(instrument: InstrumentId) -> String {
+    format!("XX{:010X}", instrument.inner().as_u128() & 0xff_ffff_ffff)
+}
+
+fn invented_description(request: &HttpRequest) -> String {
+    let body: serde_json::Value =
+        serde_json::from_str(request.body().expect("description request body").payload())
+            .expect("description request JSON");
+    let uid = body["id"].as_str().expect("instrument handle");
+    let instrument = InstrumentId(uuid::Uuid::parse_str(uid).expect("invented UID"));
+    serde_json::json!({"instrument":{
+        "isin": invented_isin(instrument), "ticker":"TESTSHARE",
+        "name":"Invented security", "instrumentType":"share",
+        "currency":"rub", "classCode":"TQBR", "lot":1
+    }})
+    .to_string()
 }
 
 fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> SubmittedOperation {
@@ -495,6 +526,8 @@ fn api_with_claims(
         },
         identity_scope: IdentityScope::Source,
         operations: Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: vec![operation],
             quarantined: Vec::new(),
         }),
@@ -606,6 +639,8 @@ async fn a_position_with_no_trade_in_the_interval_registers_no_custody() {
         },
         identity_scope: IdentityScope::Source,
         operations: Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: Vec::new(),
             quarantined: Vec::new(),
         }),
@@ -667,6 +702,8 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
         },
         identity_scope: IdentityScope::Account,
         operations: Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: vec![operation],
             quarantined: Vec::new(),
         }),
@@ -856,6 +893,8 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
         ],
     );
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -932,6 +971,8 @@ async fn a_refused_position_reaches_the_owner_counted_and_gapped() {
     let operation = trade_without_custody(account, instrument);
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: Vec::new(),
         quarantined: Vec::new(),
     });
@@ -1002,6 +1043,8 @@ async fn repeating_refused_sync_appends_one_coverage_gap() {
     let operation = trade_without_custody(account, instrument);
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -1059,7 +1102,11 @@ struct ScriptedTinvest {
 impl Transport for ScriptedTinvest {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let url = request.url();
-        let body = if url.ends_with("UsersService/GetAccounts") {
+        let description;
+        let body = if url.ends_with("InstrumentsService/GetInstrumentBy") {
+            description = invented_description(request);
+            description.as_str()
+        } else if url.ends_with("UsersService/GetAccounts") {
             self.accounts
         } else if url.ends_with("OperationsService/GetOperationsByCursor") {
             self.operations
@@ -1147,11 +1194,14 @@ async fn a_refused_t_invest_cash_row_gaps_cash_instead_of_positions() {
         ]}}"#,
         instrument_uid = instrument.inner(),
     );
-    let channel = channel_over(ScriptedTinvest {
-        accounts: r#"{"accounts":[{"id":"solo"}]}"#,
-        operations: r#"{"hasNext":false,"items":[]}"#,
-        portfolio,
-    });
+    let channel = channel_over(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio,
+        },
+        &services,
+    );
 
     let outcome = sync_broker(
         &services,
@@ -1246,6 +1296,7 @@ async fn a_refused_row_reaches_the_owner_with_its_reason_and_payload_and_settles
             ),
         },
         source,
+        &services,
     );
 
     let first = sync_broker(
@@ -1336,6 +1387,7 @@ async fn a_refused_row_reaches_the_owner_with_its_reason_and_payload_and_settles
             ),
         },
         source,
+        &services,
     );
     let second = sync_broker(
         &services,
@@ -1417,6 +1469,8 @@ async fn a_partial_sync_never_settles_an_existing_refusal() {
     // owner's question for the whole March interval.
     let mut first_broker = api(account, source, trade_without_custody(account, instrument));
     first_broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: Vec::new(),
         quarantined: Vec::new(),
     });
@@ -1549,6 +1603,8 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
         ],
     );
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -1581,6 +1637,8 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
     );
 
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -1698,6 +1756,8 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
 
     let mut operation = trade(account, instrument, custody);
     operation.source_operation_id = Some("REN_NUMBERED-2".to_owned());
+    // Unlike distinct keys within one API channel, different source IDs leave
+    // this report/API fingerprint match ambiguous, even with both keys present.
     let report_source = SourceId::new_random();
     let existing = report_trade_event(owner, &operation, report_source);
     services
@@ -1710,6 +1770,23 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
         existing.provenance.source_operation_id()
     );
 
+    let amount_values = match &operation.kind {
+        OperationKind::Buy {
+            gross_minor,
+            fee_minor,
+            ..
+        } => [Some(*gross_minor), *fee_minor],
+        _ => panic!("fixture must be a trade"),
+    };
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
     let broker = api(account, SourceId::new_random(), operation);
     let outcome = sync_broker(
         &services,
@@ -1739,6 +1816,43 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
             .any(|record| record.id == *event),
         "possible duplicate event must be recorded"
     );
+
+    let logs = String::from_utf8(captured.0.lock().expect("duplicate log buffer").clone())
+        .expect("UTF-8 logs");
+    let line = logs
+        .lines()
+        .find(|line| {
+            line.contains("verdict=\"possible_duplicate\"") && line.contains("matched_fields=")
+        })
+        .unwrap_or_else(|| panic!("missing possible duplicate diagnostic: {logs}"));
+    for field in [
+        "dedup_level=5",
+        "rule=\"fingerprint_across_sources\"",
+        "match_basis=\"canonical_fingerprint\"",
+        "REN_NUMBERED-2",
+        "matched_fields=",
+        "account",
+        "dates.trade",
+        "kind.Buy.instrument",
+        "kind.Buy.gross_minor",
+        "kind.Buy.currency",
+    ] {
+        assert!(line.contains(field), "missing {field}: {line}");
+    }
+    assert!(
+        !line.contains("dates.paid"),
+        "absent date must not be claimed: {line}"
+    );
+    assert!(
+        !line.contains("kind.Buy.basis_fee"),
+        "absent fee must not be claimed: {line}"
+    );
+    for amount in amount_values.into_iter().flatten() {
+        assert!(
+            !line.contains(&amount.to_string()),
+            "amount value leaked: {line}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1771,6 +1885,8 @@ async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
     fresh.source_operation_id = Some("FRESH-1".to_owned());
     let mut broker = api(account, SourceId::new_random(), possible.clone());
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![possible, duplicate, fresh],
         quarantined: Vec::new(),
     });
@@ -1912,6 +2028,8 @@ async fn partial_operations_record_control_assertion_and_coverage_gap() {
     let operation = trade_without_custody(account, instrument);
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -1957,6 +2075,8 @@ async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_r
     second.source_operation_id = Some("TRADE-MARCH-2".to_owned());
     let mut broker = api(account, SourceId::new_random(), first);
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![
             broker.operations.as_ref().expect("operations").accepted[0].clone(),
             second,
@@ -2007,6 +2127,8 @@ async fn bond_amortisation_and_unknown_rows_become_quarantined_verdicts() {
         let broker_operation = trade_without_custody(account, instrument);
         let mut broker = api(account, SourceId::new_random(), broker_operation);
         broker.operations = Ok(ParsedOperations {
+            journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: broker
                 .operations
                 .as_ref()
@@ -2058,6 +2180,8 @@ async fn a_normalisation_rejection_stops_one_row_and_records_the_other_rows() {
     invalid.source_operation_id = Some("INVALID-MARCH-1".to_owned());
     let mut broker = api(account, SourceId::new_random(), valid.clone());
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![valid, invalid],
         quarantined: Vec::new(),
     });
@@ -2113,6 +2237,8 @@ async fn a_structural_rejection_stops_one_operation_and_records_its_dimensions()
         trade(account, InstrumentId::new_random(), CustodyId::new_random()),
     );
     broker.operations = Ok(ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![invalid],
         quarantined: Vec::new(),
     });
@@ -2206,6 +2332,1109 @@ async fn append_checked_rejects_a_batch_before_any_event_is_written() {
     assert!(load_all(&services, owner).await.is_empty());
 }
 
+struct LendingIncomeFinam;
+
+impl Transport for LendingIncomeFinam {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let body = if request.path().ends_with("/v1/sessions") {
+            r#"{"token":"invented-finam-session"}"#
+        } else if request.path().contains("/transactions") {
+            r#"{"transactions":[{"id":"invented-lending-income",
+                "timestamp":"2026-03-15T10:00:00Z", "category":"INCOME",
+                "transaction_name":"Доход по предоставлениям займа",
+                "change":{"units":"23","nanos":0,"currency_code":"RUB"}}]}"#
+        } else if request.path().ends_with("/v1/accounts/invented-account") {
+            r#"{"cash":[{"units":"23","nanos":0,"currency_code":"RUB"}],"positions":[]}"#
+        } else {
+            panic!(
+                "unexpected Finam lending income request: {}",
+                request.path()
+            );
+        };
+        Ok(HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn finam_securities_lending_income_without_symbol_is_persisted_as_gross_cash() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let code = iaam_store::documents::BrokerCode::parse("finam").expect("Finam code");
+    services
+        .store
+        .record_broker_account_binding(owner, account, &code, "invented-account".to_owned())
+        .await
+        .expect("Finam account binding");
+    let time = Arc::new(FakeTime {
+        now: Mutex::new(Instant::now()),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_774_958_400)),
+    });
+    let gateway = Gateway::with_parts_for_database(
+        LendingIncomeFinam,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &broker_egress_database(),
+    )
+    .expect("gateway");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-finam-token")).expect("token");
+    let (_, seed) = seed_for("finam").expect("Finam dictionary");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty());
+    let source = SourceId::new_random();
+    let channel = iaam_app::adapters::finam::FinamChannel::new(
+        iaam_broker::finam::FinamClient::new(token, Arc::new(gateway)),
+        source,
+        dictionary,
+        Arc::clone(&services.directory),
+    );
+    let outcome = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: code,
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .expect("Finam lending income sync");
+
+    assert_eq!(outcome.set_aside, 0, "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    let incomes: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Income { .. }))
+        .collect();
+    assert_eq!(incomes.len(), 1, "{events:?}");
+    let event = incomes[0];
+    let EventKind::Income {
+        instrument,
+        gross,
+        kind,
+    } = &event.kind
+    else {
+        panic!("persisted income");
+    };
+    assert_eq!(*instrument, None);
+    assert_eq!(
+        *kind,
+        Some(iaam_core::event::kind::IncomeKind::SecuritiesLendingIncome)
+    );
+    assert_eq!(gross.amount().raw(), 2_300);
+    assert_eq!(gross.currency(), CurrencyCode::Rub);
+    assert_eq!(event.account, account);
+    assert_eq!(
+        event.provenance.source_operation_id(),
+        Some("invented-lending-income")
+    );
+    assert_eq!(event.legs.len(), 1);
+    assert_eq!(
+        event.legs[0],
+        iaam_core::event::leg::Leg::cash(account, *gross)
+    );
+    assert!(
+        services
+            .directory
+            .list_instruments()
+            .await
+            .expect("catalogue")
+            .is_empty()
+    );
+}
+
+struct CatalogueFinam;
+
+impl Transport for CatalogueFinam {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let body = if request.path().ends_with("/v1/sessions") {
+            r#"{"token":"invented-finam-session"}"#
+        } else if request.path().contains("/transactions") {
+            r#"{"transactions":[{"id":"cccccccc-0000-0000-0000-000000000001",
+                "timestamp":"2026-03-15T10:00:00Z", "category":"DIVIDEND",
+                "symbol":"INVENTED@MISX",
+                "change":{"units":"25","nanos":0,"currencyCode":"rub"}}]}"#
+        } else if request.path().contains("/assets/") {
+            r#"{"isin":"XX0000000001","ticker":"INVENTEDBOND","name":"Invented bond",
+                "type":"BOND","quote_currency":"RUB"}"#
+        } else {
+            panic!("unexpected Finam catalogue request: {}", request.path());
+        };
+        Ok(HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+}
+
+async fn record_finam_description(services: &AppServices, account: AccountId) -> InstrumentId {
+    let time = Arc::new(FakeTime {
+        now: Mutex::new(Instant::now()),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_774_958_400)),
+    });
+    let gateway = Gateway::with_parts_for_database(
+        CatalogueFinam,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &broker_egress_database(),
+    )
+    .expect("gateway");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-finam-token")).expect("token");
+    let (_, seed) = seed_for("finam").expect("Finam dictionary");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty());
+    let channel = iaam_app::adapters::finam::FinamChannel::new(
+        iaam_broker::finam::FinamClient::new(token, Arc::new(gateway)),
+        SourceId::new_random(),
+        dictionary,
+        Arc::clone(&services.directory),
+    );
+    let operations = channel
+        .fetch_operations(
+            account,
+            "invented-account",
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+            BrokerRequestContext {
+                deadline: None,
+                allowance: &RequestAllowance::new(20),
+            },
+        )
+        .await
+        .expect("Finam describes the security");
+    assert!(
+        operations.quarantined.is_empty(),
+        "{:?}",
+        operations.quarantined
+    );
+    assert_eq!(operations.accepted.len(), 1);
+    services
+        .directory
+        .resolve("isin", "XX0000000001", date!(2026 - 03 - 15))
+        .await
+        .expect("Finam registered ISIN")
+}
+
+struct MissingInstrumentTinvest;
+
+impl Transport for MissingInstrumentTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.body().expect("description body").payload())
+                    .expect("description JSON");
+            if body["id"]
+                .as_str()
+                .expect("UID")
+                .eq_ignore_ascii_case("bbbbbbbb-0000-0000-0000-000000000001")
+            {
+                return Ok(HttpResponse {
+                    status: 404,
+                    body:
+                        br#"{"code":5,"message":"invented broker: instrument UID is unavailable"}"#
+                            .to_vec(),
+                    ..Default::default()
+                });
+            }
+        }
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[
+                {"cursor":"missing","brokerAccountId":"solo","id":"missing-coupon","date":"2026-03-15T10:00:00Z",
+                 "type":"OPERATION_TYPE_COUPON","state":"OPERATION_STATE_EXECUTED",
+                 "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000001",
+                 "payment":{"units":"25","nano":0,"currency":"rub"}},
+                {"cursor":"good","brokerAccountId":"solo","id":"good-coupon","date":"2026-03-15T10:01:00Z",
+                 "type":"OPERATION_TYPE_COUPON","state":"OPERATION_STATE_EXECUTED",
+                 "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000002",
+                 "payment":{"units":"15","nano":0,"currency":"rub"}},
+                {"cursor":"cash","brokerAccountId":"solo","id":"good-deposit","date":"2026-03-15T11:00:00Z",
+                 "type":"OPERATION_TYPE_INPUT","state":"OPERATION_STATE_EXECUTED",
+                 "payment":{"units":"100","nano":0,"currency":"rub"}}
+            ]}"#,
+            portfolio: r#"{"positions":[
+                {"instrumentType":"bond","quantity":{"units":"1","nano":0},
+                 "positionUid":"aaaaaaaa-0000-0000-0000-000000000001",
+                 "instrumentUid":"BBBBBBBB-0000-0000-0000-000000000001","blocked":false},
+                {"instrumentType":"share","quantity":{"units":"1","nano":0},
+                 "positionUid":"aaaaaaaa-0000-0000-0000-000000000002",
+                 "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000002","blocked":false}
+            ]}"#
+            .to_owned(),
+        }
+        .send(request)
+        .await
+    }
+}
+
+#[tokio::test]
+async fn an_instrument_404_holds_only_its_rows_and_keeps_the_brokers_message() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let source = SourceId::new_random();
+    let channel = channel_over_with(MissingInstrumentTinvest, source, &services);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("a missing instrument does not abort other rows");
+    assert_eq!(outcome.set_aside, 2, "{:?}", outcome.recorded);
+    let refusals = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source.inner().to_string(),
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .expect("stored refusals");
+    assert_eq!(refusals.len(), 2);
+    for refusal in &refusals {
+        assert!(
+            refusal
+                .reason
+                .contains("invented broker: instrument UID is unavailable"),
+            "{}",
+            refusal.reason
+        );
+        assert!(
+            refusal
+                .payload
+                .to_lowercase()
+                .contains("bbbbbbbb-0000-0000-0000-000000000001")
+        );
+        assert!(!refusal.payload.contains("good-coupon"));
+        assert!(!refusal.payload.contains("good-deposit"));
+    }
+    let events = load_all(&services, owner).await;
+    for operation in ["good-coupon", "good-deposit"] {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.provenance.source_operation_id() == Some(operation)),
+            "readable operation {operation} was not imported: {events:?}"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.provenance.source_operation_id() == Some("missing-coupon"))
+    );
+    assert_eq!(
+        services
+            .directory
+            .list_instruments()
+            .await
+            .expect("catalogue")
+            .len(),
+        1
+    );
+}
+
+struct CatalogueTinvest {
+    inner: ScriptedTinvest,
+    description: String,
+    descriptions_asked: Arc<AtomicUsize>,
+}
+
+impl Transport for CatalogueTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            self.descriptions_asked.fetch_add(1, Ordering::SeqCst);
+            return Ok(HttpResponse {
+                status: 200,
+                body: self.description.as_bytes().to_vec(),
+                ..Default::default()
+            });
+        }
+        self.inner.send(request).await
+    }
+}
+
+#[tokio::test]
+async fn an_unrecorded_coupon_instrument_is_described_and_recorded_once_across_both_fetches() {
+    coupon_catalogue_sync(true, false).await;
+}
+
+#[tokio::test]
+async fn a_description_without_isin_refuses_the_security_but_records_the_deposit() {
+    coupon_catalogue_sync(false, false).await;
+}
+
+#[tokio::test]
+async fn finam_and_tinkoff_descriptions_of_one_isin_share_one_instrument() {
+    coupon_catalogue_sync(true, true).await;
+}
+
+async fn coupon_catalogue_sync(with_isin: bool, finam_first: bool) {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let finam_instrument = if finam_first {
+        Some(record_finam_description(&services, account).await)
+    } else {
+        None
+    };
+    let source = SourceId::new_random();
+    let uid = "bbbbbbbb-0000-0000-0000-000000000001";
+    let descriptions_asked = Arc::new(AtomicUsize::new(0));
+    let description = serde_json::json!({"instrument": {
+        "isin": if with_isin { "XX0000000001" } else { "" },
+        "ticker":"INVENTEDBOND", "name":"Invented bond", "instrumentType":"bond",
+        "currency":"rub", "classCode":"TQOB", "lot":1
+    }})
+    .to_string();
+    let channel = channel_over_with(
+        CatalogueTinvest {
+            descriptions_asked: Arc::clone(&descriptions_asked),
+            description,
+            inner: ScriptedTinvest {
+                accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+                operations: r#"{"hasNext":false,"items":[
+                {
+                    "cursor":"coupon-cursor", "brokerAccountId":"solo",
+                    "id":"invented-coupon", "date":"2026-03-15T10:00:00Z",
+                    "type":"OPERATION_TYPE_COUPON", "state":"OPERATION_STATE_EXECUTED",
+                    "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000001",
+                    "figi":"BBG_INVENTED_BOND",
+                    "payment":{"units":"25","nano":0,"currency":"rub"}
+                },
+                {
+                    "cursor":"deposit-cursor", "brokerAccountId":"solo",
+                    "id":"invented-deposit", "date":"2026-03-15T11:00:00Z",
+                    "type":"OPERATION_TYPE_INPUT", "state":"OPERATION_STATE_EXECUTED",
+                    "payment":{"units":"100","nano":0,"currency":"rub"}
+                }
+            ]}"#,
+                portfolio: format!(
+                    r#"{{"positions":[{{
+                    "instrumentType":"bond", "quantity":{{"units":"1","nano":0}},
+                    "positionUid":"aaaaaaaa-0000-0000-0000-000000000001",
+                    "instrumentUid":"{portfolio_uid}", "figi":"BBG_INVENTED_BOND", "blocked":false
+                }}]}}"#,
+                    portfolio_uid = uid.to_uppercase()
+                ),
+            },
+        },
+        source,
+        &services,
+    );
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("missing reference data must not abort the sync");
+
+    assert_eq!(descriptions_asked.load(Ordering::SeqCst), 1);
+    let instruments = services
+        .directory
+        .list_instruments()
+        .await
+        .expect("catalogue");
+    let events = load_all(&services, owner).await;
+    let deposits: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::CashIn { amount } => Some(amount),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deposits.len(), 1, "{events:?}");
+    assert_eq!(deposits[0].amount().raw(), 10_000);
+    let refusals = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source.inner().to_string(),
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .expect("stored refusals");
+    if with_isin {
+        assert_eq!(outcome.set_aside, 0, "{:?}", outcome.recorded);
+        assert_eq!(outcome.assertions, 1, "{:?}", outcome.recorded);
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(instruments[0].title, "Invented bond");
+        if let Some(finam_instrument) = finam_instrument {
+            assert_eq!(instruments[0].id, finam_instrument);
+        }
+        let canonical = services
+            .directory
+            .resolve("isin", "XX0000000001", date!(2026 - 03 - 15))
+            .await
+            .expect("registered ISIN");
+        assert_eq!(canonical, instruments[0].id);
+        assert_ne!(canonical.inner().to_string(), uid);
+        assert!(events.iter().any(|event| matches!(event.kind,
+            EventKind::Income { instrument: Some(id), .. } if id == canonical)));
+        assert!(refusals.is_empty(), "{refusals:?}");
+    } else {
+        assert_eq!(outcome.set_aside, 2, "{:?}", outcome.recorded);
+        assert_eq!(outcome.assertions, 0, "{:?}", outcome.recorded);
+        assert!(instruments.is_empty());
+        assert_eq!(refusals.len(), 2);
+        for refusal in &refusals {
+            assert!(
+                refusal.reason.to_lowercase().contains("isin"),
+                "{}",
+                refusal.reason
+            );
+        }
+        assert!(
+            refusals
+                .iter()
+                .any(|refusal| refusal.payload.contains("invented-coupon"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_portfolio_quantity_keeps_the_brokers_uid_after_catalogue_resolution() {
+    refused_portfolio_keeps_original_rows(false).await;
+}
+
+#[tokio::test]
+async fn duplicate_portfolio_positions_keep_both_original_rows_after_catalogue_resolution() {
+    refused_portfolio_keeps_original_rows(true).await;
+}
+
+async fn refused_portfolio_keeps_original_rows(duplicate: bool) {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let uid = "bbbbbbbb-0000-0000-0000-000000000003";
+    let original = serde_json::json!({
+        "instrumentType":"share", "quantity":{"units": if duplicate { "1" } else { "not-a-number" },"nano":0},
+        "positionUid":"aaaaaaaa-0000-0000-0000-000000000003",
+        "instrumentUid":uid, "blocked":false
+    });
+    let mut rows = vec![original.clone()];
+    if duplicate {
+        let mut second = original.clone();
+        second["instrumentUid"] = serde_json::json!(uid.to_uppercase());
+        second["positionUid"] = serde_json::json!("aaaaaaaa-0000-0000-0000-000000000004");
+        second["blocked"] = serde_json::json!(true);
+        rows.push(second);
+    }
+    let channel = channel_over(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio: serde_json::json!({"positions":rows.clone()}).to_string(),
+        },
+        &services,
+    );
+    let snapshot = channel
+        .fetch_portfolio(
+            account,
+            "solo",
+            date!(2026 - 03 - 31),
+            BrokerRequestContext {
+                deadline: None,
+                allowance: &RequestAllowance::new(20),
+            },
+        )
+        .await
+        .expect("portfolio with one refused quantity");
+    let instruments = services
+        .directory
+        .list_instruments()
+        .await
+        .expect("catalogue");
+    assert_eq!(
+        instruments.len(),
+        1,
+        "description was successfully registered"
+    );
+    assert_ne!(instruments[0].id.inner().to_string(), uid);
+    assert!(snapshot.claims.is_empty());
+    assert_eq!(snapshot.refused.len(), 1);
+    let expected = if duplicate {
+        serde_json::json!({"positions": rows})
+    } else {
+        original
+    };
+    assert_eq!(snapshot.refused[0].raw, expected);
+}
+
+#[tokio::test]
+async fn a_full_bond_repayment_persists_principal_and_removes_quantity_only_once() {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::event::leg::LegKind;
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let descriptions_asked = Arc::new(AtomicUsize::new(0));
+    let channel = channel_over(
+        CatalogueTinvest {
+            descriptions_asked: Arc::clone(&descriptions_asked),
+            description: serde_json::json!({"instrument": {
+                "isin":"XX0000000004", "ticker":"INVENTEDBOND",
+                "name":"Invented redeemed bond", "instrumentType":"bond",
+                "currency":"rub", "classCode":"TQOB", "lot":1
+            }})
+            .to_string(),
+            inner: ScriptedTinvest {
+                accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+                operations: r#"{"hasNext":false,"items":[{
+                    "cursor":"redemption-cursor", "brokerAccountId":"solo",
+                    "id":"invented-full-repayment", "date":"2026-03-15T10:00:00Z",
+                    "type":"OPERATION_TYPE_BOND_REPAYMENT_FULL",
+                    "state":"OPERATION_STATE_EXECUTED",
+                    "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000004",
+                    "positionUid":"aaaaaaaa-0000-0000-0000-000000000004",
+                    "quantity":"2", "quantityDone":"2", "quantityRest":"0",
+                    "payment":{"units":"2000","nano":0,"currency":"rub"}
+                }]}"#,
+                portfolio: r#"{"positions":[]}"#.to_owned(),
+            },
+        },
+        &services,
+    );
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("full repayment sync");
+    assert_eq!(first.set_aside, 0, "{:?}", first.recorded);
+    assert_eq!(first.duplicates, 0, "{:?}", first.recorded);
+
+    let instrument = services
+        .directory
+        .resolve("isin", "XX0000000004", date!(2026 - 03 - 15))
+        .await
+        .expect("repayment instrument registered from its description");
+    assert_ne!(
+        instrument.inner().to_string(),
+        "bbbbbbbb-0000-0000-0000-000000000004"
+    );
+    assert_eq!(descriptions_asked.load(Ordering::SeqCst), 1);
+    let events = load_all(&services, owner).await;
+    let redemptions: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::Redemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(redemptions.len(), 1, "{events:?}");
+    let redemption = redemptions[0];
+    let positive_quantity = iaam_core::money::Quantity(Dec::new(rust_decimal::Decimal::from(2)));
+    match &redemption.kind {
+        EventKind::CorporateAction {
+            action:
+                CorporateAction::Redemption {
+                    instrument: actual_instrument,
+                    custody,
+                    quantity,
+                    principal_returned_per_unit,
+                    compensation,
+                    effective_date,
+                    ..
+                },
+        } => {
+            assert_eq!(*actual_instrument, instrument);
+            assert_eq!(*custody, None, "an opaque position UID is not custody");
+            assert_eq!(*quantity, positive_quantity);
+            assert_eq!(
+                principal_returned_per_unit.value(),
+                Dec::new(rust_decimal::Decimal::from(1000))
+            );
+            assert_eq!(principal_returned_per_unit.currency(), CurrencyCode::Rub);
+            assert_eq!(compensation.amount().raw(), 200_000);
+            assert_eq!(compensation.currency(), CurrencyCode::Rub);
+            assert_eq!(*effective_date, date!(2026 - 03 - 15));
+        }
+        other => panic!("expected redemption, got {other:?}"),
+    }
+    assert_eq!(redemption.legs.len(), 2);
+    let principal_leg = redemption
+        .legs
+        .iter()
+        .find(|leg| leg.kind == LegKind::Principal)
+        .expect("returned principal cash leg");
+    assert_eq!(principal_leg.account, account);
+    assert_eq!(principal_leg.instrument, Some(instrument));
+    assert_eq!(
+        principal_leg
+            .cash_effect()
+            .expect("cash inflow")
+            .amount()
+            .raw(),
+        200_000
+    );
+    let security_leg = redemption
+        .legs
+        .iter()
+        .find(|leg| leg.kind == LegKind::SecurityQuantity)
+        .expect("redeemed quantity leg");
+    assert_eq!(security_leg.account, account);
+    assert_eq!(security_leg.instrument, Some(instrument));
+    assert_eq!(security_leg.custody, None);
+    assert_eq!(
+        security_leg.quantity,
+        Some(iaam_core::money::Quantity(Dec::new(
+            rust_decimal::Decimal::from(-2)
+        )))
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::Income { .. } | EventKind::CashIn { .. }
+    )));
+    let redemption_id = redemption.id;
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("repeat full repayment sync");
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+    assert_eq!(second.duplicates, 1, "{:?}", second.recorded);
+    assert!(second.recorded.iter().any(|verdict| matches!(
+        verdict, Verdict::Duplicate { existing } if *existing == redemption_id
+    )));
+    let after = load_all(&services, owner).await;
+    let redemptions_after: Vec<_> = after
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::Redemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(redemptions_after, vec![redemption]);
+}
+
+fn zero_quantity_repayment_channel(services: &AppServices) -> TinkoffChannel {
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").expect("invented bond UID"),
+    );
+    channel_over(
+        CatalogueTinvest {
+            descriptions_asked: Arc::new(AtomicUsize::new(0)),
+            description: serde_json::json!({"instrument": {
+                "isin":invented_isin(instrument), "ticker":"INVENTEDBOND",
+                "name":"Invented redeemed bond", "instrumentType":"bond",
+                "currency":"rub", "classCode":"TQOB", "lot":1
+            }})
+            .to_string(),
+            inner: ScriptedTinvest {
+                accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+                operations: r#"{"hasNext":false,"items":[{
+                    "cursor":"zero-redemption-cursor", "brokerAccountId":"solo",
+                    "id":"invented-zero-full-repayment", "date":"2026-03-15T10:00:00Z",
+                    "type":"OPERATION_TYPE_BOND_REPAYMENT_FULL",
+                    "state":"OPERATION_STATE_EXECUTED",
+                    "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000005",
+                    "positionUid":"aaaaaaaa-0000-0000-0000-000000000005",
+                    "quantity":"0", "quantityDone":"0", "quantityRest":"0",
+                    "payment":{"units":"2000","nano":0,"currency":"rub"}
+                }]}"#,
+                portfolio: r#"{"positions":[]}"#.to_owned(),
+            },
+        },
+        services,
+    )
+}
+
+async fn seed_redemption_history(
+    services: &AppServices,
+    owner: OwnerId,
+    account: AccountId,
+    instrument: InstrumentId,
+    history: &[(Date, i64)],
+) {
+    let source = SourceId::new_random();
+    let events = history
+        .iter()
+        .enumerate()
+        .map(|(index, &(at, quantity))| {
+            let quantity_value = Dec::new(rust_decimal::Decimal::from(quantity.abs()));
+            let mut operation = trade_without_custody(account, instrument);
+            operation.kind = if quantity > 0 {
+                OperationKind::Buy {
+                    instrument,
+                    custody: None,
+                    quantity: quantity_value,
+                    gross_minor: quantity.abs() * 100_000,
+                    fee_minor: None,
+                    basis_fee: None,
+                    accrued_interest_minor: None,
+                    currency: CurrencyCode::Rub,
+                }
+            } else {
+                OperationKind::Sell {
+                    instrument,
+                    custody: None,
+                    quantity: quantity_value,
+                    gross_minor: quantity.abs() * 100_000,
+                    fee_minor: None,
+                    basis_fee: None,
+                    accrued_interest_minor: None,
+                    currency: CurrencyCode::Rub,
+                }
+            };
+            operation.dates = OperationDates {
+                trade: Some(at),
+                settled: Some(at),
+                cash_posted: Some(at),
+                paid: None,
+            };
+            operation.source_operation_id = Some(format!("invented-bond-trade-{index}"));
+            iaam_ingest::normalize(
+                &operation,
+                &iaam_ingest::operation::NormalizationContext {
+                    owner,
+                    source,
+                    parser_version: ParserVersion(PARSER_VERSION.to_owned()),
+                },
+            )
+            .expect("invented bond trade")
+            .event
+        })
+        .collect();
+    services
+        .store
+        .append_events(events, IdentityScope::Source)
+        .await
+        .expect("seed journal position history");
+}
+
+#[tokio::test]
+async fn a_zero_quantity_full_repayment_retires_the_position_at_its_date_only_once() {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::event::leg::LegKind;
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").expect("invented bond UID"),
+    );
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBOND");
+    });
+    seed_redemption_history(
+        &services,
+        owner,
+        account,
+        instrument,
+        &[
+            (date!(2026 - 03 - 01), 3),
+            (date!(2026 - 03 - 10), -1),
+            (date!(2026 - 03 - 20), 5),
+        ],
+    )
+    .await;
+    let channel = zero_quantity_repayment_channel(&services);
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("zero quantity repayment sync");
+    assert_eq!(first.set_aside, 0, "{:?}", first.recorded);
+    let events = load_all(&services, owner).await;
+    let redemptions: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::Redemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(redemptions.len(), 1, "{events:?}");
+    let redemption = redemptions[0];
+    match &redemption.kind {
+        EventKind::CorporateAction {
+            action:
+                CorporateAction::Redemption {
+                    quantity,
+                    compensation,
+                    principal_returned_per_unit,
+                    effective_date,
+                    ..
+                },
+        } => {
+            assert_eq!(quantity.0, Dec::new(rust_decimal::Decimal::from(2)));
+            assert_eq!(compensation.amount().raw(), 200_000);
+            assert_eq!(compensation.currency(), CurrencyCode::Rub);
+            assert_eq!(
+                principal_returned_per_unit.value(),
+                Dec::new(rust_decimal::Decimal::from(1000))
+            );
+            assert_eq!(*effective_date, date!(2026 - 03 - 15));
+        }
+        other => panic!("expected redemption, got {other:?}"),
+    }
+    let security = redemption
+        .legs
+        .iter()
+        .find(|leg| leg.kind == LegKind::SecurityQuantity)
+        .expect("retired position leg");
+    assert_eq!(security.account, account);
+    assert_eq!(security.instrument, Some(instrument));
+    assert_eq!(
+        security.quantity.map(|quantity| quantity.0),
+        Some(Dec::new(rust_decimal::Decimal::from(-2)))
+    );
+    let cash = redemption
+        .legs
+        .iter()
+        .find(|leg| leg.kind == LegKind::Principal)
+        .expect("principal payment leg");
+    assert_eq!(
+        cash.cash_effect().expect("principal inflow").amount().raw(),
+        200_000
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::Income { .. } | EventKind::CashIn { .. }
+    )));
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("repeat zero quantity repayment sync");
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+    assert_eq!(second.duplicates, 1, "{:?}", second.recorded);
+    assert!(second.recorded.iter().any(|verdict| matches!(verdict,
+        Verdict::Duplicate { existing } if *existing == redemption.id
+    )));
+    let after = load_all(&services, owner).await;
+    let redemptions_after: Vec<_> = after
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::Redemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(redemptions_after, vec![redemption]);
+}
+
+#[tokio::test]
+async fn a_zero_quantity_full_repayment_without_journal_history_is_set_aside() {
+    zero_quantity_repayment_without_position(false).await;
+}
+
+#[tokio::test]
+async fn a_future_position_does_not_supply_a_zero_quantity_full_repayment() {
+    zero_quantity_repayment_without_position(true).await;
+}
+
+async fn zero_quantity_repayment_without_position(future_position: bool) {
+    use iaam_core::event::corporate_action::CorporateAction;
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").expect("invented bond UID"),
+    );
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBOND");
+    });
+    if future_position {
+        seed_redemption_history(
+            &services,
+            owner,
+            account,
+            instrument,
+            &[(date!(2026 - 03 - 20), 5)],
+        )
+        .await;
+    }
+    let channel = zero_quantity_repayment_channel(&services);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("unproven repayment sync");
+    assert_eq!(outcome.set_aside, 1, "{:?}", outcome.recorded);
+    assert!(outcome.recorded.iter().any(|verdict| matches!(verdict,
+        Verdict::Quarantined { reason }
+            if reason.to_lowercase().contains("journal") && reason.to_lowercase().contains("position")
+    )), "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.kind,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption { .. }
+            } | EventKind::Income { .. }
+                | EventKind::CashIn { .. }
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_fractional_unit_price_is_multiplied_before_the_journal_gross_is_posted() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000002")
+            .expect("invented instrument UID"),
+    );
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDSHARE");
+    });
+    let channel = channel_over(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[{
+                "cursor":"trade-cursor", "brokerAccountId":"solo",
+                "id":"invented-priced-buy", "date":"2026-03-15T10:00:00Z",
+                "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+                "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000002",
+                "positionUid":"aaaaaaaa-0000-0000-0000-000000000002",
+                "quantity":"2", "quantityDone":"2", "quantityRest":"0",
+                "price":{"units":"98","nano":765000000,"currency":"rub"},
+                "payment":{"units":"-197","nano":-530000000,"currency":"rub"},
+                "tradesInfo":{"trades":[{
+                    "num":"invented-execution", "date":"2026-03-15T10:00:00Z",
+                    "quantity":"2",
+                    "price":{"units":"98","nano":765000000,"currency":"rub"}
+                }]}
+            }]}"#,
+            portfolio: r#"{"positions":[]}"#.to_owned(),
+        },
+        &services,
+    );
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("priced trade sync");
+    assert_eq!(outcome.set_aside, 0, "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    let trades: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Trade {
+                instrument,
+                quantity,
+                gross,
+                ..
+            } => Some((instrument, quantity, gross)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(trades.len(), 1, "{events:?}");
+    assert_eq!(*trades[0].0, instrument);
+    assert_eq!(
+        *trades[0].1,
+        iaam_core::money::Quantity(Dec::new(rust_decimal::Decimal::from(2)))
+    );
+    assert_eq!(trades[0].2.amount().raw(), 19_753);
+    let trade = events
+        .iter()
+        .find(|event| matches!(event.kind, EventKind::Trade { .. }))
+        .expect("trade");
+    let cash = trade
+        .legs
+        .iter()
+        .find(|leg| leg.kind == iaam_core::event::leg::LegKind::Cash)
+        .expect("cash leg");
+    assert_eq!(cash.money.expect("posted cash").amount().raw(), -19_753);
+}
+
 #[tokio::test]
 async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
     let owner = OwnerId::new_random();
@@ -2222,7 +3451,9 @@ async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
         trade_without_custody(account, instrument),
     );
     broker.operations = Ok(ParsedOperations {
-        accepted: broker
+        journal: Vec::new(),
+            pending_redemptions: Vec::new(),
+            accepted: broker
             .operations
             .as_ref()
             .expect("operations")
@@ -2518,6 +3749,8 @@ async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {
 /// An empty sync source: no operations, and a portfolio with nothing in it.
 fn empty_operations() -> ParsedOperations {
     ParsedOperations {
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: Vec::new(),
         quarantined: Vec::new(),
     }
@@ -3138,7 +4371,12 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    let channel = TinkoffChannel::new(client, SourceId::new_random(), dictionary);
+    let channel = TinkoffChannel::new(
+        client,
+        SourceId::new_random(),
+        dictionary,
+        Arc::clone(&services.directory),
+    );
     let before = load_all(&services, owner).await;
     let started = tokio::time::Instant::now();
 
@@ -3200,14 +4438,18 @@ impl Transport for ThrottlingTinvest {
     }
 }
 
-fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
-    channel_over_with(transport, SourceId::new_random())
+fn channel_over<T: Transport + 'static>(transport: T, services: &AppServices) -> TinkoffChannel {
+    channel_over_with(transport, SourceId::new_random(), services)
 }
 
 /// The same channel over a source the caller chooses: two syncs that must
 /// speak for one channel identity — so the second can settle the first's
 /// refusals — build both channels with one `SourceId`.
-fn channel_over_with<T: Transport + 'static>(transport: T, source: SourceId) -> TinkoffChannel {
+fn channel_over_with<T: Transport + 'static>(
+    transport: T,
+    source: SourceId,
+    services: &AppServices,
+) -> TinkoffChannel {
     // The gateway's wall clock dates live answers and cache stamps, and the
     // channel turns the moment into the portfolio's observation date. The
     // tests this helper serves request 2026-03-31 intervals with same-day
@@ -3234,7 +4476,7 @@ fn channel_over_with<T: Transport + 'static>(transport: T, source: SourceId) -> 
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    TinkoffChannel::new(client, source, dictionary)
+    TinkoffChannel::new(client, source, dictionary, Arc::clone(&services.directory))
 }
 
 #[tokio::test]
@@ -3244,9 +4486,12 @@ async fn a_broker_that_stays_throttled_is_unreachable_for_the_minimum_pause() {
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
     });
-    let channel = channel_over(ThrottlingTinvest {
-        wait: Duration::from_secs(7),
-    });
+    let channel = channel_over(
+        ThrottlingTinvest {
+            wait: Duration::from_secs(7),
+        },
+        &services,
+    );
 
     let refused = sync_broker(
         &services,
@@ -3799,6 +5044,16 @@ struct CachedPortfolioTinvest {
 
 impl Transport for CachedPortfolioTinvest {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            return Ok(HttpResponse {
+                status: 200,
+                body: invented_description(request).into_bytes(),
+                ..Default::default()
+            });
+        }
         if request.path().ends_with("/GetOperationsByCursor") {
             return Ok(HttpResponse {
                 status: 200,
@@ -3831,6 +5086,7 @@ fn tinkoff_channel_with_time<T: Transport + 'static>(
     transport: T,
     source: SourceId,
     time: Arc<WallTime>,
+    services: &AppServices,
 ) -> TinkoffChannel {
     let database = broker_egress_database();
     let gateway = Gateway::with_parts_for_database_with_response_cache(
@@ -3848,7 +5104,7 @@ fn tinkoff_channel_with_time<T: Transport + 'static>(
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    TinkoffChannel::new(client, source, dictionary)
+    TinkoffChannel::new(client, source, dictionary, Arc::clone(&services.directory))
 }
 
 /// A portfolio fetched on day D and served from the response cache on day
@@ -3880,7 +5136,8 @@ async fn a_cached_portfolio_keeps_the_day_it_was_answered_and_withholds_on_the_n
         ),
         portfolio_asked: Arc::clone(&portfolio_asked),
     };
-    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+    let channel =
+        tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time), &day_d);
 
     // Day D, half past eleven at night: the live read is dated 23:20 UTC
     // and stored in the cache. The sync asked [D, D], and the answer
@@ -3963,7 +5220,8 @@ async fn a_same_day_served_cached_portfolio_still_records_its_claims() {
         ),
         portfolio_asked: Arc::clone(&portfolio_asked),
     };
-    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+    let channel =
+        tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time), &first);
 
     // Day E at ten in the morning: the live read populates the cache.
     let first_sync = sync_broker(
@@ -4006,4 +5264,367 @@ async fn a_same_day_served_cached_portfolio_still_records_its_claims() {
             .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
         "a same-day portfolio is still recorded as a claim"
     );
+}
+
+struct AccountingPagesTinvest {
+    pages: Vec<String>,
+    asked: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl Transport for AccountingPagesTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            return Ok(HttpResponse {
+                status: 200,
+                body: invented_description(request).into_bytes(),
+                ..Default::default()
+            });
+        }
+        assert!(request.path().ends_with("/GetOperationsByCursor"));
+        let body: serde_json::Value =
+            serde_json::from_str(request.body().expect("operations request body").payload())
+                .expect("operations request JSON");
+        let mut asked = self.asked.lock().expect("requested cursors");
+        let page = self
+            .pages
+            .get(asked.len())
+            .expect("only two pages requested");
+        asked.push(body["cursor"].as_str().map(str::to_owned));
+        Ok(HttpResponse {
+            status: 200,
+            body: page.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct AccountingLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for AccountingLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("accounting log buffer")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn distinct_t_invest_fee_and_fill_keys_are_not_possible_duplicates_and_resync_is_duplicate() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "DISTINCTFILLS");
+    });
+    let fee = |id: &str| {
+        serde_json::json!({
+            "id": id, "cursor": id, "brokerAccountId": "invented-account",
+            "date": "2026-03-15T10:00:00Z", "type": "OPERATION_TYPE_BROKER_FEE",
+            "state": "OPERATION_STATE_EXECUTED", "quantityDone": "0",
+            "payment": {"units":"-9876543", "nano":0, "currency":"rub"}
+        })
+    };
+    let trade = serde_json::json!({
+        "id":"two-identical-fills", "cursor":"two-identical-fills",
+        "brokerAccountId":"invented-account", "date":"2026-03-15T10:00:00Z",
+        "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+        "instrumentUid":instrument.inner().to_string(), "positionUid":"invented-position",
+        "quantityDone":"2",
+        "payment":{"units":"-2469134", "nano":0, "currency":"rub"},
+        "tradesInfo":{"trades":[
+            {"num":"distinct-fill-one", "date":"2026-03-15T10:00:00Z", "quantity":"1",
+             "price":{"units":"1234567", "nano":0, "currency":"rub"}},
+            {"num":"distinct-fill-two", "date":"2026-03-15T10:00:00Z", "quantity":"1",
+             "price":{"units":"1234567", "nano":0, "currency":"rub"}}
+        ]}
+    });
+    let channel = channel_over(
+        CachedPortfolioTinvest {
+            operations: serde_json::json!({"hasNext":false,
+                "items":[fee("distinct-fee-one"), fee("distinct-fee-two"), trade]})
+            .to_string(),
+            portfolio: r#"{"positions":[]}"#.to_owned(),
+            portfolio_asked: Arc::new(AtomicUsize::new(0)),
+        },
+        &services,
+    );
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("sync invented single page");
+    // Equal economic details do not imply the same fact: within this channel,
+    // distinct authoritative operation/fill keys identify distinct executions.
+    assert_eq!(first.recorded.len(), 4, "{:?}", first.recorded);
+    assert_eq!(first.possible_duplicates, 0, "{:?}", first.recorded);
+    assert_eq!(first.duplicates, 0);
+    assert!(
+        first
+            .recorded
+            .iter()
+            .all(|verdict| matches!(verdict, Verdict::Provisional { .. }))
+    );
+    let events = load(&services, owner).await;
+    assert_eq!(events.len(), 4);
+    let keys = events
+        .iter()
+        .map(|event| {
+            event
+                .provenance
+                .source_operation_id()
+                .expect("each fee and fill has a source key")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys.len(),
+        4,
+        "operation and fill keys must remain distinct"
+    );
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("resync same invented keys");
+    assert_eq!(second.duplicates, 4, "{:?}", second.recorded);
+    assert_eq!(second.possible_duplicates, 0);
+    assert!(
+        second
+            .recorded
+            .iter()
+            .all(|verdict| matches!(verdict, Verdict::Duplicate { .. }))
+    );
+    assert_eq!(load(&services, owner).await.len(), 4);
+
+    let logs = String::from_utf8(captured.0.lock().expect("verdict log buffer").clone())
+        .expect("UTF-8 logs");
+    assert!(!logs.contains("verdict=\"possible_duplicate\""), "{logs}");
+    let distinct_keys = logs
+        .lines()
+        .filter(|line| {
+            line.contains("DEBUG")
+                && line.contains("verdict=\"fresh\"")
+                && line.contains("rule=\"distinct_source_keys_within_channel\"")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(distinct_keys.len(), 2, "second fee and second fill: {logs}");
+    let key_matches = logs
+        .lines()
+        .filter(|line| {
+            line.contains("DEBUG")
+                && line.contains("verdict=\"duplicate\"")
+                && line.contains("rule=\"key_match\"")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(key_matches.len(), 4, "every resynced key: {logs}");
+    for amount in ["987654300", "123456700", "246913400"] {
+        assert!(!logs.contains(amount), "amount value leaked: {logs}");
+    }
+}
+
+#[tokio::test]
+async fn operation_pages_account_for_source_rows_without_counting_trade_fills_as_rows() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_instrument(store, instrument, "ACCOUNTING");
+    });
+    let row = |id: &str, kind: &str, state: &str| {
+        serde_json::json!({
+            "id": id, "cursor": id, "brokerAccountId": "invented-account",
+            "date": "2026-03-15T10:00:00Z", "type": kind, "state": state,
+            "quantityDone": "0"
+        })
+    };
+    let no_buy = row(
+        "no-buy-fills",
+        "OPERATION_TYPE_BUY",
+        "OPERATION_STATE_PROGRESS",
+    );
+    let no_sell = row(
+        "no-sell-fills",
+        "OPERATION_TYPE_SELL",
+        "OPERATION_STATE_CANCELED",
+    );
+    let mut deposit = row(
+        "deposit",
+        "OPERATION_TYPE_INPUT",
+        "OPERATION_STATE_EXECUTED",
+    );
+    deposit["payment"] = serde_json::json!({"units":"10", "nano":0, "currency":"rub"});
+    let mut cancelled = deposit.clone();
+    cancelled["id"] = "cancelled-deposit".into();
+    cancelled["state"] = "OPERATION_STATE_CANCELED".into();
+    let mut malformed = deposit.clone();
+    malformed["id"] = "sub-minor-payment".into();
+    malformed["payment"]["nano"] = 1.into();
+    let mut trade = row(
+        "two-fills",
+        "OPERATION_TYPE_BUY",
+        "OPERATION_STATE_EXECUTED",
+    );
+    trade["instrumentUid"] = instrument.inner().to_string().into();
+    trade["positionUid"] = "invented-position".into();
+    trade["quantityDone"] = "2".into();
+    trade["payment"] = serde_json::json!({"units":"-20", "nano":0, "currency":"rub"});
+    trade["tradesInfo"] = serde_json::json!({"trades":[
+        {"num":"fill-one", "date":"2026-03-15T10:00:00Z", "quantity":"1",
+         "price":{"units":"10", "nano":0, "currency":"rub"}},
+        {"num":"fill-two", "date":"2026-03-15T10:01:00Z", "quantity":"1",
+         "price":{"units":"10", "nano":0, "currency":"rub"}}
+    ]});
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let channel = channel_over(
+        AccountingPagesTinvest {
+            pages: vec![
+                serde_json::json!({"hasNext":true, "nextCursor":"page-two",
+                "items":[no_buy, deposit, cancelled]})
+                .to_string(),
+                serde_json::json!({"hasNext":false, "items":[no_sell, malformed, trade]})
+                    .to_string(),
+            ],
+            asked: Arc::clone(&asked),
+        },
+        &services,
+    );
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let result = channel
+        .fetch_operations(
+            account,
+            "invented-account",
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+            BrokerRequestContext {
+                deadline: None,
+                allowance: &RequestAllowance::new(20),
+            },
+        )
+        .await
+        .expect("read both invented operation pages");
+    assert_eq!(
+        *asked.lock().expect("requested cursors"),
+        vec![None, Some("page-two".to_owned())]
+    );
+    assert_eq!(result.accepted.len(), 3, "deposit and two execution fills");
+    assert!(result.journal.is_empty());
+    assert!(result.pending_redemptions.is_empty());
+    assert_eq!(result.quarantined.len(), 2);
+    assert!(
+        result
+            .quarantined
+            .iter()
+            .any(|row| row.raw["id"] == "cancelled-deposit")
+    );
+    assert!(
+        result
+            .quarantined
+            .iter()
+            .any(|row| row.raw["id"] == "sub-minor-payment")
+    );
+    let logs = String::from_utf8(captured.0.lock().expect("accounting log buffer").clone())
+        .expect("UTF-8 logs");
+    // The source-row equation is 6 = 2 accepted + 2 quarantined + 2 reduced.
+    // Three emitted operations must not be substituted for the two accepted rows.
+    let summary = logs
+        .lines()
+        .find(|line| {
+            line.contains("phase=\"fetch_operations\"") && line.contains("status=\"complete\"")
+        })
+        .unwrap_or_else(|| panic!("missing source-row summary: {logs}"));
+    for field in [
+        "received=6",
+        "source_rows_accepted=2",
+        "quarantined=2",
+        "reduced_no_execution_trades=2",
+        "emitted_operations=3",
+        "quarantined_parse=1",
+        "quarantined_order_state=1",
+        "quarantined_instrument_resolution=0",
+        "quarantined_securities_transfer=0",
+        "quarantined_trade=0",
+        "quarantined_conversion=0",
+    ] {
+        assert!(summary.contains(field), "missing {field}: {summary}");
+    }
+    let pages = logs
+        .lines()
+        .find(|line| {
+            line.contains("phase=\"fetch_operation_pages\"") && line.contains("status=\"complete\"")
+        })
+        .unwrap_or_else(|| panic!("missing page summary: {logs}"));
+    assert!(pages.contains("pages_fetched=2"), "{pages}");
+    assert!(pages.contains("received=6"), "{pages}");
+    let page_logs = logs
+        .lines()
+        .filter(|line| line.contains("DEBUG") && line.contains("phase=\"fetch_operation_pages\""))
+        .collect::<Vec<_>>();
+    assert_eq!(page_logs.len(), 2, "{logs}");
+    for (index, line) in page_logs.iter().enumerate() {
+        assert!(line.contains(&format!("page={}", index + 1)), "{line}");
+        assert!(line.contains("received=3"), "{line}");
+    }
+    for (id, kind) in [
+        ("no-buy-fills", "OPERATION_TYPE_BUY"),
+        ("no-sell-fills", "OPERATION_TYPE_SELL"),
+    ] {
+        let line = logs
+            .lines()
+            .find(|line| {
+                line.contains("DEBUG") && line.contains(id) && line.contains("no_execution_trades")
+            })
+            .unwrap_or_else(|| panic!("missing reduction diagnostic for {id}: {logs}"));
+        assert!(line.contains(kind), "missing source operation type: {line}");
+    }
+    for (id, reason) in [
+        ("sub-minor-payment", "parse"),
+        ("cancelled-deposit", "order_state"),
+    ] {
+        let line = logs
+            .lines()
+            .find(|line| line.contains("DEBUG") && line.contains(&format!("operation_id=\"{id}\"")))
+            .unwrap_or_else(|| panic!("missing quarantine diagnostic for {id}: {logs}"));
+        assert!(
+            line.contains("source_kind=\"OPERATION_TYPE_INPUT\""),
+            "{line}"
+        );
+        assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
+    }
 }

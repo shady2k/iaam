@@ -2305,6 +2305,7 @@ pub(crate) mod fake {
         pub(crate) status: u16,
         pub(crate) body: String,
         pub(crate) reset: Option<Duration>,
+        pub(crate) remaining: Option<u64>,
     }
 
     impl Answer {
@@ -2313,6 +2314,7 @@ pub(crate) mod fake {
                 status,
                 body: body.to_owned(),
                 reset: None,
+                remaining: None,
             }
         }
     }
@@ -2356,6 +2358,8 @@ pub(crate) mod fake {
             Ok(HttpResponse {
                 status: answer.status,
                 body: answer.body.as_bytes().to_vec(),
+                rate_remaining: answer.remaining,
+                rate_reset: answer.reset.map(|reset| reset.as_secs()),
                 retry_after: answer
                     .reset
                     .filter(|_| request.reset_header() == Some("x-ratelimit-reset")),
@@ -2791,8 +2795,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn position_refusal_diagnostics_cancel_a_local_mutex_wait_at_the_sync_deadline() {
-        let (gateway, requests, _) = fake::gateway(Vec::new(), None);
+        let (gateway, requests, _) = fake::gateway(vec![Answer::status(200, "{}")], None);
         let channel = channel(gateway);
+        // A normal sync has already made required calls before diagnostics.
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
         let writer = InstrumentLog::default();
         let captured = writer.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2825,10 +2841,58 @@ mod tests {
             elapsed <= bound + std::time::Duration::from_millis(1),
             "diagnostic outlived its deadline: {elapsed:?}"
         );
-        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 1);
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("phase=\"position_refusal_history\""), "{log}");
         assert!(log.contains("status=\"deadline_elapsed\""), "{log}");
+    }
+
+    #[tokio::test]
+    async fn position_refusal_diagnostics_skip_low_remaining_without_report_requests() {
+        let (gateway, requests, _) = fake::gateway(
+            vec![Answer {
+                status: 200,
+                body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
+                reset: Some(Duration::from_secs(30)),
+                remaining: Some(5),
+            }],
+            None,
+        );
+        let channel = channel(gateway);
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        channel
+            .trace_instrument_history(
+                &[InstrumentId::new_random()],
+                "invented",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+            )
+            .await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("low_rate_capacity_or_host_pause"), "{log}");
     }
 
     #[tokio::test]
@@ -2840,6 +2904,7 @@ mod tests {
         ], "itemsCount":2,"pagesCount":1,"page":0}});
         let (gateway, requests, _) = fake::gateway(
             vec![
+                Answer::status(200, "{}"),
                 Answer::status(
                     200,
                     r#"{"generateBrokerReportResponse":{"taskId":"diagnostic-task"}}"#,
@@ -2849,6 +2914,18 @@ mod tests {
             None,
         );
         let channel = channel(gateway);
+        // A normal sync has already made required calls before diagnostics.
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
         let writer = InstrumentLog::default();
         let captured = writer.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2859,7 +2936,7 @@ mod tests {
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
         let mut operation = report_operation();
-        operation.raw = serde_json::json!({"id":"source-proof", "figi":"FIGI1", "description":"invented-history", "payment":{"units":"-1","nano":0}, "brokerAccountId":"hidden-account"});
+        operation.raw = serde_json::json!({"id":"source-proof", "date":"2026-08-20T10:00:00Z", "figi":"FIGI1", "description":"invented-history", "payment":{"units":"-1","nano":0}, "brokerAccountId":"hidden-account"});
         let mut rows = super::diagnostics::capture(&[operation]);
         rows[0].instrument = Some(affected);
         *channel.diagnostic_operations.lock().await = rows;
@@ -2868,13 +2945,30 @@ mod tests {
                 &[affected],
                 "account",
                 (
-                    time::macros::date!(2026 - 08 - 01),
-                    time::macros::date!(2026 - 08 - 31),
+                    time::macros::date!(2015 - 01 - 01),
+                    time::macros::date!(2026 - 11 - 12),
                 ),
                 broker_context(None),
             )
             .await;
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        let request: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        let period = &request["generateBrokerReportRequest"];
+        let from = time::OffsetDateTime::parse(
+            period["from"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let to = time::OffsetDateTime::parse(
+            period["to"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(to - from <= time::Duration::days(31));
+        assert!(from.date() <= time::macros::date!(2026 - 08 - 20));
+        assert!(to.date() >= time::macros::date!(2026 - 08 - 20));
+        drop(sent);
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("invented-history"));
         assert!(log.contains("FIGI1"));
@@ -5542,6 +5636,7 @@ mod tests {
                     status: 429,
                     body: "{}".to_owned(),
                     reset: Some(Duration::from_secs(7)),
+                    remaining: None,
                 },
                 Answer::status(200, &page_json(false, None, Some("operation-1"))),
             ],
@@ -5646,6 +5741,7 @@ mod tests {
                     status: 429,
                     body: "{}".to_owned(),
                     reset: Some(Duration::from_secs(60)),
+                    remaining: None,
                 },
             ],
             None,

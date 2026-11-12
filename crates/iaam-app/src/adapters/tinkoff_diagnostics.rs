@@ -188,13 +188,38 @@ impl TinkoffChannel {
         (from, to): (Date, Date),
         context: BrokerRequestContext<'_>,
     ) {
+        if !self.client.diagnostic_report_allowed().await {
+            tracing::debug!(
+                phase = "position_refusal_history",
+                status = "skipped",
+                reason = "low_rate_capacity_or_host_pause",
+                "instrument diagnostic skipped to preserve broker capacity"
+            );
+            return;
+        }
         let rows = self.diagnostic_operations.lock().await;
         let selected = related_rows(&rows, instruments);
         let mut figis = HashSet::new();
         let mut tickers = HashSet::new();
+        let mut operation_dates = Vec::new();
         let mut selected_instruments: HashSet<_> = instruments.iter().copied().collect();
         for index in selected {
             let row = &rows[index];
+            if let Some(date) = row
+                .fields
+                .get("date")
+                .and_then(Value::as_str)
+                .and_then(|date| {
+                    time::OffsetDateTime::parse(
+                        date,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .ok()
+                    .map(|date| date.date())
+                })
+            {
+                operation_dates.push(date);
+            }
             selected_instruments.extend(row.instrument);
             if let Some(figi) = row
                 .fields
@@ -253,42 +278,54 @@ impl TinkoffChannel {
                 ),
             }
         }
-        match self
-            .read_settlement_report(account, from, to, context)
-            .await
-        {
-            Ok(report) => {
-                let matching: Vec<_> = report
-                    .iter()
-                    .filter(|row| report_matches(row, &figis, &tickers))
-                    .collect();
-                tracing::debug!(
-                    phase = "position_refusal_report",
-                    received_rows = report.len(),
-                    matching_rows = matching.len(),
-                    "broker report diagnostic selection"
-                );
-                for row in matching {
-                    let ticker = row.get("ticker").and_then(Value::as_str);
-                    // The published BrokerReport has direction, not operation name,
-                    // and no ISIN. Keep catalogue enrichment explicitly separate.
-                    tracing::debug!(phase = "position_refusal_report", figi = ?row.get("figi"), security_code = ticker, catalogue_isins = ?ticker.and_then(|ticker| catalogue_isins.get(ticker)), isin_source = "catalogue", asset_name = ?row.get("name"), direction = ?row.get("direction"), quantity = ?row.get("quantity"), trade_datetime = ?row.get("tradeDatetime"), "broker report row for affected instrument");
+        let windows = report::report_windows(&operation_dates, from, to);
+        if windows.is_empty() {
+            tracing::debug!(
+                phase = "position_refusal_report",
+                status = "skipped",
+                reason = "no_affected_operation_date",
+                "broker report diagnostic skipped"
+            );
+        }
+        for (from, to) in windows {
+            match self
+                .read_diagnostic_report(account, from, to, context)
+                .await
+            {
+                Ok(report) => {
+                    let matching: Vec<_> = report
+                        .iter()
+                        .filter(|row| report_matches(row, &figis, &tickers))
+                        .collect();
+                    tracing::debug!(
+                        phase = "position_refusal_report",
+                        received_rows = report.len(),
+                        matching_rows = matching.len(),
+                        "broker report diagnostic selection"
+                    );
+                    for row in matching {
+                        let ticker = row.get("ticker").and_then(Value::as_str);
+                        // The published BrokerReport has direction, not operation name,
+                        // and no ISIN. Keep catalogue enrichment explicitly separate.
+                        tracing::debug!(phase = "position_refusal_report", figi = ?row.get("figi"), security_code = ticker, catalogue_isins = ?ticker.and_then(|ticker| catalogue_isins.get(ticker)), isin_source = "catalogue", asset_name = ?row.get("name"), direction = ?row.get("direction"), quantity = ?row.get("quantity"), trade_datetime = ?row.get("tradeDatetime"), "broker report row for affected instrument");
+                    }
                 }
-            }
-            Err(_) => {
-                tracing::debug!(
-                    phase = "position_refusal_report",
-                    failure = "report_unavailable",
-                    account,
-                    from = %from,
-                    to = %to,
-                    "broker report diagnostic request unavailable"
-                );
-                tracing::warn!(
-                    phase = "position_refusal_report",
-                    failure = "report_unavailable",
-                    "broker report diagnostic unavailable; refusal unchanged"
-                );
+                Err(_) => {
+                    tracing::debug!(
+                        phase = "position_refusal_report",
+                        failure = "report_unavailable",
+                        account,
+                        from = %from,
+                        to = %to,
+                        "broker report diagnostic request unavailable"
+                    );
+                    tracing::warn!(
+                        phase = "position_refusal_report",
+                        failure = "report_unavailable",
+                        "broker report diagnostic unavailable; refusal unchanged"
+                    );
+                    break;
+                }
             }
         }
     }

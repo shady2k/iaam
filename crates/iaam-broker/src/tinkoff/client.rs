@@ -179,6 +179,17 @@ impl TinkoffClient {
         }
     }
 
+    /// Optional report diagnostics stop before known low capacity or a host
+    /// pause. Required settlement reads still use the ordinary gateway path.
+    pub async fn diagnostic_report_allowed(&self) -> bool {
+        self.gateway
+            .diagnostic_allowed(
+                destination_for(self.environment),
+                "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport",
+            )
+            .await
+    }
+
     /// Return the raw response body from `UsersService/GetAccounts`.
     pub async fn get_accounts(&self, allowance: &RequestAllowance) -> Result<String, TinkoffError> {
         self.post(ACCOUNTS, json!({}), None, allowance)

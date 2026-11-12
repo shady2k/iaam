@@ -1193,6 +1193,25 @@ fn adapt_operations_with_currencies(
             });
             continue;
         }
+        if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell)
+            && operation.trades.is_empty()
+            && (currency_description.is_none()
+                || (operation.quantity_done == iaam_core::money::Quantity::zero()
+                    && matches!(
+                        operation.state,
+                        ChannelOrderState::Cancelled | ChannelOrderState::InProgress
+                    )))
+        {
+            accounting.reduced_no_execution_trades += 1;
+            tracing::debug!(
+                phase = "map_operations",
+                operation_id,
+                source_kind,
+                reason = "no_execution_trades",
+                "T-Invest operation reduced"
+            );
+            continue;
+        }
         if matches!(kind, ChannelOperationKind::BondRedemption) {
             if operation
                 .quantity
@@ -1249,19 +1268,7 @@ fn adapt_operations_with_currencies(
             match trade_operations(account, operation, kind)
                 .map_err(|error| error.with_dimensions(dimensions))
             {
-                Ok(operations) => {
-                    if operations.is_empty() {
-                        accounting.reduced_no_execution_trades += 1;
-                        tracing::debug!(
-                            phase = "map_operations",
-                            operation_id,
-                            source_kind,
-                            reason = "no_execution_trades",
-                            "T-Invest operation reduced"
-                        );
-                    }
-                    accepted.extend(operations);
-                }
+                Ok(operations) => accepted.extend(operations),
                 Err(RowRefusal::Row { reason, dimensions }) => {
                     trace_quarantined_operation(&operation_id, &source_kind, "conversion");
                     quarantined.push(Quarantined {
@@ -3666,6 +3673,58 @@ mod tests {
 
         assert!(parsed.accepted.is_empty());
         assert!(parsed.quarantined.is_empty());
+    }
+
+    #[test]
+    fn cancelled_currency_and_security_buys_share_no_execution_accounting() {
+        use super::adapt_operations_with_currencies;
+        use std::collections::HashMap;
+        for is_currency in [false, true] {
+            let body = serde_json::json!({"hasNext": false, "items": [{
+                "cursor": "invented-cancelled-cursor",
+                "brokerAccountId": "invented-account",
+                "id": "invented-cancelled-buy",
+                "date": "2026-08-20T10:11:12Z",
+                "type": "OPERATION_TYPE_BUY",
+                "state": "OPERATION_STATE_CANCELED",
+                "instrumentType": if is_currency { "currency" } else { "share" },
+                "instrumentUid": "aaaaaaaa-0000-0000-0000-000000000001",
+                "quantity": "2",
+                "quantityDone": "0",
+                "payment": {"units": "100", "nano": 0, "currency": "rub"},
+                "tradesInfo": {"trades": []}
+            }]});
+            let operations = parse_operations(&body.to_string()).expect("parse invented buy");
+            let mut currency_rows = HashMap::new();
+            if is_currency {
+                let description = serde_json::json!({"instrument": {
+                    "isoCurrencyName": "usd", "currency": "rub", "lot": 1,
+                    "nominal": {"currency": "usd", "units": "1", "nano": 0}
+                }});
+                currency_rows.insert(
+                    operations[0].deduplication_key.clone(),
+                    iaam_broker::tinkoff::parse::parse_currency_description(
+                        &description.to_string(),
+                    )
+                    .expect("parse invented currency description"),
+                );
+            }
+            let (parsed, accounting) = adapt_operations_with_currencies(
+                trading_account(),
+                operations,
+                &dictionary(),
+                &currency_rows,
+            )
+            .expect("adapt cancelled buy");
+
+            assert!(parsed.accepted.is_empty());
+            assert!(parsed.journal.is_empty());
+            assert!(parsed.pending_redemptions.is_empty());
+            assert!(parsed.quarantined.is_empty());
+            assert_eq!(accounting.reduced_no_execution_trades, 1);
+            assert_eq!(accounting.source_rows_accepted, 0);
+            assert_eq!(accounting.quarantined_conversion, 0);
+        }
     }
 
     #[test]

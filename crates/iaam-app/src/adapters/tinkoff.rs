@@ -53,6 +53,12 @@ mod fund_redemption;
 #[path = "tinkoff_questions_timestamps.rs"]
 mod questions_timestamps;
 
+#[path = "tinkoff_questions_commission.rs"]
+mod questions_commission;
+
+#[path = "tinkoff_questions_reports.rs"]
+mod questions_reports;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
@@ -612,6 +618,7 @@ impl BrokerChannel for TinkoffChannel {
         let mut diagnostic_operations = diagnostics::capture(&operations);
         self.resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;
+        let question_operations = operations.clone();
         let received = operations.len();
         tracing::info!(
             phase = "resolve_instruments",
@@ -776,6 +783,8 @@ impl BrokerChannel for TinkoffChannel {
                 parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
             "T-Invest operations accounted"
         );
+        self.trace_question_reports(&question_operations, broker_account, from, to, context)
+            .await;
         Ok(parsed)
     }
 
@@ -3461,6 +3470,60 @@ mod tests {
                     "currency must not use FindInstrument"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn question_reports_yield_to_low_shared_allowance_and_elapsed_deadline() {
+        for expired in [false, true] {
+            let (gateway, requests, _) = fake::gateway(vec![], None);
+            let channel = channel(gateway);
+            let body = serde_json::json!({"hasNext":false,"items":[{
+                "id":"invented-zone-fill", "date":"2026-08-01T21:30:00Z",
+                "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+                "commission":{"units":"1","nano":0,"currency":"rub"},
+                "tradesInfo":{"trades":[{"num":"invented-fill","quantity":"1",
+                    "date":"2026-08-01T21:30:00Z", "price":{"units":"1","nano":0,"currency":"rub"}},
+                    {"num":"invented-fill-2","quantity":"1", "date":"2026-08-01T21:31:00Z",
+                    "price":{"units":"2","nano":0,"currency":"rub"}}]}
+            }]})
+            .to_string();
+            let operations = iaam_broker::tinkoff::parse_operations(&body)
+                .unwrap()
+                .operations;
+            let allowance = iaam_http::RequestAllowance::new(if expired { 50 } else { 5 });
+            let writer = InstrumentLog::default();
+            let captured = writer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _subscriber = tracing::subscriber::set_default(subscriber);
+            channel
+                .trace_question_reports(
+                    &operations,
+                    "invented-account",
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 02),
+                    BrokerRequestContext {
+                        deadline: expired.then(|| tokio::time::Instant::now().into_std()),
+                        allowance: &allowance,
+                    },
+                )
+                .await;
+            assert!(requests.lock().unwrap().is_empty());
+            let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(log.contains("T-Invest question report skipped"), "{log}");
+            assert!(
+                log.contains(if expired {
+                    "sync_deadline_near_or_elapsed"
+                } else {
+                    "low_rate_capacity_or_host_pause"
+                }),
+                "{log}"
+            );
         }
     }
 

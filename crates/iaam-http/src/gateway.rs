@@ -52,7 +52,7 @@ use crate::tally::{
 const MINUTE: Duration = Duration::from_secs(60);
 
 /// Capacity optional diagnostics leave for required broker reads.
-pub(crate) const DIAGNOSTIC_REQUEST_RESERVE: u32 = 5;
+pub const DIAGNOSTIC_REQUEST_RESERVE: u32 = 5;
 
 /// Attempts per broker call, the first included.
 pub const ATTEMPTS: u32 = 3;

@@ -158,7 +158,10 @@ impl TinkoffChannel {
         diagnostic: bool,
     ) -> Result<Vec<serde_json::Value>, BrokerError> {
         let (from, to) = period;
-        if diagnostic && !self.client.diagnostic_report_allowed().await {
+        if diagnostic
+            && (context.allowance.remaining() <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
+                || !self.client.diagnostic_report_allowed().await)
+        {
             tracing::debug!(
                 phase = "broker_report", account, from = %from, to = %to,
                 status = "skipped", reason = "low_rate_capacity_or_host_pause",
@@ -201,7 +204,11 @@ impl TinkoffChannel {
             // The shared allowance and deadline apply to every poll, too.
             let mut polls = 0;
             let body = loop {
-                if diagnostic && !self.client.diagnostic_report_allowed().await {
+                if diagnostic
+                    && (context.allowance.remaining()
+                        <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
+                        || !self.client.diagnostic_report_allowed().await)
+                {
                     tracing::debug!(
                         phase = "broker_report", account, from = %from, to = %to,
                         page = page_number, status = "skipped", reason = "low_rate_capacity_or_host_pause",

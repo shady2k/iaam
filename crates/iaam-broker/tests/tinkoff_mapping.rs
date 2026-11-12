@@ -366,8 +366,14 @@ fn refuses_money_that_cannot_be_represented_in_minor_units() -> Result<(), Box<d
                         "date": "2026-08-20T10:11:12Z",
                         "type": "OPERATION_TYPE_BUY",
                         "state": "OPERATION_STATE_EXECUTED",
+                        "instrumentType": "bond",
+                        "instrumentKind": "INSTRUMENT_TYPE_BOND",
+                        "ticker": "INVENTED-BOND",
+                        "figi": "INVENTED-FIGI",
                         "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
-                        "quantity": "1",
+                        "positionUid": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "quantity": "0007",
+                        "price": {"units": "0002", "nano": 123456789, "currency": "rub"},
                         "payment": source_payment
                     }]
                 });
@@ -381,6 +387,13 @@ fn refuses_money_that_cannot_be_represented_in_minor_units() -> Result<(), Box<d
                 ));
                 assert_eq!(operations[0].payment, None);
                 assert_eq!(operations[0].raw["payment"], source_payment);
+                assert_eq!(operations[0].raw["quantity"], "0007");
+                assert_eq!(operations[0].raw["price"], body["items"][0]["price"]);
+                assert_eq!(operations[0].quantity_as_decimal().as_deref(), Some("7"));
+                assert_eq!(
+                    operations[0].price,
+                    Some(CalcMoney::new(dec("2.123456789"), CurrencyCode::Rub))
+                );
             }
             Ok(())
         })?;
@@ -402,6 +415,16 @@ fn refuses_money_that_cannot_be_represented_in_minor_units() -> Result<(), Box<d
                 "remainder_nano=-1",
                 "operation_id=\"op\"",
                 "source_kind=\"OPERATION_TYPE_BUY\"",
+                "source_instrument_type=\"bond\"",
+                "source_instrument_kind=\"INSTRUMENT_TYPE_BOND\"",
+                "source_ticker=\"INVENTED-BOND\"",
+                "source_figi=\"INVENTED-FIGI\"",
+                "source_instrument_uid=\"01234567-89ab-cdef-0123-456789abcdef\"",
+                "source_position_uid=\"fedcba98-7654-3210-fedc-ba9876543210\"",
+                "source_quantity=\"0007\"",
+                "source_price_units=\"0002\"",
+                "source_price_nano=123456789",
+                "source_price_currency=\"rub\"",
             ] {
                 assert!(text.contains(expected), "missing {expected}: {text}");
             }

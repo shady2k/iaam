@@ -654,6 +654,25 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
             source_kind = operation_type,
             reason = "subminor_payment_unrepresentable",
             field,
+            source_instrument_type = raw.get("instrumentType").and_then(serde_json::Value::as_str),
+            source_instrument_kind = raw.get("instrumentKind").and_then(serde_json::Value::as_str),
+            source_ticker = raw.get("ticker").and_then(serde_json::Value::as_str),
+            source_figi = raw.get("figi").and_then(serde_json::Value::as_str),
+            source_instrument_uid = raw.get("instrumentUid").and_then(serde_json::Value::as_str),
+            source_position_uid = raw.get("positionUid").and_then(serde_json::Value::as_str),
+            source_quantity = raw.get("quantity").and_then(serde_json::Value::as_str),
+            source_price_units = raw
+                .get("price")
+                .and_then(|price| price.get("units"))
+                .and_then(serde_json::Value::as_str),
+            source_price_nano = raw
+                .get("price")
+                .and_then(|price| price.get("nano"))
+                .and_then(serde_json::Value::as_i64),
+            source_price_currency = raw
+                .get("price")
+                .and_then(|price| price.get("currency"))
+                .and_then(serde_json::Value::as_str),
             source_units = source
                 .and_then(|v| v.get("units"))
                 .and_then(serde_json::Value::as_str),

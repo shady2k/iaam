@@ -155,6 +155,10 @@ pub fn first_event_date(events: &[Event], instrument: Option<InstrumentId>) -> O
                     instrument: event_instrument,
                     ..
                 }
+                | EventKind::SecuritiesTransferOut {
+                    instrument: event_instrument,
+                    ..
+                }
                 | EventKind::OpeningPosition {
                     instrument: event_instrument,
                     ..

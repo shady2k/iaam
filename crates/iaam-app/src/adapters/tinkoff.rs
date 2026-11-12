@@ -1016,6 +1016,19 @@ fn adapt_operations_accounted(
             });
             continue;
         }
+        if matches!(kind, ChannelOperationKind::SecuritiesTransferOut) {
+            tracing::debug!(
+                phase = "map_operations",
+                operation_id,
+                description = ?raw.get("description"),
+                child_operation_ids = ?raw.get("childOperations").and_then(serde_json::Value::as_array).map(|children| children.iter().filter_map(|child| child.get("id").and_then(serde_json::Value::as_str)).collect::<Vec<_>>()),
+                child_descriptions = ?raw.get("childOperations").and_then(serde_json::Value::as_array).map(|children| children.iter().filter_map(|child| child.get("description").and_then(serde_json::Value::as_str)).collect::<Vec<_>>()),
+                destination_account = ?raw.get("destinationAccountId"),
+                recipient_account = ?raw.get("recipientAccountId"),
+                destination = "unpaired",
+                "T-Invest outbound securities evidence; no receiving account inferred"
+            );
+        }
         if let Some(reason) = securities_transfer_reason(&kind) {
             accounting.quarantined_securities_transfer += 1;
             trace_quarantined_operation(&operation_id, &source_kind, "securities_transfer");
@@ -1215,9 +1228,7 @@ fn securities_transfer_reason(kind: &ChannelOperationKind) -> Option<&'static st
         ChannelOperationKind::SecuritiesTransferIn => {
             Some("inbound securities transfer: securities moved without a cash movement")
         }
-        ChannelOperationKind::SecuritiesTransferOut => {
-            Some("outbound securities transfer: securities moved without a cash movement")
-        }
+        ChannelOperationKind::SecuritiesTransferOut => None,
         _ => None,
     }
 }
@@ -1392,9 +1403,24 @@ fn operation_to_submitted(
             ));
         }
         ChannelOperationKind::SecuritiesTransferOut => {
-            return Err(row_unparsable(
-                "outbound securities transfer: securities moved without a cash movement",
-            ));
+            let instrument = optional_instrument(&operation)?.ok_or_else(|| {
+                row_unparsable("outbound securities transfer does not contain instrumentUid")
+            })?;
+            let quantity = operation
+                .quantity
+                .filter(|quantity| quantity.0 > Dec::zero())
+                .ok_or_else(|| {
+                    row_unparsable("outbound securities transfer requires positive quantity")
+                })?;
+            if operation.date.is_none() {
+                return Err(row_unparsable(
+                    "outbound securities transfer does not contain date",
+                ));
+            }
+            OperationKind::SecuritiesTransferOut {
+                instrument,
+                quantity: quantity.0,
+            }
         }
         ChannelOperationKind::Transfer => {
             return Err(RowRefusal::Row {
@@ -2903,22 +2929,25 @@ mod tests {
     }
 
     #[test]
-    fn a_securities_transfer_out_is_quarantined_as_an_outbound_securities_transfer() {
-        let operations = parse_operations(&income_operation("OPERATION_TYPE_OUTPUT_SECURITIES"))
-            .expect("parsing");
+    fn an_outbound_securities_transfer_records_quantity_without_cash_or_destination() {
+        let mut body: serde_json::Value =
+            serde_json::from_str(&income_operation("OPERATION_TYPE_OUTPUT_SECURITIES")).unwrap();
+        body["items"][0].as_object_mut().unwrap().remove("payment");
+        body["items"][0]["description"] = serde_json::json!("Transfer to another depository");
+        body["items"][0]["childOperations"] = serde_json::json!([]);
+        let operations = parse_operations(&body.to_string()).expect("parsing");
         let parsed =
             adapt_operations(trading_account(), operations, &dictionary()).expect("adaptation");
-
-        assert!(parsed.accepted.is_empty());
-        assert_eq!(parsed.quarantined.len(), 1);
-        assert!(parsed.quarantined[0].reason.contains("securities"));
-        assert!(parsed.quarantined[0].reason.contains("outbound"));
-        assert_eq!(
-            parsed.quarantined[0].dimensions,
-            [Dimension::Positions, Dimension::TaxBasis]
-                .into_iter()
-                .collect()
+        assert!(parsed.quarantined.is_empty());
+        assert_eq!(parsed.accepted.len(), 1);
+        assert!(
+            matches!(parsed.accepted[0].kind, OperationKind::SecuritiesTransferOut { quantity, .. } if quantity == iaam_core::numeric::decimal::Dec::one())
         );
+        assert_eq!(
+            parsed.accepted[0].dates.trade,
+            Some(time::macros::date!(2026 - 08 - 20))
+        );
+        assert!(parsed.accepted[0].source_operation_id.is_some());
     }
 
     #[test]

@@ -54,8 +54,8 @@ use time::{Date, OffsetDateTime, Time};
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
     CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow, FeeRow,
-    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, StatedSecuritiesValueRow, TaxRow,
-    TradeRow, UnresolvedMovementRow, ValuationRow,
+    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, SecuritiesTransferOutRow,
+    StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow, ValuationRow,
 };
 use crate::StoreError;
 
@@ -213,6 +213,16 @@ fn kind_to_detail(event: &str, kind: &EventKind) -> Result<DetailRows, StoreErro
         | EventKind::Refund { amount: _ }
         | EventKind::OpeningCash { amount: _ }
         | EventKind::OwnAccountMovement { amount: _ } => Ok(DetailRows::None),
+        EventKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        } => Ok(DetailRows::SecuritiesTransferOut(
+            SecuritiesTransferOutRow {
+                event: event.to_owned(),
+                instrument: instrument.inner().to_string(),
+                quantity: quantity.0.inner().to_string(),
+            },
+        )),
         EventKind::CashTransfer {
             transfer_id,
             from,
@@ -799,6 +809,16 @@ fn detail_to_kind(kind: &str, detail: DetailRows, legs: &[Leg]) -> Result<EventK
         DetailRows::CoverageGap(detail) => coverage_gap_from_detail(detail),
         DetailRows::CorporateAction(row) => corporate_action_from_row(*row, legs),
         DetailRows::OfferExercise(row) => offer_exercise_from_row(row),
+        DetailRows::SecuritiesTransferOut(row) => Ok(EventKind::SecuritiesTransferOut {
+            instrument: InstrumentId(parse_uuid(
+                "event_securities_transfer_out.instrument",
+                &row.instrument,
+            )?),
+            quantity: Quantity(dec_from_text(
+                "event_securities_transfer_out.quantity",
+                &row.quantity,
+            )?),
+        }),
         DetailRows::None => none_detail_from_kind(kind, legs),
     }
 }
@@ -2146,6 +2166,17 @@ mod tests {
         let f = Fixture::new();
         let mut events = Vec::new();
 
+        events.push(f.event(
+            EventKind::SecuritiesTransferOut {
+                instrument: f.instrument,
+                quantity: qty("2"),
+            },
+            vec![Leg::security_without_custody(
+                f.account,
+                f.instrument,
+                qty("-2"),
+            )],
+        ));
         // --- The five leg-only kinds -------------------------------------
         events.push(f.event(
             EventKind::CashIn {

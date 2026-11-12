@@ -439,7 +439,7 @@ impl MoneyFlow {
                     EventKind::Tax { .. } => {
                         // A tax's monetary leg is LegKind::Tax, not LegKind::Cash.
                     }
-                    EventKind::OpeningPosition { .. } => {
+                    EventKind::SecuritiesTransferOut { .. } | EventKind::OpeningPosition { .. } => {
                         // An opening position establishes state, not a cash flow.
                     }
                     EventKind::OpeningCash { .. } => {
@@ -497,6 +497,7 @@ impl MoneyFlow {
                     | EventKind::Income { .. }
                     | EventKind::Fee { .. }
                     | EventKind::Tax { .. }
+                    | EventKind::SecuritiesTransferOut { .. }
                     | EventKind::OpeningPosition { .. }
                     | EventKind::OpeningCash { .. }
                     | EventKind::StatedSecuritiesValue { .. }

@@ -665,6 +665,10 @@ impl LotBook {
                 settlement,
                 rules,
             ),
+            EventKind::SecuritiesTransferOut {
+                instrument,
+                quantity,
+            } => self.transfer_out(event, *instrument, *quantity, settlement, rules),
             // Assertions about the reconstructed opening state determine the
             // ownership boundary: the event date is the import time, not evidence
             // of the position's origin.
@@ -1194,6 +1198,55 @@ impl LotBook {
                 entry.ownership.observe(quantity, settlement);
             }
         }
+        Ok(())
+    }
+
+    /// Remove FIFO lots without proceeds or a realised result. The immutable
+    /// outbound event and its replay retain the basis needed for later pairing.
+    fn transfer_out(
+        &mut self,
+        event: &Event,
+        instrument: InstrumentId,
+        quantity: Quantity,
+        settlement: SettlementKnowledge,
+        rules: &RuleRegistry,
+    ) -> Result<(), LotError> {
+        let key = LotKey {
+            account: event.account,
+            instrument,
+        };
+        let rule = rules
+            .disposal_rule(self.rule_version)
+            .ok_or(LotError::UnknownRule {
+                version: self.rule_version,
+            })?;
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or(LotError::SaleWithoutPosition {
+                event: event.id,
+                instrument,
+            })?;
+        let from_unpriced = entry.unpriced.0.min(quantity.0);
+        let left = quantity.0.checked_sub(from_unpriced)?;
+        // Compute before mutating: an oversized transfer must not consume lots.
+        let result = if left.is_zero() {
+            None
+        } else {
+            Some(rule.apply(&DisposalInput {
+                lots: entry.lots.clone(),
+                quantity: Quantity(left),
+            })?)
+        };
+        entry.unpriced = Quantity(entry.unpriced.0.checked_sub(from_unpriced)?);
+        if let Some(result) = result {
+            entry.add_released_basis(result.basis_released)?;
+            entry.lots = result.remaining;
+            self.applied_rule = Some(result.rule);
+        }
+        entry
+            .ownership
+            .observe(Quantity(quantity.0.checked_neg()?), settlement);
         Ok(())
     }
 
@@ -1856,6 +1909,62 @@ mod tests {
             units: 100,
             gross: 1_000_000,
         }
+    }
+
+    #[test]
+    fn outbound_transfer_consumes_fifo_basis_without_realizing_a_sale() {
+        let first = sample_trade();
+        let second = Trade {
+            day: date!(2025 - 04 - 01),
+            units: 50,
+            gross: 2_000_000,
+            ..first
+        };
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&dated_buy(&first, 1), &rules).unwrap();
+        book.apply(&dated_buy(&second, 2), &rules).unwrap();
+        let outbound = |units| {
+            event_with(
+                first.account,
+                date!(2025 - 05 - 01),
+                3,
+                EventKind::SecuritiesTransferOut {
+                    instrument: first.instrument,
+                    quantity: qty(units),
+                },
+                vec![Leg::security(
+                    first.account,
+                    CustodyId::new_random(),
+                    first.instrument,
+                    qty(-units),
+                )],
+            )
+        };
+        let event = outbound(120);
+        event.validate_structure().unwrap();
+        let mut balances = crate::projection::balances::Balances::new();
+        balances.apply(&dated_buy(&first, 1)).unwrap();
+        balances.apply(&dated_buy(&second, 2)).unwrap();
+        balances.apply(&event).unwrap();
+        assert_eq!(
+            balances.position(&crate::projection::balances::PositionKey {
+                account: first.account,
+                instrument: first.instrument,
+            }),
+            Some(qty(30))
+        );
+        assert!(event.legs.iter().all(|leg| leg.money.is_none()));
+        book.apply(&event, &rules).unwrap();
+        let entry = book.entry(&key(&first)).unwrap();
+        assert_eq!(entry.lots().len(), 1);
+        assert_eq!(entry.lots()[0].quantity, qty(30));
+        assert_eq!(entry.lots()[0].cost_basis, rub(1_206_000));
+        assert_eq!(entry.released_basis(), Some(rub(1_814_000)));
+        assert_eq!(entry.realized(), None);
+        let before = entry.clone();
+        assert!(book.apply(&outbound(31), &rules).is_err());
+        assert_eq!(book.entry(&key(&first)).unwrap(), &before);
     }
 
     #[test]

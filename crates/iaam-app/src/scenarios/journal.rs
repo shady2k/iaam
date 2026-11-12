@@ -1100,6 +1100,17 @@ fn kind_aspects(kind: &EventKind) -> KindAspects {
             ]),
             confidence: Vec::new(),
         },
+        EventKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: vec![
+                KindFigure::Instrument(*instrument),
+                KindFigure::Quantity(*quantity),
+            ],
+            confidence: Vec::new(),
+        },
         EventKind::OpeningPosition {
             instrument,
             quantity,

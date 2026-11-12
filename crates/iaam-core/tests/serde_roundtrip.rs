@@ -101,6 +101,13 @@ fn every_kind() -> Vec<Event> {
             ],
         ),
         envelope(
+            EventKind::SecuritiesTransferOut {
+                instrument,
+                quantity: qty(3),
+            },
+            vec![Leg::security(account, custody, instrument, qty(-3))],
+        ),
+        envelope(
             EventKind::CashIn { amount: rub(1) },
             vec![Leg::cash(account, rub(1))],
         ),
@@ -342,6 +349,7 @@ fn is_known(kind: &EventKind) -> bool {
         | EventKind::Income { .. }
         | EventKind::Fee { .. }
         | EventKind::Tax { .. }
+        | EventKind::SecuritiesTransferOut { .. }
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::StatedSecuritiesValue { .. }

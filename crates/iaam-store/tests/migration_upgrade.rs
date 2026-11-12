@@ -21,6 +21,8 @@ use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
 fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
+    conn.execute_batch("DROP TABLE event_securities_transfer_out;")
+        .expect("remove version-15 detail table");
     conn.execute_batch("ALTER TABLE event_tax DROP COLUMN instrument;")
         .expect("remove the version-13 tax instrument");
     let legacy = include_str!("../migrations/0001_schema.sql");
@@ -54,6 +56,45 @@ fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
          ALTER TABLE event_corporate_action_old RENAME TO event_corporate_action;",
     )
     .expect("remove the version-14 posted-principal columns");
+}
+
+#[test]
+fn version_fourteen_upgrade_preserves_journal_and_foreign_keys() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (version, sql) in iaam_store::schema::MIGRATIONS {
+        if version <= 14 {
+            conn.execute_batch(sql).unwrap();
+        }
+    }
+    conn.execute_batch(
+        "PRAGMA user_version = 14;
+         PRAGMA foreign_keys = ON;
+         INSERT INTO accounts (id, owner, title, created_at)
+         VALUES ('a', 'o', 'Account', '2026-01-01T00:00:00Z');
+         INSERT INTO events (id, owner, account, kind, effective_date, sequence, confidence, relation_kind, recorded_at, source, raw_hash, parser_version)
+         VALUES ('e', 'o', 'a', 'cash_in', '2026-01-02', 1, 'known', 'none', '2026-01-02T00:00:00Z', 'file', 'hash', 'v1');
+         INSERT INTO event_legs (event, ordinal, kind, account, amount, currency)
+         VALUES ('e', 0, 'cash', 'a', 100, 'RUB');"
+    ).unwrap();
+    migrate(&conn).expect("upgrade populated version fourteen");
+    let amount: i64 = conn
+        .query_row(
+            "SELECT amount FROM event_legs WHERE event = 'e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(amount, 100);
+    let violations: i64 = conn
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
 }
 
 fn user_version(store: &SqliteStore) -> u32 {

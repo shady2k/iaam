@@ -728,6 +728,7 @@ pub(crate) fn subject(event: &Event) -> Option<ClassificationSubject> {
             (Counterparty::Unknown, None, FarSide::OwnAccount)
         }
         EventKind::Trade { .. }
+        | EventKind::SecuritiesTransferOut { .. }
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::StatedSecuritiesValue { .. }

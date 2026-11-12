@@ -37,7 +37,8 @@ use super::read::hydrate_one;
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail, DetailRows,
     EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow,
-    StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow, ValuationRow,
+    SecuritiesTransferOutRow, StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow,
+    ValuationRow,
 };
 use crate::StoreError;
 
@@ -294,6 +295,7 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
     match detail {
         DetailRows::None => Ok(()),
         DetailRows::Trade(row) => insert_trade(tx, row),
+        DetailRows::SecuritiesTransferOut(row) => insert_securities_transfer_out(tx, row),
         DetailRows::CashTransfer(row) => insert_cash_transfer(tx, row),
         DetailRows::UnresolvedMovement(row) => insert_unresolved_movement(tx, row),
         DetailRows::Income(row) => insert_income(tx, row),
@@ -307,6 +309,22 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
         DetailRows::CorporateAction(row) => insert_corporate_action(tx, row),
         DetailRows::OfferExercise(row) => insert_offer_exercise(tx, row),
     }
+}
+
+fn insert_securities_transfer_out(
+    tx: &Transaction<'_>,
+    row: &SecuritiesTransferOutRow,
+) -> Result<(), StoreError> {
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_securities_transfer_out (event, instrument, quantity) VALUES (?1, ?2, ?3)",
+            params![row.event, row.instrument, row.quantity],
+        ),
+        "insert_securities_transfer_out_detail",
+        "event_securities_transfer_out",
+        event_id = row.event
+    )?;
+    Ok(())
 }
 
 fn insert_trade(tx: &Transaction<'_>, row: &TradeRow) -> Result<(), StoreError> {

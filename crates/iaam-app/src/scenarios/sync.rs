@@ -993,6 +993,7 @@ fn operation_kind_name(kind: &iaam_ingest::operation::OperationKind) -> &'static
         OperationKind::OwnAccountMovement { .. } => "OwnAccountMovement",
         OperationKind::Buy { .. } => "Buy",
         OperationKind::Sell { .. } => "Sell",
+        OperationKind::SecuritiesTransferOut { .. } => "SecuritiesTransferOut",
         OperationKind::Income { .. } => "Income",
         OperationKind::Fee { .. } => "Fee",
         OperationKind::Tax { .. } => "Tax",

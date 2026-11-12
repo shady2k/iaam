@@ -46,7 +46,13 @@ fn version_twelve_tax_history_keeps_its_origin_and_unknown_instrument() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(indexes_after, indexes_before);
+    // Later detail tables add their own primary-key indexes; the existing
+    // indexes, including every index on the historical tax table, survive.
+    assert!(
+        indexes_before
+            .iter()
+            .all(|name| indexes_after.contains(name))
+    );
     conn.execute(
         "UPDATE event_tax SET instrument = 'i' WHERE event = 'e'",
         [],

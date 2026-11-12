@@ -1223,7 +1223,7 @@ async fn health_is_public_and_reports_the_projection_version() {
     assert_eq!(body["status"], "ok");
     // Version 9 retains income totals by account, kind and currency.
     // Earlier snapshots must rebuild rather than omit historical income.
-    assert_eq!(body["projection_version"], 9);
+    assert_eq!(body["projection_version"], 10);
 }
 
 #[tokio::test]
@@ -14067,6 +14067,49 @@ async fn ingest_deposit(
         .and_then(|id| Uuid::parse_str(id).ok())
         .expect("the ingest verdict names the event it recorded")
 }
+#[tokio::test]
+async fn a_securities_transfer_out_round_trips_through_the_journal() {
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
+    let account = harness.account.inner();
+    let instrument = harness.instrument.inner();
+    let body = json!({
+        "source_label": "contract test",
+        "operations": [{
+            "account": account,
+            "type": "securities_transfer_out",
+            "instrument": instrument,
+            "quantity": "2.5",
+            "dates": { "cash_posted": "2026-03-01" },
+            "idempotency_key": "securities-out"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    let rows = journal_events(&harness).await;
+    let row = rows
+        .iter()
+        .find(|row| row["idempotency_key"] == "securities-out")
+        .expect("recorded event");
+    assert_eq!(row["event"], verdicts[0]["event_id"]);
+    assert_eq!(row["account"], account.to_string());
+    assert_eq!(row["kind"], "securities_transfer_out");
+    let legs = row["legs"].as_array().expect("legs");
+    assert_eq!(legs.len(), 1, "{row}");
+    assert_eq!(legs[0]["kind"], "security_quantity");
+    assert_eq!(legs[0]["account"], account.to_string());
+    assert_eq!(legs[0]["instrument"], instrument.to_string());
+    assert_eq!(legs[0]["quantity"], "-2.5");
+    assert!(legs[0].get("custody").is_none());
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
 async fn create_account(harness: &Harness, title: &str) -> AccountId {
     let (status, body) = call(
         &harness.router,

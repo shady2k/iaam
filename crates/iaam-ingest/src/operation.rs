@@ -226,6 +226,11 @@ pub enum OperationKind {
         accrued_interest_minor: Option<i64>,
         currency: CurrencyCode,
     },
+    /// Securities left the account without cash; the destination is unknown.
+    SecuritiesTransferOut {
+        instrument: InstrumentId,
+        quantity: Dec,
+    },
     /// A coupon, dividend or interest payment actually received.
     ///
     /// `instrument` is optional because interest on a cash balance belongs to no
@@ -878,6 +883,30 @@ fn build(
         } => {
             let amount = money(positive(*amount_minor, "amount", *currency)?, *currency);
             Ok((EventKind::StatedSecuritiesValue { amount }, Vec::new()))
+        }
+        OperationKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        } => {
+            if !quantity.is_positive() {
+                return Err(Rejection {
+                    field: "quantity".into(),
+                    expected: "positive quantity".into(),
+                    actual: quantity.inner().to_string(),
+                });
+            }
+            let outgoing = quantity.checked_neg().map_err(|error| Rejection {
+                field: "quantity".into(),
+                expected: "representable quantity".into(),
+                actual: error.to_string(),
+            })?;
+            Ok((
+                EventKind::SecuritiesTransferOut {
+                    instrument: *instrument,
+                    quantity: Quantity(*quantity),
+                },
+                vec![security_leg(account, None, *instrument, Quantity(outgoing))],
+            ))
         }
         OperationKind::OpeningPosition {
             instrument,

@@ -284,6 +284,7 @@ impl Event {
                 OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {}
             },
             EventKind::Trade { .. }
+            | EventKind::SecuritiesTransferOut { .. }
             | EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
             | EventKind::Refund { .. }
@@ -376,6 +377,19 @@ impl Event {
                 quantity,
                 ..
             } => self.validate_opening_position(name, *instrument, *quantity),
+            EventKind::SecuritiesTransferOut {
+                instrument,
+                quantity,
+            } => {
+                require_positive_quantity(name, "quantity", *quantity)?;
+                let outgoing = Quantity(quantity.0.checked_neg().map_err(|_| {
+                    EventValidationError::LegDoesNotMatchEvent {
+                        kind: name,
+                        field: "quantity",
+                    }
+                })?);
+                self.validate_opening_position_leg(name, *instrument, outgoing)
+            }
             EventKind::Valuation { price, .. } => self.validate_valuation(name, *price),
             EventKind::ControlAssertion { period, claim } => {
                 self.validate_control_assertion(name, *period, *claim)
@@ -887,6 +901,15 @@ impl Event {
         quantity: Quantity,
     ) -> Result<(), EventValidationError> {
         require_positive_quantity(name, "quantity", quantity)?;
+        self.validate_opening_position_leg(name, instrument, quantity)
+    }
+
+    fn validate_opening_position_leg(
+        &self,
+        name: &'static str,
+        instrument: InstrumentId,
+        quantity: Quantity,
+    ) -> Result<(), EventValidationError> {
         let cash = self.cash_legs();
         if !cash.is_empty() {
             return Err(EventValidationError::LegCount {

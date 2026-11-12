@@ -317,9 +317,18 @@ pub(crate) struct CoverageGapDetail {
 // columns that leaving them inline would make every `DetailRows` value pay
 // for the largest variant's size, most visibly in the `Vec<DetailRows>`
 // Task 6's bulk hydration builds per page.
+/// The asserted outbound quantity; legs carry its signed movement separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SecuritiesTransferOutRow {
+    pub event: String,
+    pub instrument: String,
+    pub quantity: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DetailRows {
     Trade(TradeRow),
+    SecuritiesTransferOut(SecuritiesTransferOutRow),
     CashTransfer(CashTransferRow),
     UnresolvedMovement(UnresolvedMovementRow),
     Income(IncomeRow),

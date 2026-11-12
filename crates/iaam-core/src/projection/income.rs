@@ -196,6 +196,7 @@ impl IncomeLedger {
             | EventKind::UnresolvedOwnAccountMovement { .. }
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }
+            | EventKind::SecuritiesTransferOut { .. }
             | EventKind::OpeningPosition { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::StatedSecuritiesValue { .. }

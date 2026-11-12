@@ -165,6 +165,12 @@ pub enum EventKind {
         /// Accrued coupon interest paid to the seller or received from the buyer (§7.2).
         accrued_interest: Option<Money>,
     },
+    /// Securities left this account without a cash payment. The receiving
+    /// account is not identified; this unpaired leg can be replaced when paired.
+    SecuritiesTransferOut {
+        instrument: InstrumentId,
+        quantity: Quantity,
+    },
     /// Money entered the contour from outside (§4.10).
     CashIn { amount: Money },
     /// Money left the contour.
@@ -434,9 +440,10 @@ impl EventKind {
     /// This is kept beside [`Self::discriminant`] so a route cannot accept a
     /// name the event model does not publish.
     #[must_use]
-    pub const fn discriminants() -> &'static [&'static str; 18] {
+    pub const fn discriminants() -> &'static [&'static str; 19] {
         &[
             "trade",
+            "securities_transfer_out",
             "cash_in",
             "cash_out",
             "refund",
@@ -465,6 +472,7 @@ impl EventKind {
     pub const fn discriminant(&self) -> &'static str {
         match self {
             Self::Trade { .. } => "trade",
+            Self::SecuritiesTransferOut { .. } => "securities_transfer_out",
             Self::CashIn { .. } => "cash_in",
             Self::CashOut { .. } => "cash_out",
             Self::Refund { .. } => "refund",
@@ -514,6 +522,7 @@ impl EventKind {
             Self::OwnAccountMovement { .. } | Self::UnresolvedOwnAccountMovement { .. } => {
                 FlowEndpoints::OwnAccountUnnamed
             }
+            Self::SecuritiesTransferOut { .. } => FlowEndpoints::OwnAccountUnnamed,
             Self::Trade { .. }
             | Self::Income { .. }
             | Self::Fee { .. }

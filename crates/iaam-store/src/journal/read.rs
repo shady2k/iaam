@@ -28,8 +28,8 @@ use super::kind::from_rows;
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
     CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow, FeeRow,
-    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, StatedSecuritiesValueRow, TaxRow,
-    TradeRow, UnresolvedMovementRow, ValuationRow,
+    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, SecuritiesTransferOutRow,
+    StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow, ValuationRow,
 };
 use crate::StoreError;
 
@@ -343,6 +343,26 @@ fn load_valuation(conn: &Connection, ids: &[String]) -> Result<Vec<ValuationRow>
         .map_err(StoreError::from)
 }
 
+fn load_securities_transfer_out(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<SecuritiesTransferOutRow>, StoreError> {
+    let sql = format!(
+        "SELECT * FROM event_securities_transfer_out WHERE event IN ({})",
+        placeholders(ids.len())
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(ids), |row| {
+        Ok(SecuritiesTransferOutRow {
+            event: row.get("event")?,
+            instrument: row.get("instrument")?,
+            quantity: row.get("quantity")?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
 fn load_stated_securities_value(
     conn: &Connection,
     ids: &[String],
@@ -561,6 +581,9 @@ fn load_details(
             row.event.clone(),
             DetailRows::OpeningPosition(Box::new(row)),
         );
+    }
+    for row in load_securities_transfer_out(conn, ids)? {
+        map.insert(row.event.clone(), DetailRows::SecuritiesTransferOut(row));
     }
     for row in load_stated_securities_value(conn, ids)? {
         map.insert(row.event.clone(), DetailRows::StatedSecuritiesValue(row));
@@ -850,6 +873,12 @@ mod tests {
         match detail {
             DetailRows::None => {}
             DetailRows::Trade(row) => insert_trade(conn, &row),
+            DetailRows::SecuritiesTransferOut(row) => {
+                conn.execute(
+                    "INSERT INTO event_securities_transfer_out (event, instrument, quantity) VALUES (?1, ?2, ?3)",
+                    params![row.event, row.instrument, row.quantity],
+                ).expect("insert securities transfer out detail");
+            }
             DetailRows::CashTransfer(row) => insert_cash_transfer(conn, &row),
             DetailRows::UnresolvedMovement(row) => insert_unresolved_movement(conn, &row),
             DetailRows::Income(row) => insert_income(conn, &row),

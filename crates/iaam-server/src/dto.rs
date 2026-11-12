@@ -536,6 +536,8 @@ pub enum OperationKindDto {
         amount: String,
         currency: CurrencyDto,
     },
+    /// Securities leaving the account without a cash payment or stated custody.
+    SecuritiesTransferOut { instrument: Uuid, quantity: String },
     Buy {
         instrument: Uuid,
         /// Where the security is kept, when the source states one. A bank
@@ -1075,6 +1077,13 @@ impl OperationDto {
                 to: AccountId(*to_account),
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
+            },
+            OperationKindDto::SecuritiesTransferOut {
+                instrument,
+                quantity,
+            } => OperationKind::SecuritiesTransferOut {
+                instrument: InstrumentId(*instrument),
+                quantity: Dec::new(decimal(quantity, "quantity")?),
             },
             OperationKindDto::Buy {
                 instrument,
@@ -7322,6 +7331,20 @@ mod tests {
             source_kind: None,
             description: None,
         }
+    }
+
+    #[test]
+    fn securities_transfer_out_input_preserves_instrument_and_quantity() {
+        let instrument = Uuid::from_u128(7);
+        let kind: OperationKindDto = serde_json::from_value(serde_json::json!({
+            "type": "securities_transfer_out", "instrument": instrument, "quantity": "2.5"
+        }))
+        .unwrap();
+        let mut operation = income_operation(None);
+        operation.kind = kind;
+        assert!(matches!(operation.kind_to_domain().unwrap(),
+            OperationKind::SecuritiesTransferOut { instrument: id, quantity }
+            if id == InstrumentId(instrument) && quantity == Dec::new("2.5".parse().unwrap())));
     }
 
     #[test]

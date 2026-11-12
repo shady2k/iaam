@@ -20,6 +20,46 @@ fn entry(source_kind: &str, kind: &str) -> BrokerOperationKind {
 }
 
 #[test]
+fn a_changed_contract_kind_is_refreshed_and_an_unchanged_kind_is_counted_separately() {
+    let mut store = store();
+    store
+        .extend_broker_operation_kinds(
+            &tinkoff(),
+            "old dictionary",
+            &[entry("OPERATION_TYPE_INPUT_SECURITIES", "deposit")],
+        )
+        .unwrap();
+    let entries = [entry(
+        "OPERATION_TYPE_INPUT_SECURITIES",
+        "securities_transfer_in",
+    )];
+    let outcome = store
+        .extend_broker_operation_kinds(&tinkoff(), "new dictionary", &entries)
+        .unwrap();
+    assert_eq!(outcome.added, 0);
+    assert_eq!(outcome.changed, 1);
+    assert_eq!(outcome.already_known, 0);
+    assert_eq!(
+        store.broker_operation_kinds(&tinkoff()).unwrap()["OPERATION_TYPE_INPUT_SECURITIES"],
+        "securities_transfer_in"
+    );
+    let provenance: (String, String) = store.connection().query_row(
+        "SELECT origin, dictionary FROM broker_operation_kinds WHERE source_kind = 'OPERATION_TYPE_INPUT_SECURITIES'", [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(
+        provenance,
+        ("contract".to_owned(), "new dictionary".to_owned())
+    );
+    let repeated = store
+        .extend_broker_operation_kinds(&tinkoff(), "new dictionary", &entries)
+        .unwrap();
+    assert_eq!(repeated.added, 0);
+    assert_eq!(repeated.changed, 0);
+    assert_eq!(repeated.already_known, 1);
+}
+
+#[test]
 fn a_dictionary_is_read_back_whole() {
     let mut store = store();
     let outcome = store

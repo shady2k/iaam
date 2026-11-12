@@ -291,7 +291,8 @@ where
                 broker_key: _,
             } = Places::from_lookup(&get)?;
             ensure_private_directory(&database.path, "the instance's database")?;
-            let store = SqliteStore::open(&database.path)?;
+            let mut store = SqliteStore::open(&database.path)?;
+            iaam_app::adapters::sqlite::refresh_broker_operation_dictionaries(&mut store)?;
             let admin = SqliteAdapter::new(store);
             let token = claim_owner(&admin, label).await?;
             println!("{token}");

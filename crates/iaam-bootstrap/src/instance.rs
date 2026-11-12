@@ -51,7 +51,11 @@ pub enum InstanceError {
 /// one message naming the place and the command that creates, and no
 /// branch can reach a create-if-missing open by accident.
 pub fn open_database(place: &Place) -> Result<SqliteStore, InstanceError> {
-    SqliteStore::open_existing(&place.path).map_err(|source| match source {
+    let opened = SqliteStore::open_existing(&place.path).and_then(|mut store| {
+        iaam_app::adapters::sqlite::refresh_broker_operation_dictionaries(&mut store)?;
+        Ok(store)
+    });
+    opened.map_err(|source| match source {
         StoreError::DatabaseMissing { path } => InstanceError::DatabaseMissing { path },
         source => InstanceError::DatabaseUnreadable {
             path: place.path.display().to_string(),
@@ -95,6 +99,86 @@ pub fn ensure_private_directory(of: &Path, what: &'static str) -> Result<(), Ins
 mod tests {
     use super::{ensure_private_directory, open_database};
     use crate::config::{Place, PlaceSource};
+
+    #[test]
+    fn opening_a_version_twelve_dictionary_refreshes_contract_kinds_and_keeps_owner_decisions() {
+        use iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS;
+        use iaam_store::documents::BrokerCode;
+        use iaam_store::schema::{MIGRATIONS, SCHEMA_VERSION};
+
+        let base =
+            std::env::temp_dir().join(format!("iaam-old-dictionary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("iaam.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            for (version, sql) in MIGRATIONS {
+                if version <= 12 {
+                    conn.execute_batch(sql).unwrap();
+                }
+            }
+            conn.pragma_update(None, "user_version", 12).unwrap();
+            // The older dictionary has no tax codes and still interprets securities as cash.
+            for (source, kind) in TINKOFF_OPERATION_KINDS {
+                if *kind == "tax" {
+                    continue;
+                }
+                let kind = if *source == "OPERATION_TYPE_INPUT_SECURITIES" {
+                    "deposit"
+                } else {
+                    kind
+                };
+                conn.execute(
+                    "INSERT INTO broker_operation_kinds VALUES (?1, ?2, ?3, 'contract', 'old embedded dictionary', '2026-01-01T00:00:00Z')",
+                    rusqlite::params!["tinkoff", source, kind],
+                ).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO broker_operation_kinds VALUES
+                 ('tinkoff', 'OPERATION_TYPE_TAX_CORRECTION', 'coupon', 'owner', NULL, '2026-01-01T00:00:00Z');
+                 INSERT INTO broker_operation_kinds VALUES
+                 ('finam', 'BUY', 'sell', 'contract', 'old Finam dictionary', '2026-01-01T00:00:00Z');"
+            ).unwrap();
+        }
+        let place = Place {
+            path: path.clone(),
+            source: PlaceSource::Default,
+        };
+        for _ in 0..2 {
+            let store = open_database(&place)
+                .expect("old database opens and refreshes without credentials or HTTP");
+            let tinkoff = store
+                .broker_operation_kinds(&BrokerCode::parse("tinkoff").unwrap())
+                .unwrap();
+            assert_eq!(tinkoff["OPERATION_TYPE_TAX"], "tax");
+            assert_eq!(tinkoff["OPERATION_TYPE_DIVIDEND_TAX"], "tax");
+            assert_eq!(
+                tinkoff["OPERATION_TYPE_INPUT_SECURITIES"],
+                "securities_transfer_in"
+            );
+            assert_eq!(tinkoff["OPERATION_TYPE_TAX_CORRECTION"], "coupon");
+            let finam = store
+                .broker_operation_kinds(&BrokerCode::parse("finam").unwrap())
+                .unwrap();
+            assert_eq!(finam["BUY"], "buy");
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let owner: (String, Option<String>, String) = conn.query_row(
+            "SELECT origin, dictionary, recorded_at FROM broker_operation_kinds WHERE broker = 'tinkoff' AND source_kind = 'OPERATION_TYPE_TAX_CORRECTION'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            owner,
+            ("owner".to_owned(), None, "2026-01-01T00:00:00Z".to_owned())
+        );
+        drop(conn);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn a_created_directory_is_private_and_an_existing_one_is_untouched() {

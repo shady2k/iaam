@@ -32,6 +32,7 @@ zeroize = { version = "1", features = ["alloc"] }
 rustix = { version = "1", features = ["termios", "stdio"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.42", features = ["bundled"] }
 time = { version = "0.3", default-features = false, features = ["macros"] }
 
 [lints]

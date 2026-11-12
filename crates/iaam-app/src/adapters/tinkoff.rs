@@ -436,6 +436,7 @@ impl BrokerChannel for TinkoffChannel {
             quarantined = parsed.quarantined.len(),
             quarantined_instrument_resolution,
             quarantined_parse = accounting.quarantined_parse,
+            quarantined_kind_not_in_dictionary = accounting.quarantined_kind_not_in_dictionary,
             quarantined_securities_transfer = accounting.quarantined_securities_transfer,
             quarantined_order_state = accounting.quarantined_order_state,
             quarantined_trade = accounting.quarantined_trade,
@@ -851,6 +852,7 @@ struct OperationAccounting {
     source_rows_accepted: usize,
     reduced_no_execution_trades: usize,
     quarantined_parse: usize,
+    quarantined_kind_not_in_dictionary: usize,
     quarantined_securities_transfer: usize,
     quarantined_order_state: usize,
     quarantined_trade: usize,
@@ -925,6 +927,26 @@ fn adapt_operations_accounted(
             continue;
         }
 
+        if matches!(kind, ChannelOperationKind::Other(_)) {
+            accounting.quarantined_kind_not_in_dictionary += 1;
+            let dictionary = iaam_broker::tinkoff::dictionary_seed::TINKOFF_SEED_NAME;
+            tracing::debug!(
+                phase = "map_operations",
+                operation_id,
+                source_kind,
+                dictionary,
+                reason = "kind_not_in_dictionary",
+                "T-Invest operation quarantined"
+            );
+            quarantined.push(Quarantined {
+                raw,
+                reason: format!(
+                    "kind_not_in_dictionary: {source_kind} is absent from {dictionary}"
+                ),
+                dimensions: dimensions_for_kind(&kind),
+            });
+            continue;
+        }
         if let Some(reason) = securities_transfer_reason(&kind) {
             accounting.quarantined_securities_transfer += 1;
             trace_quarantined_operation(&operation_id, &source_kind, "securities_transfer");
@@ -1061,6 +1083,7 @@ fn adapt_operations_accounted(
         source_rows - quarantined.len() - accounting.reduced_no_execution_trades;
     accounting.quarantined_conversion = quarantined.len()
         - accounting.quarantined_parse
+        - accounting.quarantined_kind_not_in_dictionary
         - accounting.quarantined_securities_transfer
         - accounting.quarantined_order_state
         - accounting.quarantined_trade;
@@ -2519,6 +2542,26 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_dictionary_kind_has_its_own_quarantine_accounting_and_names_the_dictionary() {
+        let operations = parse_operations(&income_operation("OPERATION_TYPE_UNKNOWN")).unwrap();
+        let (parsed, accounting) = super::adapt_operations_accounted(
+            AccountId(Uuid::from_u128(1)),
+            operations,
+            &dictionary(),
+        )
+        .unwrap();
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(accounting.quarantined_kind_not_in_dictionary, 1);
+        assert_eq!(accounting.quarantined_conversion, 0);
+        assert_eq!(
+            parsed.quarantined[0].reason,
+            "kind_not_in_dictionary: OPERATION_TYPE_UNKNOWN is absent from embedded T-Invest dictionary"
+        );
+        assert_eq!(parsed.quarantined[0].dimensions, super::all_dimensions());
+    }
+
+    #[test]
     fn a_row_refusal_is_quarantined_without_aborting_other_operations() {
         for source_kind in [
             "OPERATION_TYPE_TRANSFER",
@@ -2537,7 +2580,7 @@ mod tests {
                 parsed.quarantined[0].reason.contains(match source_kind {
                     "OPERATION_TYPE_TRANSFER" => "transfer does not contain a recipient account",
                     "OPERATION_TYPE_BOND_AMORTISATION" => "returned face value per unit",
-                    _ => "unsupported operation kind: OPERATION_TYPE_UNKNOWN",
+                    _ => "kind_not_in_dictionary: OPERATION_TYPE_UNKNOWN is absent from embedded T-Invest dictionary",
                 }),
                 "row refusal reason: {}",
                 parsed.quarantined[0].reason

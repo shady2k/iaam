@@ -4,11 +4,10 @@
 //! does not say that `OPERATION_TYPE_DIV_EXT` and
 //! `OPERATION_TYPE_DIVIDEND` are both dividends for us, or that
 //! `OPERATION_TYPE_OVER_COM` is a fee. Therefore the table lives in code and
-//! is inserted into the database once, when access is configured.
+//! refreshes contract-origin entries when the database is opened or access is configured.
 //!
-//! It is **not** the source of truth afterwards: the dictionary is edited in
-//! the database, and seeding from here does not touch existing rows. Otherwise
-//! the owner's decision would be cancelled on every access setup.
+//! Owner-origin entries in the database always take precedence: embedded updates
+//! never cancel the owner's decision.
 //!
 //! Most entries reproduce the former `match` in `parse.rs` (commit 5320fb0)
 //! word for word. The two securities-transfer entries intentionally do not:

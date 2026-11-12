@@ -33,6 +33,36 @@ async fn a_redirect_returns_to_the_gateway_as_one_refusal() {
 }
 
 #[tokio::test]
+async fn report_pending_code_reaches_the_real_transport_observer() {
+    use iaam_http::gateway::Transport;
+    use std::sync::{Arc, Mutex};
+    let server = LoopbackServer::start([LoopbackReply::complete(400, r#"{"code":30058}"#)])
+        .expect("loopback server");
+    let client = HttpClientHarness::new(&server);
+    let request = HttpRequest::post(
+        Destination::TinkoffProd,
+        "/OperationsService/GetBrokerReport",
+        iaam_http::RequestBody::Json("{}".to_owned()),
+    );
+    let observed = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&observed);
+    client
+        .send_observed(
+            &request,
+            Box::new(|| Ok(())),
+            Box::new(move |response| {
+                *captured.lock().unwrap() = Some(response);
+            }),
+        )
+        .await
+        .expect("response");
+    let observed = observed.lock().unwrap();
+    let response = observed.as_ref().expect("observed");
+    assert_eq!(response.status, 400);
+    assert_eq!(response.body, br#"{"code":30058}"#);
+}
+
+#[tokio::test]
 async fn the_server_records_every_request_in_order() {
     let server = LoopbackServer::start([
         LoopbackReply::complete(200, "first"),

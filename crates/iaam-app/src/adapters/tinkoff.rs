@@ -41,6 +41,9 @@ use crate::ports::{
     PortfolioAsOf, PortfolioSnapshot, Quarantined,
 };
 
+#[path = "tinkoff_report.rs"]
+mod report;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
@@ -423,12 +426,14 @@ impl BrokerChannel for TinkoffChannel {
         request.from = Some(rfc3339_midnight(from));
         request.to = Some(rfc3339_operation_end(to));
         request.limit = Some(OPERATIONS_PAGE_LIMIT);
-        let operations = fetch_operation_pages(request, |request| async move {
+        let mut operations = fetch_operation_pages(request, |request| async move {
             self.client
                 .get_operations_by_cursor(&request, deadline, allowance)
                 .await
         })
         .await?;
+        self.resolve_report_payments(&mut operations, broker_account, from, to, context)
+            .await?;
         let received = operations.len();
         tracing::info!(
             phase = "resolve_instruments",
@@ -2520,6 +2525,103 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn report_operation() -> iaam_broker::tinkoff::ChannelOperation {
+        let body = serde_json::json!({"hasNext": false, "items": [{
+            "cursor":"c", "brokerAccountId":"account", "id":"operation", "figi":"FIGI1",
+            "date":"2026-08-20T10:00:00Z", "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+            "quantity":"92", "payment":{"currency":"rub", "units":"-173", "nano":-926000000},
+            "tradesInfo":{"trades":[{"num":"trade-1", "date":"2026-08-20T10:00:00Z", "quantity":"92",
+                "price":{"currency":"rub", "units":"1", "nano":890500000}}]}
+        }]});
+        parse_operations(&body.to_string()).unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn report_generation_polls_pending_then_reads_every_page() {
+        let report_row = serde_json::json!({"tradeId":"trade-1", "figi":"FIGI1", "quantity":"92",
+            "tradeDatetime":"2026-08-20T10:00:00Z", "clearValueDate":"2026-08-21T00:00:00Z",
+            "totalOrderAmount":{"currency":"rub", "units":"173", "nano":930000000}});
+        let page0 = serde_json::json!({"getBrokerReportResponse":{"brokerReport":[{"tradeId":"unrelated"}], "itemsCount":2,"pagesCount":2,"page":0}}).to_string();
+        let page1 = serde_json::json!({"getBrokerReportResponse":{"brokerReport":[report_row.clone()], "itemsCount":2,"pagesCount":2,"page":1}}).to_string();
+        let (gateway, requests, time) = fake::gateway(
+            vec![
+                Answer::status(
+                    200,
+                    r#"{"generateBrokerReportResponse":{"taskId":"task-1"}}"#,
+                ),
+                Answer::status(400, r#"{"code":30058}"#),
+                Answer::status(400, r#"{"code":30058}"#),
+                Answer::status(200, &page0),
+                Answer::status(200, &page1),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        let mut operations = vec![report_operation()];
+        assert!(iaam_broker::tinkoff::needs_report_payment(&operations[0]));
+        iaam_broker::tinkoff::resolve_report_payment(&operations[0], &[report_row])
+            .expect("fixture report resolves");
+        channel
+            .resolve_report_payments(
+                &mut operations,
+                "account",
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                broker_context(None),
+            )
+            .await
+            .unwrap();
+        assert!(
+            operations[0].rejection.is_none(),
+            "remaining refusal: {:?}",
+            operations[0].rejection
+        );
+        assert_eq!(operations[0].payment.unwrap().amount.raw(), -17393);
+        let requests = requests.lock().unwrap();
+        let calls: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|v| serde_json::from_str(v).unwrap())
+            .collect();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(
+            calls[0]["generateBrokerReportRequest"]["accountId"],
+            "account"
+        );
+        for call in &calls[1..4] {
+            assert_eq!(call["getBrokerReportRequest"]["taskId"], "task-1");
+            assert_eq!(call["getBrokerReportRequest"]["page"], 0);
+        }
+        assert_eq!(calls[4]["getBrokerReportRequest"]["page"], 1);
+        assert!(!time.slept().is_empty(), "gateway spaces report polls");
+    }
+
+    #[tokio::test]
+    async fn incomplete_report_keeps_subminor_operation_refused() {
+        let (gateway, _, _) = fake::gateway(
+            vec![
+                Answer::status(200, r#"{"generateBrokerReportResponse":{"taskId":"task"}}"#),
+                Answer::status(
+                    200,
+                    r#"{"getBrokerReportResponse":{"brokerReport":[],"itemsCount":1,"pagesCount":2,"page":0}}"#,
+                ),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        let mut operations = vec![report_operation()];
+        channel
+            .resolve_report_payments(
+                &mut operations,
+                "account",
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                broker_context(None),
+            )
+            .await
+            .unwrap();
+        assert!(iaam_broker::tinkoff::needs_report_payment(&operations[0]));
     }
 
     #[tokio::test]

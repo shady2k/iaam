@@ -291,6 +291,47 @@ impl TinkoffClient {
         Ok(body)
     }
 
+    /// Start asynchronous report generation for one account and UTC period.
+    pub async fn generate_broker_report(
+        &self,
+        account_id: &str,
+        from: &str,
+        to: &str,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            BROKER_REPORT,
+            json!({"generateBrokerReportRequest": {
+                "accountId": account_id, "from": from, "to": to
+            }}),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
+    }
+
+    /// Read a generated report page through the same bounded gateway.
+    pub async fn get_broker_report(
+        &self,
+        task_id: &str,
+        page: i32,
+        deadline: Option<Instant>,
+        allowance: &RequestAllowance,
+    ) -> Result<String, TinkoffError> {
+        self.post(
+            BROKER_REPORT,
+            json!({"getBrokerReportRequest": {
+                "taskId": task_id, "page": page
+            }}),
+            deadline,
+            allowance,
+        )
+        .await
+        .map(|(body, _)| body)
+    }
+
     /// The request path identifies the service budget at the gateway.
     /// Returns the body beside the moment the answer was observed: the
     /// gateway stamps a live answer it accepted and a served one with the
@@ -365,6 +406,11 @@ const PORTFOLIO: ReadCall = ReadCall {
 const INSTRUMENT: ReadCall = ReadCall {
     method: Method::Instrument,
     path: "InstrumentsService/GetInstrumentBy",
+};
+
+const BROKER_REPORT: ReadCall = ReadCall {
+    method: Method::BrokerReport,
+    path: "OperationsService/GetBrokerReport",
 };
 
 const OPERATIONS: ReadCall = ReadCall {

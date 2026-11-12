@@ -5729,3 +5729,159 @@ async fn operation_pages_account_for_source_rows_without_counting_trade_fills_as
         assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
     }
 }
+
+#[tokio::test]
+async fn outbound_transfers_require_holdings_and_retry_without_consuming_refused_rows() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDSHARE");
+    });
+    let mut purchase = trade_without_custody(account, instrument);
+    purchase.dates = OperationDates {
+        trade: Some(date!(2026 - 03 - 10)),
+        settled: Some(date!(2026 - 03 - 10)),
+        cash_posted: Some(date!(2026 - 03 - 10)),
+        paid: None,
+    };
+    let transfer = |id: &str, day: Date| {
+        let mut operation = trade_without_custody(account, instrument);
+        operation.kind = OperationKind::SecuritiesTransferOut {
+            instrument,
+            quantity: Dec::one(),
+        };
+        operation.dates = OperationDates {
+            trade: Some(day),
+            settled: None,
+            cash_posted: None,
+            paid: None,
+        };
+        operation.source_operation_id = Some(id.to_owned());
+        operation
+    };
+    let mut too_large = transfer("OUT-TOO-LARGE", date!(2026 - 03 - 10));
+    too_large.kind = OperationKind::SecuritiesTransferOut {
+        instrument,
+        quantity: Dec::new(rust_decimal::Decimal::from(2)),
+    };
+    // Deliberately newest first: an accepted earlier buy must support the
+    // first later transfer, but neither a future buy nor an exhausted holding can.
+    let mut broker = api_with_claims(SourceId::new_random(), purchase.clone(), vec![]);
+    broker.operations.as_mut().unwrap().accepted = vec![
+        transfer("OUT-EXHAUSTED", date!(2026 - 03 - 12)),
+        transfer("OUT-VALID", date!(2026 - 03 - 11)),
+        purchase,
+        too_large,
+        transfer("OUT-BEFORE-BUY", date!(2026 - 03 - 09)),
+    ];
+    // The repeat deduplicates the buy, valid transfer, and refusal coverage gap.
+    for expected_duplicates in [0, 3] {
+        let outcome = sync_broker(
+            &services,
+            &principal(owner),
+            &broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .expect("transfer sync");
+        assert_eq!(outcome.set_aside, 3);
+        assert_eq!(outcome.duplicates, expected_duplicates);
+        assert_eq!(
+            outcome
+                .recorded
+                .iter()
+                .filter(|verdict| matches!(verdict, Verdict::Quarantined { .. }))
+                .count(),
+            3
+        );
+    }
+    let events = load(&services, owner).await;
+    let transfers: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::SecuritiesTransferOut { .. }))
+        .collect();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(
+        transfers[0].provenance.source_operation_id(),
+        Some("OUT-VALID")
+    );
+    let gap = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ImportCoverageGap { dimensions, .. } => Some(dimensions),
+            _ => None,
+        })
+        .expect("refusals leave a coverage gap");
+    assert_eq!(
+        gap,
+        &dimensions(&[Dimension::Positions, Dimension::TaxBasis])
+    );
+}
+
+#[tokio::test]
+async fn repeated_sync_warns_about_existing_invalid_outbound_transfer_without_deleting_it() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDSHARE");
+    });
+    let source = SourceId::new_random();
+    let mut operation = trade_without_custody(account, instrument);
+    operation.kind = OperationKind::SecuritiesTransferOut {
+        instrument,
+        quantity: Dec::one(),
+    };
+    operation.source_operation_id = Some("OLD-INVALID-OUT".to_owned());
+    let mut event = report_trade_event(owner, &operation, source);
+    event.provenance = event.provenance.with_source_operation_id("OLD-INVALID-OUT");
+    let event_id = event.id;
+    append_checked(&services, vec![event], IdentityScope::Source)
+        .await
+        .expect("seed old-build fact");
+    let broker = api_with_claims(source, operation, vec![]);
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("repeat old-build sync");
+    assert_eq!(outcome.duplicates, 1);
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let warning = logs
+        .lines()
+        .find(|line| line.contains("retract this event explicitly"))
+        .expect("historical warning");
+    for expected in [
+        "WARN",
+        "OLD-INVALID-OUT",
+        &event_id.inner().to_string(),
+        &instrument.inner().to_string(),
+    ] {
+        assert!(warning.contains(expected), "{expected}: {warning}");
+    }
+    assert!(
+        load(&services, owner)
+            .await
+            .iter()
+            .any(|event| event.id == event_id)
+    );
+}

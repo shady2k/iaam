@@ -321,6 +321,7 @@ pub async fn sync_broker(
         accepted = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
         "broker sync phase start"
     );
+    let mut diagnostic_instruments = audit_outbound_transfers(&bounded_events, account)?;
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -385,7 +386,17 @@ pub async fn sync_broker(
         rows = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
         "broker sync phase start"
     );
-    for (row_index, operation) in parsed.accepted.into_iter().enumerate() {
+    let mut accepted = parsed.accepted;
+    // Broker pages may arrive newest first. Earlier buys must stand before
+    // checking a later outbound transfer against the journal.
+    accepted.sort_by_key(|operation| {
+        (
+            operation.dates.effective_date(),
+            operation.source_time.is_none(),
+            operation.source_time,
+        )
+    });
+    for (row_index, operation) in accepted.into_iter().enumerate() {
         let context = DocumentContext {
             account: operation.account,
             document: None,
@@ -476,6 +487,43 @@ pub async fn sync_broker(
             duplicates += 1;
             recorded.push(Verdict::Duplicate { existing });
             continue;
+        }
+
+        if let iaam_core::event::kind::EventKind::SecuritiesTransferOut {
+            instrument,
+            quantity,
+        } = event.kind
+        {
+            let held = held_quantity_before_transfer(services, principal.owner, &event).await?;
+            if held.0 < quantity.0 {
+                let reason = "outbound securities transfer would take position below zero";
+                tracing::debug!(
+                    phase = "map",
+                    source_operation_id = ?operation.source_operation_id,
+                    instrument = %instrument.inner(),
+                    held_quantity = %held.0.inner(),
+                    requested_quantity = %quantity.0.inner(),
+                    reason,
+                    "broker outbound transfer set aside"
+                );
+                diagnostic_instruments.insert(instrument);
+                let mut row = refused_row(&operation, channel.source);
+                row.dimensions = [Dimension::Positions, Dimension::TaxBasis]
+                    .into_iter()
+                    .collect();
+                refusal_records.push(refusal_record(
+                    &refusal_context,
+                    &row.key,
+                    &row.dimensions,
+                    reason.to_owned(),
+                    serde_json::to_string(&operation).expect("operation serializes"),
+                ));
+                refusals.push(row);
+                recorded.push(Verdict::Quarantined {
+                    reason: reason.to_owned(),
+                });
+                continue;
+            }
         }
 
         let result = crate::scenarios::ingest::append_checked(
@@ -719,6 +767,7 @@ pub async fn sync_broker(
         }
         recorded.push(verdict);
     }
+
 
     tracing::info!(
         phase = "map",
@@ -1248,6 +1297,94 @@ fn coverage_gap_event(
         Provenance::new(channel.source, raw_hash, channel.parser_version.clone()),
         identity,
     )
+}
+
+/// Inspect the effective chronology even on a repeat sync whose rows deduplicate.
+/// Historical facts are not silently changed: the warning names the retraction needed.
+fn audit_outbound_transfers(
+    events: &[Event],
+    account: AccountId,
+) -> Result<BTreeSet<InstrumentId>, AppError> {
+    use iaam_core::event::kind::EventKind;
+    use iaam_core::money::Quantity;
+    use iaam_core::projection::balances::{Balances, PositionKey};
+
+    let effective = iaam_core::event::correction::resolve(events).map_err(AppError::Correction)?;
+    let mut balances = Balances::new();
+    let mut affected = BTreeSet::new();
+    for event in effective {
+        if event.account == account
+            && let EventKind::SecuritiesTransferOut {
+                instrument,
+                quantity,
+            } = event.kind
+        {
+            let held = balances
+                .position(&PositionKey {
+                    account,
+                    instrument,
+                })
+                .unwrap_or_else(Quantity::zero);
+            if held.0 < quantity.0 {
+                affected.insert(instrument);
+                tracing::warn!(
+                    phase = "audit_outbound_transfers",
+                    event = %event.id.inner(),
+                    source = %event.provenance.source().inner(),
+                    source_operation_id = ?event.provenance.source_operation_id(),
+                    instrument = %instrument.inner(),
+                    account = %account.inner(),
+                    held_quantity = %held.0.inner(),
+                    requested_quantity = %quantity.0.inner(),
+                    "recorded outbound securities transfer took position below zero; retract this event explicitly"
+                );
+            }
+        }
+        balances
+            .apply(event)
+            .map_err(iaam_core::projection::ProjectionError::from)
+            .map_err(AppError::from_projection)?;
+    }
+    Ok(affected)
+}
+
+async fn held_quantity_before_transfer(
+    services: &AppServices,
+    owner: OwnerId,
+    transfer: &Event,
+) -> Result<iaam_core::money::Quantity, AppError> {
+    use iaam_core::money::Quantity;
+    use iaam_core::projection::balances::{Balances, PositionKey};
+
+    let events = services
+        .store
+        .load_events_through(owner, transfer.order.date())
+        .await?;
+    let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
+    let mut balances = Balances::new();
+    for event in effective {
+        if event.order.date() == transfer.order.date()
+            && let (Some(existing), Some(current)) =
+                (event.order.source_time(), transfer.order.source_time())
+            && existing > current
+        {
+            continue;
+        }
+        balances
+            .apply(event)
+            .map_err(iaam_core::projection::ProjectionError::from)
+            .map_err(AppError::from_projection)?;
+    }
+    let iaam_core::event::kind::EventKind::SecuritiesTransferOut { instrument, .. } = transfer.kind
+    else {
+        unreachable!("only outbound transfers need a position check")
+    };
+    Ok(balances
+        .position(&PositionKey {
+            account: transfer.account,
+            instrument,
+        })
+        .unwrap_or_else(Quantity::zero))
 }
 
 async fn resolve_full_redemption(

@@ -70,7 +70,7 @@ impl TinkoffChannel {
         from: Date,
         to: Date,
         context: BrokerRequestContext<'_>,
-    ) -> Result<(), BrokerError> {
+    ) -> Result<Vec<serde_json::Value>, BrokerError> {
         let dates: Vec<_> = operations
             .iter()
             .filter(|operation| needs_report_payment(operation))
@@ -94,7 +94,7 @@ impl TinkoffChannel {
                         phase = "resolve_report_payment",
                         "broker report unavailable; subminor payments remain refused"
                     );
-                    return Ok(());
+                    return Ok(rows);
                 }
                 Err(error) => return Err(error),
             }
@@ -113,7 +113,7 @@ impl TinkoffChannel {
                 ),
             }
         }
-        Ok(())
+        Ok(rows)
     }
 
     pub(super) async fn read_settlement_report(

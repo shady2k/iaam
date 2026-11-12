@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/12";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/13";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -99,6 +99,8 @@ pub struct ChannelTrade {
     pub quantity: Quantity,
     /// Exact source price; it is not rounded until the gross is calculated.
     pub price: CalcMoney,
+    /// Exact broker-reported execution commission, when available.
+    pub broker_commission: Option<CalcMoney>,
 }
 
 /// Operation received from the T-Invest REST channel.
@@ -525,6 +527,80 @@ pub fn resolve_report_payment(
     }
     resolved.raw = operation.raw.clone();
     resolved.raw["brokerReportSettlement"] = Value::Array(evidence);
+    Ok(resolved)
+}
+
+/// Attach exact per-execution broker commissions from unambiguous report rows.
+/// Missing rows or absent commissions leave allocation to the order adapter.
+/// The operation-level commission remains the independent order total.
+pub fn resolve_report_commissions(
+    operation: &ChannelOperation,
+    rows: &[Value],
+) -> Result<ChannelOperation, ParseError> {
+    let mut resolved = operation.clone();
+    let mut ids = std::collections::HashSet::new();
+    let mut evidence = Vec::new();
+    for trade in &mut resolved.trades {
+        if trade.num.is_empty() || !ids.insert(&trade.num) {
+            return Err(ParseError::InvalidField {
+                field: "trade.num",
+                value: trade.num.clone(),
+            });
+        }
+        trade.broker_commission = None;
+        let mut matches = rows
+            .iter()
+            .filter(|row| row.get("tradeId").and_then(Value::as_str) == Some(trade.num.as_str()));
+        let Some(row) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            return Err(ParseError::InvalidField {
+                field: "tradeId",
+                value: trade.num.clone(),
+            });
+        }
+        if let Some(figi) = row.get("figi") {
+            let figi = figi.as_str().filter(|figi| !figi.is_empty());
+            if figi.is_none() || figi != operation.figi.as_deref() {
+                return Err(ParseError::InvalidField {
+                    field: "figi",
+                    value: row["figi"].to_string(),
+                });
+            }
+        }
+        let Some(raw) = row.get("brokerCommission") else {
+            continue;
+        };
+        let raw: RawMoneyValue = serde_json::from_value(raw.clone())
+            .map_err(|error| ParseError::Json(error.to_string()))?;
+        // Report commissions are posted source cash, not calculated allocations.
+        parse_money(&raw, "brokerCommission")?;
+        let commission = parse_calc_money(&raw, "brokerCommission")?;
+        if commission.value().inner().is_sign_negative()
+            || commission.currency() != trade.price.currency()
+            || operation
+                .commission
+                .is_some_and(|total| total.currency() != commission.currency())
+        {
+            return Err(ParseError::InvalidField {
+                field: "brokerCommission",
+                value: row["brokerCommission"].to_string(),
+            });
+        }
+        trade.broker_commission = Some(commission);
+        let mut selected = serde_json::json!({
+            "tradeId": trade.num,
+            "brokerCommission": row["brokerCommission"],
+        });
+        if let Some(figi) = row.get("figi") {
+            selected["figi"] = figi.clone();
+        }
+        evidence.push(selected);
+    }
+    if !evidence.is_empty() {
+        resolved.raw["brokerReportCommissions"] = Value::Array(evidence);
+    }
     Ok(resolved)
 }
 
@@ -1297,6 +1373,7 @@ fn parse_trade(trade: RawTrade) -> Result<ChannelTrade, ParseError> {
         at,
         quantity,
         price,
+        broker_commission: None,
     })
 }
 
@@ -1524,6 +1601,121 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    fn commission_operation() -> super::ChannelOperation {
+        let body = serde_json::json!({"hasNext": false, "items": [{
+            "cursor": "c", "brokerAccountId": "a", "id": "o",
+            "date": "2026-08-20T10:00:00Z", "type": "OPERATION_TYPE_BUY",
+            "state": "OPERATION_STATE_EXECUTED", "figi": "FIGI1",
+            "commission": {"currency":"rub", "units":"0", "nano":90000000},
+            "tradesInfo": {"trades": [
+                {"num":"t1", "date":"2026-08-20T10:00:00Z", "quantity":"1",
+                 "price":{"currency":"rub", "units":"10"}},
+                {"num":"t2", "date":"2026-08-20T10:00:01Z", "quantity":"1",
+                 "price":{"currency":"rub", "units":"20"}}
+            ]}
+        }]});
+        let operation = parse_operations(&body.to_string()).unwrap().remove(0);
+        assert!(operation.rejection.is_none());
+        operation
+    }
+
+    #[test]
+    fn report_commissions_follow_trade_ids_not_prices_or_row_order() {
+        let operation = commission_operation();
+        assert!(
+            operation
+                .trades
+                .iter()
+                .all(|trade| trade.broker_commission.is_none())
+        );
+        let rows = [
+            serde_json::json!({"tradeId":"t2", "figi":"FIGI1",
+                "brokerCommission":{"currency":"rub", "units":"0", "nano":20000000}}),
+            serde_json::json!({"tradeId":"unrelated",
+                "brokerCommission":{"currency":"usd", "units":"-1"}}),
+            serde_json::json!({"tradeId":"t1",
+                "brokerCommission":{"currency":"rub", "units":"0", "nano":60000000}}),
+        ];
+        let resolved = super::resolve_report_commissions(&operation, &rows).unwrap();
+        let amounts = resolved
+            .trades
+            .iter()
+            .map(|trade| trade.broker_commission.unwrap().value().inner().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(amounts, ["0.06", "0.02"]);
+        assert_eq!(resolved.commission, operation.commission);
+        assert_eq!(
+            resolved.raw["brokerReportCommissions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn report_commissions_leave_missing_evidence_for_fallback_but_keep_known_zero() {
+        let operation = commission_operation();
+        assert_eq!(
+            super::resolve_report_commissions(&operation, &[]).unwrap(),
+            operation
+        );
+        let row = serde_json::json!({"tradeId":"t1"});
+        let resolved = super::resolve_report_commissions(&operation, &[row]).unwrap();
+        assert!(
+            resolved
+                .trades
+                .iter()
+                .all(|trade| trade.broker_commission.is_none())
+        );
+        let row = serde_json::json!({"tradeId":"t2",
+            "brokerCommission":{"currency":"rub", "units":"0"}});
+        let resolved = super::resolve_report_commissions(&operation, &[row]).unwrap();
+        assert!(resolved.trades[0].broker_commission.is_none());
+        assert!(
+            resolved.trades[1]
+                .broker_commission
+                .unwrap()
+                .value()
+                .is_zero()
+        );
+    }
+
+    #[test]
+    fn report_commissions_refuse_ambiguous_or_invalid_evidence() {
+        let operation = commission_operation();
+        let row = serde_json::json!({"tradeId":"t1", "figi":"FIGI1",
+            "brokerCommission":{"currency":"rub", "units":"0", "nano":30000000}});
+        assert!(
+            super::resolve_report_commissions(&operation, &[row.clone(), row.clone()]).is_err()
+        );
+        let mut duplicate = operation.clone();
+        duplicate.trades[1].num = "t1".to_owned();
+        assert!(super::resolve_report_commissions(&duplicate, &[]).is_err());
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!({"currency":"rub"}),
+            serde_json::json!({"currency":"rub", "units":"bad"}),
+            serde_json::json!({"currency":"rub", "units":"0", "nano":1000000000}),
+            serde_json::json!({"currency":"rub", "units":"0", "nano":-1}),
+            serde_json::json!({"currency":"rub", "units":"0", "nano":20000001}),
+            serde_json::json!({"currency":"usd", "units":"1"}),
+        ] {
+            let mut invalid_row = row.clone();
+            invalid_row["brokerCommission"] = invalid;
+            assert!(super::resolve_report_commissions(&operation, &[invalid_row]).is_err());
+        }
+        let mut invalid_row = row.clone();
+        invalid_row["figi"] = serde_json::json!("another-instrument");
+        assert!(super::resolve_report_commissions(&operation, &[invalid_row]).is_err());
+        let mut invalid_total = operation.clone();
+        invalid_total.commission = Some(super::CalcMoney::new(
+            iaam_core::numeric::decimal::Dec::zero(),
+            super::CurrencyCode::Usd,
+        ));
+        assert!(super::resolve_report_commissions(&invalid_total, &[row]).is_err());
     }
 
     #[test]

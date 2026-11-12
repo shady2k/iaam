@@ -619,7 +619,8 @@ impl BrokerChannel for TinkoffChannel {
         );
         questions_timestamps::trace_timestamps(&operations, from, to);
         let mut diagnostic_operations = diagnostics::capture(&operations);
-        self.resolve_report_payments(&mut operations, broker_account, from, to, context)
+        let settlement_rows = self
+            .resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;
         let question_operations = operations.clone();
         let received = operations.len();
@@ -755,6 +756,21 @@ impl BrokerChannel for TinkoffChannel {
             "broker sync phase complete"
         );
         *self.diagnostic_operations.lock().await = diagnostic_operations;
+        let report_rows = self
+            .read_question_reports(
+                &question_operations,
+                broker_account,
+                (from, to),
+                context,
+                &settlement_rows,
+            )
+            .await;
+        for operation in &mut checked {
+            match iaam_broker::tinkoff::resolve_report_commissions(operation, &report_rows) {
+                Ok(resolved) => *operation = resolved,
+                Err(error) => operation.rejection = Some(error),
+            }
+        }
         let (mut parsed, accounting) =
             adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
         for pending in &mut parsed.pending_redemptions {
@@ -786,8 +802,8 @@ impl BrokerChannel for TinkoffChannel {
                 parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
             "T-Invest operations accounted"
         );
-        self.trace_question_reports(&question_operations, broker_account, from, to, context)
-            .await;
+        questions_commission::trace_commission(&question_operations, &report_rows);
+        questions_zone::trace_trading_zone(&question_operations, &report_rows);
         Ok(parsed)
     }
 
@@ -2080,7 +2096,7 @@ fn trade_operations(
     }
     let commission_minor = posted_commission(operation.commission, currency)?;
     let commission_allocations = commission_minor
-        .map(|total| allocate_minor(total, &trades))
+        .map(|total| allocate_trade_commission(total, &trades, &operation.operation_id))
         .transpose()?
         .unwrap_or_else(|| vec![0; trades.len()]);
     let accrued_known = operation.accrued_interest.is_some();
@@ -2211,6 +2227,59 @@ fn posted_commission(
         .checked_abs()
         .map(Some)
         .ok_or_else(|| row_unparsable("commission magnitude is not representable"))
+}
+
+fn allocate_trade_commission(
+    total: i64,
+    trades: &[iaam_broker::tinkoff::ChannelTrade],
+    operation_id: &str,
+) -> Result<Vec<i64>, RowRefusal> {
+    let mut order: Vec<_> = (0..trades.len()).collect();
+    order.sort_by(|left, right| {
+        trades[*left]
+            .num
+            .as_bytes()
+            .cmp(trades[*right].num.as_bytes())
+    });
+    let grosses = order
+        .iter()
+        .map(|index| {
+            iaam_core::money::gross_for_fill(trades[*index].price, trades[*index].quantity)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| row_unparsable(error.to_string()))?;
+    let reported = order
+        .iter()
+        .map(|index| {
+            trades[*index]
+                .broker_commission
+                .map(|amount| amount.rounded_minor())
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| row_unparsable(error.to_string()))?;
+    let allocated = iaam_core::rules::trade_allocation::allocate_commission_minor(
+        PostedMinor::new(total),
+        &grosses,
+        &reported,
+    )
+    .map_err(|error| row_unparsable(format!("fill commission: {error}")))?;
+    let mut result = vec![0; trades.len()];
+    for (position, index) in order.into_iter().enumerate() {
+        result[index] = allocated[position].raw();
+        tracing::debug!(
+            operation_id,
+            trade_id = trades[index].num,
+            source = if reported[position].is_some() {
+                "report"
+            } else {
+                "value_allocation"
+            },
+            commission_minor = result[index],
+            "T-Invest fill commission source"
+        );
+    }
+    Ok(result)
 }
 
 fn allocate_minor(
@@ -3474,6 +3543,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn commissions_reuse_settlement_rows_without_another_report() {
+        let operation = report_operation();
+        let rows: Vec<_> = operation.trades.iter().map(|trade| serde_json::json!({
+            "tradeId":trade.num, "figi":operation.figi, "brokerCommission":{"units":"0","nano":0,"currency":"rub"}
+        })).collect();
+        let (gateway, requests, _) = fake::gateway(vec![], None);
+        let channel = channel(gateway);
+        let actual = channel
+            .read_question_reports(
+                &[operation],
+                "invented-account",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+                &rows,
+            )
+            .await;
+        assert_eq!(actual, rows);
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -5683,7 +5776,53 @@ mod tests {
     }
 
     #[test]
-    fn commission_is_allocated_in_minor_units_by_quantity_and_trade_num() {
+    fn fill_commission_uses_report_then_value_weighted_residual() {
+        let body = trading_operation_with_fields(TradingOperationFields {
+            operation_type: "OPERATION_TYPE_BUY",
+            state: "OPERATION_STATE_EXECUTED",
+            operation_id: "invented-commission-sources",
+            quantity_done: "3",
+            payment: r#"{"units":"-60","nano":0,"currency":"rub"}"#,
+            fields: r#","commission":{"units":"0","nano":60000000,"currency":"rub"}"#,
+            trades: &format!(
+                "{},{},{}",
+                trade("c", "2026-08-21T10:00:00Z", "1", "30", 0),
+                trade("a", "2026-08-21T10:00:00Z", "1", "10", 0),
+                trade("b", "2026-08-21T10:00:00Z", "1", "20", 0)
+            ),
+        });
+        let mut operation = parse_operations(&body).unwrap().remove(0);
+        let currency = operation.trades[0].price.currency();
+        let fallback =
+            super::allocate_trade_commission(6, &operation.trades, &operation.operation_id)
+                .unwrap();
+        assert_eq!(fallback, vec![3, 1, 2]);
+        operation.trades[1].broker_commission =
+            Some(super::calc_money_from_minor(2, currency).unwrap());
+        let reported =
+            super::allocate_trade_commission(6, &operation.trades, &operation.operation_id)
+                .unwrap();
+        assert_eq!(reported, vec![2, 2, 2]);
+        let converted = trade_operations(
+            AccountId::new_random(),
+            operation,
+            super::ChannelOperationKind::Buy,
+        )
+        .unwrap();
+        let fees: Vec<_> = converted
+            .iter()
+            .map(|fill| match &fill.kind {
+                OperationKind::Buy { basis_fee, .. } => {
+                    basis_fee.unwrap().rounded_minor().unwrap().raw()
+                }
+                _ => panic!("expected buy"),
+            })
+            .collect();
+        assert_eq!(fees, vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn commission_is_allocated_in_minor_units_by_value_and_trade_num() {
         let fields = r#","commission":{"units":"1","nano":0,"currency":"rub"}"#;
         let first = trading_operation_with_fields(TradingOperationFields {
             operation_type: "OPERATION_TYPE_BUY",

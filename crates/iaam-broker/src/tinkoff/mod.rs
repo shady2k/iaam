@@ -9,5 +9,6 @@ pub use parse::{
     ChannelPortfolioPosition, ChannelTrade, OperationsPage, ParseError, ParsedPortfolio,
     ParsedPortfolioPositions, RefusedPosition, TINKOFF_PARSER_VERSION, needs_report_payment,
     parse_account_ids, parse_broker_report_page, parse_broker_report_task, parse_instrument,
-    parse_operations, parse_portfolio, parse_portfolio_positions, resolve_report_payment,
+    parse_operations, parse_portfolio, parse_portfolio_positions, resolve_report_commissions,
+    resolve_report_payment,
 };

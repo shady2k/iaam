@@ -127,6 +127,68 @@ pub fn allocate_gross_minor(
     })
 }
 
+/// Failure while preserving reported fill commissions and allocating the remainder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CommissionAllocationError {
+    #[error("commission grosses and reports must have equal lengths")]
+    LengthMismatch,
+    #[error("commission amounts must not be negative")]
+    NegativeAmount,
+    #[error("reported fill commissions do not reconcile with the order total")]
+    ReportedTotalMismatch,
+    #[error(transparent)]
+    Allocation(#[from] AllocationError),
+}
+
+/// Preserve reported commissions and allocate only the unreported remainder.
+///
+/// Exact gross magnitudes supply the weights, without rounding prices or fills.
+/// The caller sorts fills by trade identifier so equal largest remainders follow
+/// that stable order. Reported commissions are authoritative, even when their
+/// proportions differ from the gross weights.
+pub fn allocate_commission_minor(
+    total: PostedMinor,
+    grosses: &[CalcMoney],
+    reported: &[Option<PostedMinor>],
+) -> Result<Vec<PostedMinor>, CommissionAllocationError> {
+    if grosses.len() != reported.len() {
+        return Err(CommissionAllocationError::LengthMismatch);
+    }
+    if total.raw() < 0 || reported.iter().flatten().any(|amount| amount.raw() < 0) {
+        return Err(CommissionAllocationError::NegativeAmount);
+    }
+    let mut remaining = total;
+    for amount in reported.iter().flatten() {
+        if amount.raw() > remaining.raw() {
+            return Err(CommissionAllocationError::ReportedTotalMismatch);
+        }
+        remaining = remaining
+            .checked_sub(*amount)
+            .ok_or(AllocationError::Overflow)?;
+    }
+    let weights = grosses
+        .iter()
+        .zip(reported)
+        .filter(|(_, amount)| amount.is_none())
+        .map(|(gross, _)| Quantity(Dec::new(gross.value().inner().abs())))
+        .collect::<Vec<_>>();
+    if weights.is_empty() && remaining.raw() != 0 {
+        return Err(CommissionAllocationError::ReportedTotalMismatch);
+    }
+    let allocated = if remaining.raw() == 0 {
+        vec![PostedMinor::new(0); weights.len()]
+    } else {
+        allocate_minor(remaining, &weights)?
+    };
+    let mut allocated = allocated.into_iter();
+    Ok(reported
+        .iter()
+        .map(|amount| {
+            amount.unwrap_or_else(|| allocated.next().expect("one share per missing fill"))
+        })
+        .collect())
+}
+
 /// Failure while distributing a posted order amount across fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum AllocationError {
@@ -316,6 +378,106 @@ mod tests {
                 CurrencyCode::Rub
             ),
             Err(GrossAllocationError::InvalidAccrued),
+        );
+    }
+
+    #[test]
+    fn commission_preserves_reports_and_allocates_exact_gross_remainder() {
+        let grosses = ["12.12345", "0.001", "0.002"]
+            .map(|value| CalcMoney::new(dec(value), CurrencyCode::Rub));
+        let result = allocate_commission_minor(
+            PostedMinor::new(14),
+            &grosses,
+            &[Some(PostedMinor::new(4)), None, None],
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![
+                PostedMinor::new(4),
+                PostedMinor::new(3),
+                PostedMinor::new(7)
+            ]
+        );
+        assert_eq!(result.iter().map(|amount| amount.raw()).sum::<i64>(), 14);
+    }
+
+    #[test]
+    fn commission_breaks_ties_in_missing_fill_order() {
+        let grosses = [CalcMoney::new(dec("0.0001"), CurrencyCode::Rub); 3];
+        assert_eq!(
+            allocate_commission_minor(
+                PostedMinor::new(6),
+                &grosses,
+                &[None, Some(PostedMinor::new(5)), None],
+            )
+            .unwrap(),
+            vec![
+                PostedMinor::new(1),
+                PostedMinor::new(5),
+                PostedMinor::new(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn commission_accepts_matching_reports_and_zero_without_weights() {
+        let zero = [CalcMoney::new(dec("0"), CurrencyCode::Rub); 2];
+        assert_eq!(
+            allocate_commission_minor(
+                PostedMinor::new(7),
+                &zero,
+                &[Some(PostedMinor::new(2)), Some(PostedMinor::new(5))],
+            )
+            .unwrap(),
+            vec![PostedMinor::new(2), PostedMinor::new(5)]
+        );
+        assert_eq!(
+            allocate_commission_minor(PostedMinor::new(0), &zero, &[None, None]).unwrap(),
+            vec![PostedMinor::new(0); 2]
+        );
+        assert_eq!(
+            allocate_commission_minor(PostedMinor::new(0), &[], &[]).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn commission_refuses_inconsistent_or_negative_reports() {
+        let gross = [CalcMoney::new(dec("1"), CurrencyCode::Rub)];
+        for (total, reports, expected) in [
+            (1, vec![], CommissionAllocationError::LengthMismatch),
+            (-1, vec![None], CommissionAllocationError::NegativeAmount),
+            (
+                1,
+                vec![Some(PostedMinor::new(-1))],
+                CommissionAllocationError::NegativeAmount,
+            ),
+            (
+                1,
+                vec![Some(PostedMinor::new(2))],
+                CommissionAllocationError::ReportedTotalMismatch,
+            ),
+            (
+                2,
+                vec![Some(PostedMinor::new(1))],
+                CommissionAllocationError::ReportedTotalMismatch,
+            ),
+        ] {
+            assert_eq!(
+                allocate_commission_minor(PostedMinor::new(total), &gross, &reports),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            allocate_commission_minor(
+                PostedMinor::new(1),
+                &[CalcMoney::new(dec("0"), CurrencyCode::Rub)],
+                &[None],
+            ),
+            Err(CommissionAllocationError::Allocation(
+                AllocationError::ZeroQuantity
+            ))
         );
     }
 

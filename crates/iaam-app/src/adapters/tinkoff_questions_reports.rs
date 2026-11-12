@@ -3,6 +3,7 @@
 use super::*;
 
 impl TinkoffChannel {
+    #[cfg(test)]
     pub(super) async fn trace_question_reports(
         &self,
         operations: &[ChannelOperation],
@@ -11,10 +12,50 @@ impl TinkoffChannel {
         to: Date,
         context: BrokerRequestContext<'_>,
     ) {
-        let mut dates = questions_commission::affected_dates(operations);
-        dates.extend(questions_zone::affected_dates(operations));
-        let mut rows = Vec::new();
-        if !dates.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+        let rows = self
+            .read_question_reports(operations, account, (from, to), context, &[])
+            .await;
+        questions_commission::trace_commission(operations, &rows);
+        questions_zone::trace_trading_zone(operations, &rows);
+    }
+
+    pub(super) async fn read_question_reports(
+        &self,
+        operations: &[ChannelOperation],
+        account: &str,
+        interval: (Date, Date),
+        context: BrokerRequestContext<'_>,
+        existing_rows: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
+        let (from, to) = interval;
+        let uncovered: Vec<_> = operations
+            .iter()
+            .filter(|operation| {
+                !operation.trades.iter().all(|trade| {
+                    existing_rows.iter().any(|row| {
+                        row.get("tradeId").and_then(serde_json::Value::as_str)
+                            == Some(trade.num.as_str())
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        let mut dates: Vec<_> = uncovered
+            .iter()
+            .filter(|operation| !operation.trades.is_empty() && operation.commission.is_some())
+            .flat_map(|operation| {
+                operation
+                    .trades
+                    .iter()
+                    .map(|trade| trade.at.to_offset(time::UtcOffset::UTC).date())
+            })
+            .collect();
+        dates.extend(questions_commission::affected_dates(&uncovered));
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            dates.extend(questions_zone::affected_dates(&uncovered));
+        }
+        let mut rows = existing_rows.to_vec();
+        if !dates.is_empty() {
             let windows = report::report_windows(&dates, from, to);
             tracing::debug!(window_count = windows.len(), windows = ?windows,
                 "planned shared question report windows");
@@ -52,7 +93,13 @@ impl TinkoffChannel {
                     request.await
                 };
                 match result {
-                    Ok(report_rows) => rows.extend(report_rows),
+                    Ok(report_rows) => {
+                        for row in report_rows {
+                            if !rows.contains(&row) {
+                                rows.push(row);
+                            }
+                        }
+                    }
                     Err(_) => {
                         tracing::debug!(from = %from, to = %to, reason = "diagnostic_report_read_failed",
                             "T-Invest question report unavailable");
@@ -61,7 +108,6 @@ impl TinkoffChannel {
                 }
             }
         }
-        questions_commission::trace_commission(operations, &rows);
-        questions_zone::trace_trading_zone(operations, &rows);
+        rows
     }
 }

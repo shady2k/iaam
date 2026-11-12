@@ -371,3 +371,36 @@ defect of the comparison.
   `iaam-server`, поэтому `scripts/check-mutants.sh` обязан передавать
   `--test-workspace true`. Без него заслон печатает «выживших нет» для
   кода, который никто не тестировал.
+
+## Blocked-asset units inferred from a broker withdrawal (iaam-xzz5.4.12)
+
+The broker's `blocked_tca_flag` is broker-description evidence, not an owner setting.
+A paired withdrawal uses the catalogue instrument's flag: handles with the same
+ISIN describe one asset. The catalogue exposes the OR of the latest persisted
+descriptions per broker handle; reading a different unblocked handle cannot
+clear a blocked handle. A withdrawal's own false flag therefore does not prevent
+its arrival from being derived when another handle makes the instrument blocked.
+DEBUG then names the blocking handles as well as the withdrawal and redemption. Each handle can refresh its own flag in
+both directions. DEBUG records name the catalogue instrument, resolved handle
+and reported flag. Migration 18 clears the old last-write-wins aggregate because
+it has no per-handle provenance; description reads rebuild it. New backups carry
+the per-handle evidence. A legacy backup keeps its old aggregate until a handle
+refresh replaces that unverifiable value with the new aggregate.
+Only a paired fund withdrawal and full redemption may establish missing units,
+with the exact withdrawn quantity. Derivation requires a zero recorded holding
+and no broker-recorded positive securities movement in the effective journal
+through payment (earlier derived arrivals do not establish broker arrivals).
+An earlier arrival followed by disposal is not evidence of missing units.
+Unflagged assets and partial, excess or negative holdings keep their refusal.
+
+The derived fact uses the existing `OpeningPosition` with no cost basis.
+The withdrawal date is an upper bound on the unknown arrival date, not an
+asserted acquisition date. Provenance names the withdrawal, redemption and
+this uncertainty. The existing unpriced quantity and `restored_without_basis`
+gap keep realised results unknown after redemption; no zero-cost lot is made.
+The withdrawal identity makes the derived fact repeatable without duplication.
+
+Each distinct paired withdrawal restores only its own quantity at its own
+withdrawal-date bound. Its subsequent full redemption retires those units.
+Different broker handles may therefore resolve to the same catalogue instrument
+without collapsing their withdrawal identities or moving later arrivals earlier.

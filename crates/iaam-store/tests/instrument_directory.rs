@@ -20,6 +20,7 @@ fn store_with_one_bond() -> (SqliteStore, InstrumentId) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("instrument created");
     (store, instrument)
@@ -41,6 +42,132 @@ fn alias(
         },
         source: SourceId::new_random(),
     }
+}
+
+#[test]
+fn broker_block_refresh_is_readable_and_owner_edits_preserve_it() {
+    let (store, id) = store_with_one_bond();
+    assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+    store
+        .update_blocked_tca_flag(id, "tinkoff:uid:invented", true)
+        .unwrap();
+    let mut renamed = store.instrument(id).unwrap().unwrap();
+    assert!(renamed.blocked_tca_flag);
+    renamed.title = "Owner title".into();
+    renamed.blocked_tca_flag = false;
+    store.upsert_instrument(&renamed).unwrap();
+    let loaded = store.instrument(id).unwrap().unwrap();
+    assert_eq!(loaded.title, "Owner title");
+    assert!(loaded.blocked_tca_flag);
+    assert!(store.list_instruments().unwrap()[0].blocked_tca_flag);
+    store
+        .update_blocked_tca_flag(id, "tinkoff:uid:invented", false)
+        .unwrap();
+    assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+    assert!(matches!(
+        store.update_blocked_tca_flag(InstrumentId::new_random(), "tinkoff:uid:invented", true),
+        Err(StoreError::NotFound { .. })
+    ));
+}
+
+#[test]
+fn broker_blocks_are_aggregated_per_handle_in_either_read_order() {
+    for blocked_first in [true, false] {
+        let (store, id) = store_with_one_bond();
+        let reads = if blocked_first {
+            [
+                ("tinkoff:uid:blocked", true),
+                ("tinkoff:uid:ordinary", false),
+            ]
+        } else {
+            [
+                ("tinkoff:uid:ordinary", false),
+                ("tinkoff:uid:blocked", true),
+            ]
+        };
+        for (handle, blocked) in reads {
+            store.update_blocked_tca_flag(id, handle, blocked).unwrap();
+        }
+        assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+        assert!(store.list_instruments().unwrap()[0].blocked_tca_flag);
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:ordinary", false)
+            .unwrap();
+        assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:ordinary", true)
+            .unwrap();
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:blocked", false)
+            .unwrap();
+        assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:ordinary", false)
+            .unwrap();
+        assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+    }
+}
+
+#[test]
+fn blocked_handles_are_sorted_scoped_and_refreshable() {
+    let (store, id) = store_with_one_bond();
+    assert!(store.blocked_instrument_handles(id).unwrap().is_empty());
+    assert!(
+        store
+            .blocked_instrument_handles(InstrumentId::new_random())
+            .unwrap()
+            .is_empty()
+    );
+    for (handle, blocked) in [
+        ("tinkoff:uid:z-last", true),
+        ("tinkoff:uid:ordinary", false),
+        ("tinkoff:uid:a-first", true),
+    ] {
+        store.update_blocked_tca_flag(id, handle, blocked).unwrap();
+    }
+    let mut other = store.instrument(id).unwrap().unwrap();
+    other.id = InstrumentId::new_random();
+    store.upsert_instrument(&other).unwrap();
+    store
+        .update_blocked_tca_flag(other.id, "tinkoff:uid:other", true)
+        .unwrap();
+    assert_eq!(
+        store.blocked_instrument_handles(id).unwrap(),
+        vec!["tinkoff:uid:a-first", "tinkoff:uid:z-last"]
+    );
+    store
+        .update_blocked_tca_flag(id, "tinkoff:uid:a-first", false)
+        .unwrap();
+    assert_eq!(
+        store.blocked_instrument_handles(id).unwrap(),
+        vec!["tinkoff:uid:z-last"]
+    );
+    assert!(store.instrument(id).unwrap().unwrap().blocked_tca_flag);
+}
+
+#[test]
+fn a_failed_broker_block_refresh_rolls_back_its_handle_evidence() {
+    let (store, id) = store_with_one_bond();
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER refuse_block_refresh BEFORE UPDATE OF blocked_tca_flag ON instruments
+         BEGIN SELECT RAISE(ABORT, 'invented refresh failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .update_blocked_tca_flag(id, "tinkoff:uid:test", true)
+            .is_err()
+    );
+    let count: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM instrument_broker_blocks", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(!store.instrument(id).unwrap().unwrap().blocked_tca_flag);
 }
 
 #[test]
@@ -205,6 +332,7 @@ fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code()
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("foreign instrument created");
     store
@@ -316,6 +444,7 @@ fn instrument_returns_the_stored_record_and_none_for_an_unknown_id() {
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
         metadata: None,
+        blocked_tca_flag: false,
     };
     store
         .upsert_instrument(&expected)
@@ -344,6 +473,7 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
         metadata: None,
+        blocked_tca_flag: false,
     };
     let earlier = InstrumentRecord {
         id: InstrumentId::new_random(),
@@ -353,6 +483,7 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
         metadata: None,
+        blocked_tca_flag: false,
     };
     store
         .upsert_instrument(&later)

@@ -25,4 +25,6 @@ pub struct BrokerInstrumentDescription {
     pub board: Option<String>,
     pub lot: Option<u32>,
     pub price_decimals: Option<u8>,
+    /// T-Invest reports that the instrument is blocked by the trading/clearing centre.
+    pub blocked_tca_flag: bool,
 }

@@ -507,6 +507,7 @@ impl BondReferenceData {
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,
+                blocked_tca_flag: false,
             })
             .unwrap();
         store
@@ -518,6 +519,7 @@ impl BondReferenceData {
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,
+                blocked_tca_flag: false,
             })
             .unwrap();
         store
@@ -806,6 +808,164 @@ fn a_tampered_custody_place_breaks_the_checksum() {
 }
 
 #[test]
+fn broker_block_survives_bundle_restore() {
+    let (store, owner, refs) = a_store_holding_one_security_event();
+    store
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:invented", true)
+        .unwrap();
+    let bundle = store.export_bundle(owner).unwrap();
+    assert!(
+        bundle
+            .instruments
+            .iter()
+            .find(|row| row.id == refs.instrument.inner())
+            .unwrap()
+            .blocked_tca_flag
+    );
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    assert!(
+        restored
+            .instrument(refs.instrument)
+            .unwrap()
+            .unwrap()
+            .blocked_tca_flag
+    );
+}
+
+#[test]
+fn restored_broker_handle_evidence_can_clear_without_clearing_another_handle() {
+    let (store, owner, refs) = a_store_holding_one_security_event();
+    store
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:blocked", true)
+        .unwrap();
+    store
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:ordinary", false)
+        .unwrap();
+    let bundle = store.export_bundle(owner).unwrap();
+    let section = bundle
+        .instruments
+        .iter()
+        .find(|row| row.id == refs.instrument.inner())
+        .unwrap();
+    assert_eq!(section.broker_block_flags.len(), 2);
+    let json = serde_json::to_string(&bundle).unwrap();
+    let decoded: Bundle = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.checksum, decoded.compute_checksum());
+    let mut tampered = decoded.clone();
+    tampered
+        .instruments
+        .iter_mut()
+        .find(|row| row.id == refs.instrument.inner())
+        .unwrap()
+        .broker_block_flags
+        .insert("tinkoff:uid:ordinary".into(), true);
+    assert_ne!(tampered.checksum, tampered.compute_checksum());
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&decoded).unwrap();
+    assert_eq!(
+        restored.export_bundle(owner).unwrap().instruments,
+        bundle.instruments
+    );
+    restored
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:ordinary", false)
+        .unwrap();
+    assert!(
+        restored
+            .instrument(refs.instrument)
+            .unwrap()
+            .unwrap()
+            .blocked_tca_flag
+    );
+    restored
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:blocked", false)
+        .unwrap();
+    assert!(
+        !restored
+            .instrument(refs.instrument)
+            .unwrap()
+            .unwrap()
+            .blocked_tca_flag
+    );
+}
+
+#[test]
+fn an_old_aggregate_only_bundle_keeps_its_flag_until_a_handle_is_refreshed() {
+    let (store, owner, refs) = a_store_holding_one_security_event();
+    let mut bundle = store.export_bundle(owner).unwrap();
+    bundle.schema_version = 17;
+    bundle
+        .instruments
+        .iter_mut()
+        .find(|row| row.id == refs.instrument.inner())
+        .unwrap()
+        .blocked_tca_flag = true;
+    bundle.checksum = bundle.compute_checksum();
+    let json = serde_json::to_string(&bundle).unwrap();
+    assert!(!json.contains("broker_block_flags"));
+    let decoded: Bundle = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.checksum, decoded.compute_checksum());
+    assert!(
+        decoded
+            .instruments
+            .iter()
+            .all(|row| row.broker_block_flags.is_empty())
+    );
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&decoded).unwrap();
+    assert!(
+        restored
+            .instrument(refs.instrument)
+            .unwrap()
+            .unwrap()
+            .blocked_tca_flag
+    );
+    restored
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:known", false)
+        .unwrap();
+    assert!(
+        !restored
+            .instrument(refs.instrument)
+            .unwrap()
+            .unwrap()
+            .blocked_tca_flag
+    );
+}
+
+#[test]
+fn restoring_older_handle_evidence_does_not_overwrite_a_live_instrument() {
+    let (source, owner, refs) = a_store_holding_one_security_event();
+    source
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:archived", true)
+        .unwrap();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut target = SqliteStore::open_in_memory().unwrap();
+    let record = source.instrument(refs.instrument).unwrap().unwrap();
+    target.upsert_instrument(&record).unwrap();
+    target
+        .update_blocked_tca_flag(refs.instrument, "tinkoff:uid:live", false)
+        .unwrap();
+    target.import_bundle(&bundle).unwrap();
+    assert!(
+        !target
+            .instrument(refs.instrument)
+            .unwrap()
+            .unwrap()
+            .blocked_tca_flag
+    );
+    let exported = target.export_bundle(owner).unwrap();
+    let flags = &exported
+        .instruments
+        .iter()
+        .find(|row| row.id == refs.instrument.inner())
+        .unwrap()
+        .broker_block_flags;
+    assert_eq!(flags.len(), 1);
+    assert_eq!(flags.get("tinkoff:uid:live"), Some(&false));
+    assert!(!flags.contains_key("tinkoff:uid:archived"));
+}
+
+#[test]
 fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
     // Instruments are global reference data shared with whatever else the
     // target database holds. Unlike accounts and custody places, which are
@@ -832,6 +992,7 @@ fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
 
@@ -892,6 +1053,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
     store
@@ -906,6 +1068,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 reason: LineageReason::Replacement,
             }),
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
     store
@@ -920,6 +1083,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 reason: LineageReason::Replacement,
             }),
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
 
@@ -2233,6 +2397,7 @@ fn measure_the_size_of_a_realistic_export() {
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,
+                blocked_tca_flag: false,
             })
             .unwrap();
         store

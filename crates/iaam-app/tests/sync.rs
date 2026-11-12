@@ -247,6 +247,7 @@ fn seed_instrument(store: &SqliteStore, instrument: InstrumentId, symbol: &str) 
             kind: None,
             symbol: symbol.to_owned(),
             title: symbol.to_owned(),
+            blocked_tca_flag: false,
             currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
@@ -5885,4 +5886,699 @@ async fn repeated_sync_warns_about_existing_invalid_outbound_transfer_without_de
             .iter()
             .any(|event| event.id == event_id)
     );
+}
+
+#[tokio::test]
+async fn missing_fund_units_diagnostics_only_cover_missing_paired_redemptions() {
+    struct DiagnosticBroker {
+        inner: FakeBroker,
+        calls: Mutex<Vec<Vec<InstrumentId>>>,
+    }
+
+    #[async_trait]
+    impl BrokerChannel for DiagnosticBroker {
+        async fn fetch_account_numbers(
+            &self,
+            context: BrokerRequestContext<'_>,
+        ) -> Result<Vec<String>, BrokerError> {
+            self.inner.fetch_account_numbers(context).await
+        }
+
+        async fn fetch_operations(
+            &self,
+            account: AccountId,
+            broker_account: &str,
+            from: Date,
+            to: Date,
+            context: BrokerRequestContext<'_>,
+        ) -> Result<ParsedOperations, BrokerError> {
+            self.inner
+                .fetch_operations(account, broker_account, from, to, context)
+                .await
+        }
+
+        async fn fetch_portfolio(
+            &self,
+            account: AccountId,
+            broker_account: &str,
+            at: Date,
+            context: BrokerRequestContext<'_>,
+        ) -> Result<PortfolioSnapshot, BrokerError> {
+            self.inner
+                .fetch_portfolio(account, broker_account, at, context)
+                .await
+        }
+
+        async fn diagnose_missing_fund_units(
+            &self,
+            instruments: &[InstrumentId],
+            broker_account: &str,
+            period: (Date, Date),
+            _context: BrokerRequestContext<'_>,
+        ) {
+            assert!(
+                self.inner
+                    .requested_numbers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|number| number == broker_account)
+            );
+            assert_eq!(period, (date!(2026 - 03 - 01), date!(2026 - 03 - 31)));
+            self.calls.lock().unwrap().push(instruments.to_vec());
+        }
+
+        fn channel(&self) -> SourceChannel {
+            self.inner.channel()
+        }
+
+        fn identity_scope(&self) -> IdentityScope {
+            self.inner.identity_scope()
+        }
+    }
+
+    // No units, too few units, excess units, and an unpaired bond refusal.
+    for (held, paired, expected_calls) in [(0, true, 1), (1, true, 0), (3, true, 0), (0, false, 0)]
+    {
+        let owner = OwnerId::new_random();
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let services = services_with(date!(2026 - 03 - 31), |store| {
+            seed_account(store, owner, account, "Main");
+            seed_instrument(store, instrument, "INVENTEDDIAGNOSTIC");
+        });
+        if held > 0 {
+            seed_redemption_history(
+                &services,
+                owner,
+                account,
+                instrument,
+                &[(date!(2026 - 03 - 01), held)],
+            )
+            .await;
+        }
+        let mut inner = api_with_claims(
+            SourceId::new_random(),
+            trade_without_custody(account, instrument),
+            vec![],
+        );
+        let operations = inner.operations.as_mut().unwrap();
+        operations.accepted.clear();
+        for id in ["invented-first-redemption", "invented-second-redemption"] {
+            operations
+                .pending_redemptions
+                .push(iaam_app::ports::PendingFullRedemption {
+                    blocked_tca_flag: false,
+                    withdrawn_quantity: paired.then_some(iaam_core::money::Quantity(Dec::new(
+                        rust_decimal::Decimal::from(2),
+                    ))),
+                    withdrawal_operation_id: paired.then(|| format!("withdrawal-{id}")),
+                    withdrawal_date: paired.then_some(date!(2026 - 03 - 10)),
+                    account,
+                    instrument,
+                    compensation: iaam_core::money::Money::new(
+                        PostedMinor::new(20_000),
+                        CurrencyCode::Rub,
+                    ),
+                    effective_date: date!(2026 - 03 - 15),
+                    idempotency_key: id.to_owned(),
+                    source_operation_id: id.to_owned(),
+                    raw: "{}".to_owned(),
+                });
+        }
+        let broker = DiagnosticBroker {
+            inner,
+            calls: Mutex::new(Vec::new()),
+        };
+        let outcome = sync_broker(
+            &services,
+            &principal(owner),
+            &broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .expect("invented diagnostic sync");
+        assert_eq!(outcome.set_aside, 2);
+        let calls = broker.calls.lock().unwrap();
+        assert_eq!(calls.len(), expected_calls, "held={held}, paired={paired}");
+        if expected_calls > 0 {
+            assert_eq!(*calls, vec![vec![instrument]]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn blocked_fund_redemption_derives_unknown_cost_arrival_once_at_withdrawal_bound() {
+    use iaam_app::ports::PendingFullRedemption;
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::projection::lots::{BasisGap, LotBook, LotKey};
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBLOCKED");
+        store
+            .update_blocked_tca_flag(instrument, "tinkoff:invented-blocked-handle", true)
+            .unwrap();
+    });
+    let quantity = iaam_core::money::Quantity(Dec::new("1.2345".parse().unwrap()));
+    let mut broker = api_with_claims(
+        SourceId::new_random(),
+        trade_without_custody(account, instrument),
+        vec![],
+    );
+    broker.operations.as_mut().unwrap().accepted.clear();
+    broker
+        .operations
+        .as_mut()
+        .unwrap()
+        .pending_redemptions
+        .push(PendingFullRedemption {
+            blocked_tca_flag: true,
+            withdrawn_quantity: Some(quantity),
+            withdrawal_operation_id: Some("invented-blocked-withdrawal".to_owned()),
+            withdrawal_date: Some(date!(2026 - 03 - 10)),
+            account,
+            instrument,
+            compensation: iaam_core::money::Money::new(PostedMinor::new(20_000), CurrencyCode::Rub),
+            effective_date: date!(2026 - 03 - 15),
+            idempotency_key: "invented-blocked-redemption".to_owned(),
+            source_operation_id: "invented-blocked-redemption".to_owned(),
+            raw: "{}".to_owned(),
+        });
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.set_aside, 0, "{:?}", first.recorded);
+    let events = load_all(&services, owner).await;
+    let arrivals: Vec<_> = events.iter().filter(|event| matches!(event.kind, EventKind::OpeningPosition { instrument: id, .. } if id == instrument)).collect();
+    assert_eq!(arrivals.len(), 1);
+    assert!(
+        matches!(arrivals[0].kind, EventKind::OpeningPosition { quantity: q, cost_basis: None, .. } if q == quantity)
+    );
+    assert_eq!(
+        arrivals[0].dates.effective_date(),
+        Some(date!(2026 - 03 - 10))
+    );
+    assert!(events.iter().any(|event| matches!(event.kind, EventKind::CorporateAction { action: CorporateAction::Redemption { instrument: id, quantity: q, .. } } if id == instrument && q == quantity)));
+    let mut lots = LotBook::new(iaam_core::rules::LotRuleVersion(1));
+    let rules = iaam_core::rules::RuleRegistry::with_defaults();
+    let mut ordered: Vec<_> = events.iter().collect();
+    ordered.sort_by_key(|event| event.dates.effective_date());
+    for event in ordered {
+        lots.apply(event, &rules).unwrap();
+    }
+    let entry = lots
+        .entry(&LotKey {
+            account,
+            instrument,
+        })
+        .unwrap();
+    assert_eq!(entry.gap(), Some(BasisGap::RestoredWithoutBasis));
+    assert_eq!(entry.realized(), None);
+    let count = events.len();
+    let again = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.set_aside, 0);
+    let after = load_all(&services, owner).await;
+    assert_eq!(after.len(), count);
+    assert_eq!(after.iter().filter(|event| matches!(event.kind, EventKind::OpeningPosition { instrument: id, .. } if id == instrument)).count(), 1);
+}
+
+#[tokio::test]
+async fn blocked_fund_zero_after_documented_arrival_and_disposal_does_not_derive_more_units() {
+    use iaam_app::ports::PendingFullRedemption;
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBLOCKED");
+        store
+            .update_blocked_tca_flag(instrument, "tinkoff:invented-blocked-handle", true)
+            .unwrap();
+    });
+    let quantity = iaam_core::money::Quantity(Dec::new("1.2345".parse().unwrap()));
+    let mut broker = api_with_claims(
+        SourceId::new_random(),
+        trade_without_custody(account, instrument),
+        vec![],
+    );
+    broker.operations.as_mut().unwrap().accepted.clear();
+    broker
+        .operations
+        .as_mut()
+        .unwrap()
+        .pending_redemptions
+        .push(PendingFullRedemption {
+            blocked_tca_flag: true,
+            withdrawn_quantity: Some(quantity),
+            withdrawal_operation_id: Some("invented-blocked-withdrawal".to_owned()),
+            withdrawal_date: Some(date!(2026 - 03 - 10)),
+            account,
+            instrument,
+            compensation: iaam_core::money::Money::new(PostedMinor::new(20_000), CurrencyCode::Rub),
+            effective_date: date!(2026 - 03 - 15),
+            idempotency_key: "invented-blocked-redemption".to_owned(),
+            source_operation_id: "invented-blocked-redemption".to_owned(),
+            raw: "{}".to_owned(),
+        });
+    let mut bought = trade_without_custody(account, instrument);
+    bought.dates = OperationDates {
+        trade: Some(date!(2026 - 03 - 05)),
+        settled: Some(date!(2026 - 03 - 05)),
+        cash_posted: Some(date!(2026 - 03 - 05)),
+        paid: None,
+    };
+    if let OperationKind::Buy {
+        quantity: bought_quantity,
+        ..
+    } = &mut bought.kind
+    {
+        *bought_quantity = quantity.0;
+    }
+    let mut sold = bought.clone();
+    sold.source_operation_id = Some("invented-disposal-before-redemption".to_owned());
+    sold.dates = OperationDates {
+        trade: Some(date!(2026 - 03 - 12)),
+        settled: Some(date!(2026 - 03 - 12)),
+        cash_posted: Some(date!(2026 - 03 - 12)),
+        paid: None,
+    };
+    sold.kind = OperationKind::Sell {
+        instrument,
+        custody: None,
+        quantity: quantity.0,
+        gross_minor: 15_000,
+        fee_minor: None,
+        basis_fee: None,
+        accrued_interest_minor: None,
+        currency: CurrencyCode::Rub,
+    };
+    broker.operations.as_mut().unwrap().accepted = vec![bought, sold];
+    let result = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.set_aside, 1, "{:?}", result.recorded);
+    let events = load_all(&services, owner).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Trade { .. }))
+            .count(),
+        2
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::OpeningPosition { .. } | EventKind::CorporateAction { .. }
+    )));
+}
+
+#[tokio::test]
+async fn blocked_fund_two_pairs_restore_each_withdrawal_at_its_own_bound() {
+    use iaam_app::ports::PendingFullRedemption;
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBLOCKED");
+        store
+            .update_blocked_tca_flag(instrument, "tinkoff:invented-blocked-handle", true)
+            .unwrap();
+    });
+    let quantity = iaam_core::money::Quantity(Dec::new("1.2345".parse().unwrap()));
+    let mut broker = api_with_claims(
+        SourceId::new_random(),
+        trade_without_custody(account, instrument),
+        vec![],
+    );
+    broker.operations.as_mut().unwrap().accepted.clear();
+    broker
+        .operations
+        .as_mut()
+        .unwrap()
+        .pending_redemptions
+        .push(PendingFullRedemption {
+            blocked_tca_flag: true,
+            withdrawn_quantity: Some(quantity),
+            withdrawal_operation_id: Some("invented-blocked-withdrawal".to_owned()),
+            withdrawal_date: Some(date!(2026 - 03 - 10)),
+            account,
+            instrument,
+            compensation: iaam_core::money::Money::new(PostedMinor::new(20_000), CurrencyCode::Rub),
+            effective_date: date!(2026 - 03 - 15),
+            idempotency_key: "invented-blocked-redemption".to_owned(),
+            source_operation_id: "invented-blocked-redemption".to_owned(),
+            raw: "{}".to_owned(),
+        });
+    let mut second = broker.operations.as_ref().unwrap().pending_redemptions[0].clone();
+    second.withdrawal_operation_id = Some("invented-second-withdrawal".to_owned());
+    second.withdrawal_date = Some(date!(2026 - 03 - 20));
+    second.effective_date = date!(2026 - 03 - 25);
+    second.idempotency_key = "invented-second-redemption".to_owned();
+    second.source_operation_id = "invented-second-redemption".to_owned();
+    broker
+        .operations
+        .as_mut()
+        .unwrap()
+        .pending_redemptions
+        .push(second);
+    let result = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.set_aside, 0, "{:?}", result.recorded);
+    let events = load_all(&services, owner).await;
+    let arrivals: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::OpeningPosition { .. }))
+        .collect();
+    assert_eq!(arrivals.len(), 2);
+    for (event, bound) in arrivals
+        .iter()
+        .zip([date!(2026 - 03 - 10), date!(2026 - 03 - 20)])
+    {
+        assert_eq!(event.dates.effective_date(), Some(bound));
+        assert!(
+            matches!(event.kind, EventKind::OpeningPosition { quantity: q, cost_basis: None, .. } if q == quantity)
+        );
+        assert!(
+            event
+                .provenance
+                .description()
+                .unwrap()
+                .contains("not the true arrival date")
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::CorporateAction { .. }))
+            .count(),
+        2
+    );
+    let mut lots = iaam_core::projection::lots::LotBook::new(iaam_core::rules::LotRuleVersion(1));
+    let rules = iaam_core::rules::RuleRegistry::with_defaults();
+    let mut ordered: Vec<_> = events.iter().collect();
+    ordered.sort_by_key(|event| event.dates.effective_date());
+    for event in ordered {
+        lots.apply(event, &rules).unwrap();
+    }
+    let entry = lots
+        .entry(&iaam_core::projection::lots::LotKey {
+            account,
+            instrument,
+        })
+        .unwrap();
+    assert_eq!(
+        entry.quantity().unwrap(),
+        iaam_core::money::Quantity::zero()
+    );
+    assert_eq!(entry.realized(), None);
+    assert_eq!(
+        entry.gap(),
+        Some(iaam_core::projection::lots::BasisGap::RestoredWithoutBasis)
+    );
+    let again = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.set_aside, 0);
+    assert_eq!(load_all(&services, owner).await.len(), events.len());
+}
+
+#[tokio::test]
+async fn both_paired_withdrawals_derive_when_one_handle_makes_the_catalogue_instrument_blocked() {
+    use iaam_app::ports::PendingFullRedemption;
+    for reverse in [false, true] {
+        let owner = OwnerId::new_random();
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let services = services_with(date!(2026 - 03 - 31), |store| {
+            seed_account(store, owner, account, "Main");
+            seed_instrument(store, instrument, "INVENTEDBLOCKED");
+            let handles = if reverse {
+                [
+                    ("tinkoff:invented-open-handle", false),
+                    ("tinkoff:invented-blocked-handle", true),
+                ]
+            } else {
+                [
+                    ("tinkoff:invented-blocked-handle", true),
+                    ("tinkoff:invented-open-handle", false),
+                ]
+            };
+            for (handle, blocked) in handles {
+                store
+                    .update_blocked_tca_flag(instrument, handle, blocked)
+                    .unwrap();
+            }
+        });
+        let quantity = iaam_core::money::Quantity(Dec::new("1.2345".parse().unwrap()));
+        let mut broker = api_with_claims(
+            SourceId::new_random(),
+            trade_without_custody(account, instrument),
+            vec![],
+        );
+        broker.operations.as_mut().unwrap().accepted.clear();
+        broker
+            .operations
+            .as_mut()
+            .unwrap()
+            .pending_redemptions
+            .push(PendingFullRedemption {
+                blocked_tca_flag: true,
+                withdrawn_quantity: Some(quantity),
+                withdrawal_operation_id: Some("invented-blocked-withdrawal".to_owned()),
+                withdrawal_date: Some(date!(2026 - 03 - 10)),
+                account,
+                instrument,
+                compensation: iaam_core::money::Money::new(
+                    PostedMinor::new(20_000),
+                    CurrencyCode::Rub,
+                ),
+                effective_date: date!(2026 - 03 - 15),
+                idempotency_key: "invented-blocked-redemption".to_owned(),
+                source_operation_id: "invented-blocked-redemption".to_owned(),
+                raw: "{}".to_owned(),
+            });
+        let mut second = broker.operations.as_ref().unwrap().pending_redemptions[0].clone();
+        second.blocked_tca_flag = false;
+        second.withdrawal_operation_id = Some("invented-second-withdrawal".to_owned());
+        second.withdrawal_date = Some(date!(2026 - 03 - 20));
+        second.effective_date = date!(2026 - 03 - 25);
+        second.idempotency_key = "invented-second-redemption".to_owned();
+        second.source_operation_id = "invented-second-redemption".to_owned();
+        broker
+            .operations
+            .as_mut()
+            .unwrap()
+            .pending_redemptions
+            .push(second);
+        if reverse {
+            broker
+                .operations
+                .as_mut()
+                .unwrap()
+                .pending_redemptions
+                .reverse();
+        }
+        let writer = AccountingLogWriter::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || captured.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let result = sync_broker(
+            &services,
+            &principal(owner),
+            &broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.set_aside, 0, "{:?}", result.recorded);
+        let events = load_all(&services, owner).await;
+        let arrivals: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::OpeningPosition { .. }))
+            .collect();
+        assert_eq!(arrivals.len(), 2);
+        assert_eq!(
+            arrivals[0].dates.effective_date(),
+            Some(date!(2026 - 03 - 10))
+        );
+        let redeemed: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::CorporateAction { .. }))
+            .collect();
+        assert_eq!(redeemed.len(), 2);
+        assert_eq!(
+            arrivals[1].dates.effective_date(),
+            Some(date!(2026 - 03 - 20))
+        );
+        let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("catalogue instrument blocked by another broker handle"),
+            "{log}"
+        );
+        assert!(log.contains("tinkoff:invented-blocked-handle"), "{log}");
+        let again = sync_broker(
+            &services,
+            &principal(owner),
+            &broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.set_aside, 0);
+        assert_eq!(load_all(&services, owner).await.len(), events.len());
+    }
+}
+
+#[tokio::test]
+async fn paired_fund_redemption_retires_exact_units_and_never_invents_a_twin_arrival() {
+    use iaam_app::ports::PendingFullRedemption;
+    use iaam_core::event::corporate_action::CorporateAction;
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let twin = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDFUND");
+        seed_instrument(store, twin, "INVENTEDTWIN");
+    });
+    let quantity = iaam_core::money::Quantity(Dec::new(
+        "1.2345"
+            .parse::<rust_decimal::Decimal>()
+            .expect("invented fractional units"),
+    ));
+    let mut purchase = trade_without_custody(account, instrument);
+    if let OperationKind::Buy {
+        quantity: bought, ..
+    } = &mut purchase.kind
+    {
+        *bought = quantity.0;
+    }
+    purchase.dates = OperationDates {
+        trade: Some(date!(2026 - 03 - 01)),
+        settled: None,
+        cash_posted: None,
+        paid: None,
+    };
+    let mut broker = api_with_claims(SourceId::new_random(), purchase, vec![]);
+    let pending = |instrument, id: &str| PendingFullRedemption {
+        blocked_tca_flag: false,
+        withdrawn_quantity: Some(quantity),
+        withdrawal_operation_id: Some(format!("withdrawal-{id}")),
+        withdrawal_date: Some(date!(2026 - 03 - 10)),
+        account,
+        instrument,
+        compensation: iaam_core::money::Money::new(
+            iaam_core::money::PostedMinor::new(20_000),
+            CurrencyCode::Rub,
+        ),
+        effective_date: date!(2026 - 03 - 15),
+        idempotency_key: id.to_owned(),
+        source_operation_id: id.to_owned(),
+        raw: "{}".to_owned(),
+    };
+    broker.operations.as_mut().unwrap().pending_redemptions = vec![
+        pending(instrument, "invented-fund-redemption"),
+        pending(twin, "invented-twin-redemption"),
+    ];
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("paired redemption sync");
+    assert_eq!(first.set_aside, 1, "{:?}", first.recorded);
+    assert!(first.recorded.iter().any(|verdict| matches!(verdict,
+        Verdict::Quarantined { reason } if reason.contains("units never arrived in the operations stream")
+            && reason.contains(&twin.inner().to_string()) && reason.contains("1.2345")
+    )));
+    let events = load_all(&services, owner).await;
+    let redeemed: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::CorporateAction {
+                action:
+                    CorporateAction::Redemption {
+                        instrument,
+                        quantity,
+                        ..
+                    },
+            } => Some((instrument, quantity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(redeemed, vec![(instrument, quantity)]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SecuritiesTransferOut { .. }))
+    );
+    let again = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("repeat paired redemption sync");
+    assert_eq!(again.set_aside, 1);
+    assert!(again.duplicates >= 2);
 }

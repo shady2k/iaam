@@ -533,6 +533,8 @@ pub struct InstrumentView {
     pub settlement_currency: String,
     pub quote_currency: String,
     pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
+    /// Broker-reported trading block, read-only to the owner API.
+    pub blocked_tca_flag: bool,
 }
 
 /// Active instrument alias.
@@ -627,6 +629,17 @@ pub trait InstrumentDirectory: Send + Sync {
     /// Writing is needed by source synchronisation and the administrator; an agent
     /// token is not given access to this method through an HTTP route (§7, §14).
     async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError>;
+
+    /// Broker-namespaced handles currently reporting a block, sorted by handle.
+    async fn blocked_instrument_handles(&self, id: InstrumentId) -> Result<Vec<String>, AppError>;
+
+    /// Refresh one broker-namespaced handle; the catalogue flag is true if any handle is blocked.
+    async fn update_blocked_tca_flag(
+        &self,
+        id: InstrumentId,
+        handle: &str,
+        blocked_tca_flag: bool,
+    ) -> Result<(), AppError>;
 
     /// Resolve an ISIN or atomically record the instrument and its ISIN alias.
     async fn register_instrument_with_isin(
@@ -2186,6 +2199,13 @@ pub struct Quarantined {
 /// A full repayment whose source reports zero units, not a position size.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingFullRedemption {
+    /// Own-handle evidence for diagnostics; the catalogue flag governs derivation.
+    pub blocked_tca_flag: bool,
+    /// Exact units named by a paired withdrawal, not an inferred arrival.
+    pub withdrawn_quantity: Option<iaam_core::money::Quantity>,
+    pub withdrawal_operation_id: Option<String>,
+    /// Date of the paired withdrawal, a bound rather than an acquisition date.
+    pub withdrawal_date: Option<Date>,
     pub account: AccountId,
     pub instrument: InstrumentId,
     pub compensation: iaam_core::money::Money,
@@ -2310,6 +2330,17 @@ pub trait BrokerChannel: Send + Sync {
         &self,
         _instruments: &[InstrumentId],
         _broker_account: &str,
+        _period: (Date, Date),
+        _context: BrokerRequestContext<'_>,
+    ) {
+    }
+
+    /// Best-effort diagnostics for paired fund redemptions whose units never
+    /// arrived. No journal or parsing decision may depend on this hook.
+    async fn diagnose_missing_fund_units(
+        &self,
+        _instruments: &[InstrumentId],
+        _account: &str,
         _period: (Date, Date),
         _context: BrokerRequestContext<'_>,
     ) {

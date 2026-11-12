@@ -271,6 +271,7 @@ fn seed_instrument_id(path: &std::path::Path, id: InstrumentId, symbol: &str) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("journal instrument");
 }
@@ -603,6 +604,7 @@ async fn finam_sync_harness(script: Vec<String>) -> Harness {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("invented instrument");
     store
@@ -834,6 +836,7 @@ async fn seed_market(harness: &Harness) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("market instrument");
 
@@ -989,6 +992,7 @@ async fn seed_bond_market(harness: &Harness) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("bond market instrument");
     store
@@ -1777,6 +1781,48 @@ async fn the_stage_one_question_is_answered_end_to_end() {
 }
 
 #[tokio::test]
+async fn broker_block_is_read_only_in_instrument_api() {
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument(&path, &harness);
+    SqliteStore::open(&path)
+        .unwrap()
+        .update_blocked_tca_flag(harness.instrument, "tinkoff:invented-blocked-handle", true)
+        .unwrap();
+    let (status, loaded) = call(
+        &harness.router,
+        get(
+            &format!("/v1/instruments/{}", harness.instrument.inner()),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["blocked_tca_flag"], true);
+    let (status, edited) = call(
+        &harness.router,
+        post("/v1/instruments", &harness.owner_token, &json!({
+            "id": harness.instrument.inner(), "kind": "share", "symbol": "TEST", "title": "Owner title",
+            "denomination_currency": "RUB", "settlement_currency": "RUB", "quote_currency": "RUB",
+            "blocked_tca_flag": false
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::CREATED, "{edited}");
+    assert_eq!(edited["blocked_tca_flag"], true);
+    let (status, listed) = call(
+        &harness.router,
+        get(
+            &format!("/v1/instruments?ids={}", harness.instrument.inner()),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["instruments"][0]["blocked_tca_flag"], true);
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn instrument_post_retains_broker_metadata_in_its_get_view() {
     let harness = harness().await;
     let metadata = json!({"mic": "XTEST", "board": "TEST", "lot": 10, "price_decimals": 4});
@@ -2014,6 +2060,7 @@ async fn seed_share_quote(harness: &Harness) {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("market instrument");
 
@@ -6991,6 +7038,7 @@ fn seed_directory(store: &SqliteStore) -> InstrumentId {
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("instrument");
     store
@@ -7121,6 +7169,7 @@ async fn a_two_word_namespace_resolves_under_the_spelling_the_contract_publishes
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("instrument");
     store
@@ -35177,6 +35226,7 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
             currencies: CurrencyRoles::uniform(usd),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("instrument");
     SqliteAdapter::new(SqliteStore::open(&path).expect("custody connection"))

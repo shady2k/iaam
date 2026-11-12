@@ -213,6 +213,11 @@ pub struct InstrumentSection {
     pub lineage_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<iaam_core::instrument::InstrumentMetadata>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked_tca_flag: bool,
+    /// Description evidence by broker-namespaced request handle.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub broker_block_flags: std::collections::BTreeMap<String, bool>,
 }
 
 /// An owner classification rule, carried the way `classification_rules`
@@ -1210,7 +1215,7 @@ pub const REFERENCE_CLOSURE_SQL: &str = "
     )
     SELECT n.id, n.kind, n.symbol, n.title,
            n.denomination_currency, n.settlement_currency, n.quote_currency,
-           n.lineage_parent, n.lineage_reason, n.metadata
+           n.lineage_parent, n.lineage_reason, n.metadata, n.blocked_tca_flag
       FROM instruments n JOIN reached r ON n.id = r.id
      ORDER BY n.symbol, n.id
 ";
@@ -1297,6 +1302,7 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("contour_accounts", TableDisposition::Carried),
     ("custody_places", TableDisposition::Carried),
     ("instruments", TableDisposition::Carried),
+    ("instrument_broker_blocks", TableDisposition::Carried),
     // --- The owner's standing decisions (iaam-k3gh.9.2). Carried as of that
     // task: `classification_rules`, `category_rules`, `event_category_assignments`
     // and the account declarations below, each with its own bundle section. ---
@@ -1514,6 +1520,7 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, bool>(10)?,
             ))
         })?;
         let mut instruments = Vec::new();
@@ -1529,6 +1536,7 @@ impl SqliteStore {
                 lineage_parent,
                 lineage_reason,
                 metadata,
+                blocked_tca_flag,
             ) = row?;
             let lineage_parent = lineage_parent
                 .map(|value| parse(&value, "instrument"))
@@ -1544,6 +1552,14 @@ impl SqliteStore {
                 lineage_parent,
                 lineage_reason,
                 metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
+                blocked_tca_flag,
+                broker_block_flags: {
+                    let mut flags = self.conn.prepare(
+                        "SELECT handle, blocked_tca_flag FROM instrument_broker_blocks WHERE instrument = ?1 ORDER BY handle",
+                    )?;
+                    flags.query_map([&id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))?
+                        .collect::<Result<_, _>>()?
+                },
             });
         }
 
@@ -3147,12 +3163,12 @@ impl SqliteStore {
                     still_pending.push(instrument);
                     continue;
                 }
-                transaction.execute(
+                let inserted = transaction.execute(
                     "INSERT INTO instruments
                          (id, kind, symbol, title,
                           denomination_currency, settlement_currency, quote_currency,
-                          lineage_parent, lineage_reason, created_at, metadata)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                          lineage_parent, lineage_reason, created_at, metadata, blocked_tca_flag)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT (id) DO NOTHING",
                     params![
                         instrument.id.to_string(),
@@ -3170,8 +3186,26 @@ impl SqliteStore {
                             .as_ref()
                             .map(serde_json::to_string)
                             .transpose()?,
+                        instrument.blocked_tca_flag,
                     ],
                 )?;
+                if inserted != 0 {
+                    for (handle, blocked) in &instrument.broker_block_flags {
+                        transaction.execute(
+                            "INSERT INTO instrument_broker_blocks (instrument, handle, blocked_tca_flag)
+                             VALUES (?1, ?2, ?3) ON CONFLICT (instrument, handle) DO NOTHING",
+                            params![instrument.id.to_string(), handle, blocked],
+                        )?;
+                    }
+                    if !instrument.broker_block_flags.is_empty() {
+                        transaction.execute(
+                            "UPDATE instruments SET blocked_tca_flag = EXISTS(
+                                SELECT 1 FROM instrument_broker_blocks WHERE instrument = ?1 AND blocked_tca_flag = 1
+                             ) WHERE id = ?1",
+                            [instrument.id.to_string()],
+                        )?;
+                    }
+                }
                 placed.insert(instrument.id);
                 progressed = true;
             }

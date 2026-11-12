@@ -142,6 +142,7 @@ fn seed_instrument(store: &mut SqliteStore, instrument: InstrumentId, symbol: &s
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap_or_else(|error| panic!("insert instrument: {error}"));
 }

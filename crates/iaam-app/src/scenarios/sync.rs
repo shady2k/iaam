@@ -325,6 +325,7 @@ pub async fn sync_broker(
     );
     let mut diagnostic_instruments =
         audit_outbound_transfers(&bounded_events, account, broker_context.deadline)?;
+    let mut missing_fund_units = std::collections::BTreeSet::new();
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -626,9 +627,57 @@ pub async fn sync_broker(
                     recorded.push(Verdict::Duplicate { existing });
                     continue;
                 }
-                match resolve_full_redemption(services, principal.owner, &pending).await? {
+                let mut resolved =
+                    resolve_full_redemption(services, principal.owner, &pending).await?;
+                if resolved.as_ref().is_err_and(|refusal| refusal.zero_holding)
+                    && let Some(bound) = pending.withdrawal_date
+                    && let Some(event) =
+                        derived_blocked_arrival(services, principal, &channel, &pending, bound)
+                            .await?
+                {
+                    let key = event
+                        .provenance
+                        .source_operation_id()
+                        .map(|id| dedup::DedupKey::SourceOperationId(id.to_owned()));
+                    let (decision, _) = dedup::assess_with_rule(
+                        key.as_ref(),
+                        event.provenance.raw_hash(),
+                        &context,
+                        &known,
+                    );
+                    if !matches!(decision, DedupDecision::Duplicate { .. }) {
+                        let result = crate::scenarios::ingest::append_checked(
+                            services,
+                            vec![event.clone()],
+                            broker.identity_scope(),
+                        )
+                        .await?;
+                        let verdict = verdict_from_recorded(&result, &mut duplicates);
+                        if let Some(event_id) = event_id_from_verdict(&verdict) {
+                            known.push(known_record(&event, event_id));
+                            tracing::info!(
+                                instrument = %pending.instrument.inner(),
+                                withdrawal_operation_id = ?pending.withdrawal_operation_id,
+                                redemption_operation_id = %pending.source_operation_id,
+                                "blocked-asset units arrival derived from withdrawal"
+                            );
+                            tracing::debug!(
+                                instrument = %pending.instrument.inner(),
+                                withdrawal_bound = %bound,
+                                "derived arrival date is a withdrawal bound, not the true arrival date"
+                            );
+                        }
+                        recorded.push(verdict);
+                    }
+                    resolved = resolve_full_redemption(services, principal.owner, &pending).await?;
+                }
+                match resolved {
                     Ok(submitted) => submitted,
-                    Err(reason) => {
+                    Err(refusal) => {
+                        if refusal.missing_fund_units {
+                            missing_fund_units.insert(pending.instrument);
+                        }
+                        let reason = refusal.reason;
                         diagnostic_instruments.insert(pending.instrument);
                         tracing::debug!(phase = "map", row_index, reason = %reason, "broker full redemption set aside");
                         let key = SourceRowKey {
@@ -770,6 +819,17 @@ pub async fn sync_broker(
             known.push(known_record(&event, event_id));
         }
         recorded.push(verdict);
+    }
+
+    if !missing_fund_units.is_empty() {
+        broker
+            .diagnose_missing_fund_units(
+                &missing_fund_units.into_iter().collect::<Vec<_>>(),
+                &broker_account,
+                (from, to),
+                broker_context,
+            )
+            .await;
     }
 
     if !diagnostic_instruments.is_empty() {
@@ -1423,11 +1483,151 @@ async fn held_quantity_before_transfer(
         .unwrap_or_else(Quantity::zero))
 }
 
+struct FullRedemptionRefusal {
+    reason: String,
+    missing_fund_units: bool,
+    zero_holding: bool,
+}
+
+/// Restores only units proved by a paired withdrawal of a blocked instrument.
+/// Its date bounds the missing history; it does not assert an acquisition date.
+async fn derived_blocked_arrival(
+    services: &AppServices,
+    principal: &Principal,
+    channel: &SourceChannel,
+    pending: &crate::ports::PendingFullRedemption,
+    bound: Date,
+) -> Result<Option<Event>, AppError> {
+    use iaam_ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
+
+    let (Some(quantity), Some(withdrawal_id), Some(_)) = (
+        pending.withdrawn_quantity,
+        pending.withdrawal_operation_id.as_ref(),
+        pending.withdrawal_date,
+    ) else {
+        return Ok(None);
+    };
+    if !quantity.0.is_positive() {
+        return Ok(None);
+    }
+    let instrument = services
+        .directory
+        .as_ref()
+        .instrument(pending.instrument)
+        .await?;
+    if !instrument.is_some_and(|instrument| instrument.blocked_tca_flag) {
+        return Ok(None);
+    }
+    if !pending.blocked_tca_flag && tracing::enabled!(tracing::Level::DEBUG) {
+        let blocking_handles = services
+            .directory
+            .blocked_instrument_handles(pending.instrument)
+            .await?;
+        tracing::debug!(
+            instrument = %pending.instrument.inner(),
+            withdrawal_operation_id = %withdrawal_id,
+            redemption_operation_id = %pending.source_operation_id,
+            withdrawal_handle_blocked_tca_flag = false,
+            ?blocking_handles,
+            "catalogue instrument blocked by another broker handle"
+        );
+    }
+    let history = services
+        .store
+        .load_events_through(principal.owner, pending.effective_date)
+        .await?;
+    let effective =
+        iaam_core::event::correction::resolve(&history).map_err(AppError::Correction)?;
+    if effective.iter().any(|event| {
+        let derived = event
+            .provenance
+            .source_operation_id()
+            .is_some_and(|id| id.starts_with("derived-blocked-arrival/withdrawal/"));
+        !derived
+            && event.legs.iter().any(|leg| {
+                leg.account == pending.account
+                    && leg.instrument == Some(pending.instrument)
+                    && leg.kind == iaam_core::event::leg::LegKind::SecurityQuantity
+                    && leg
+                        .quantity
+                        .is_some_and(|quantity| quantity.0.is_positive())
+            })
+    }) {
+        tracing::debug!(
+            instrument = %pending.instrument.inner(),
+            withdrawal_operation_id = %withdrawal_id,
+            reason = "recorded_arrival_exists",
+            "blocked-asset arrival not derived from a zero balance after recorded arrivals"
+        );
+        return Ok(None);
+    }
+    let identity = format!("derived-blocked-arrival/withdrawal/{withdrawal_id}");
+    let operation = SubmittedOperation {
+        account: pending.account,
+        kind: OperationKind::OpeningPosition {
+            instrument: pending.instrument,
+            custody: None,
+            quantity: quantity.0,
+            cost_basis_minor: None,
+            currency: pending.compensation.currency(),
+            assertions: Some(iaam_core::event::kind::OpeningAssertions::default()),
+        },
+        dates: OperationDates {
+            settled: Some(bound),
+            ..OperationDates::default()
+        },
+        source_time: None,
+        idempotency_key: Some(identity.clone()),
+        source_operation_id: Some(identity),
+        source_position_id: None,
+        source_category: None,
+        owner_category: None,
+        source_code: None,
+        source_kind: None,
+        description: Some(format!(
+            "Derived from broker withdrawal {withdrawal_id} paired with redemption {}; \
+             no arrival exists in the operations stream. Date {bound} is this \
+             paired withdrawal bound, not the true arrival date. Acquisition date \
+             and cost basis are unknown.",
+            pending.source_operation_id,
+        )),
+        counterparty: None,
+    };
+    let mut event = normalize(
+        &operation,
+        &NormalizationContext {
+            owner: principal.owner,
+            source: channel.source,
+            parser_version: channel.parser_version.clone(),
+        },
+    )
+    .map_err(|rejection| AppError::Invalid {
+        field: rejection.field,
+        expected: rejection.expected,
+        actual: rejection.actual,
+    })?
+    .event;
+    event.confidence = Confidence::Estimated;
+    event.provenance = event
+        .provenance
+        .with_declared_by(PrincipalId(principal.token_id));
+    if let Some(rejection) =
+        crate::scenarios::ingest::structural_rejection(&event, "derived_arrival")
+    {
+        return Err(AppError::Invalid {
+            field: rejection.field,
+            expected: rejection.expected,
+            actual: rejection.actual,
+        });
+    }
+    Ok(Some(event))
+}
+
 async fn resolve_full_redemption(
     services: &AppServices,
     owner: OwnerId,
     pending: &crate::ports::PendingFullRedemption,
-) -> Result<Result<iaam_ingest::SubmittedJournalEvent, String>, AppError> {
+) -> Result<Result<iaam_ingest::SubmittedJournalEvent, FullRedemptionRefusal>, AppError> {
     use iaam_core::event::corporate_action::CorporateAction;
     use iaam_core::projection::balances::{Balances, PositionKey};
     let events = services
@@ -1442,20 +1642,57 @@ async fn resolve_full_redemption(
             .map_err(iaam_core::projection::ProjectionError::from)
             .map_err(AppError::from_projection)?;
     }
-    let Some(quantity) = balances
-        .position(&PositionKey {
-            account: pending.account,
-            instrument: pending.instrument,
-        })
+    let held = balances.position(&PositionKey {
+        account: pending.account,
+        instrument: pending.instrument,
+    });
+    if let Some(withdrawn) = pending.withdrawn_quantity {
+        let held = held.unwrap_or_else(iaam_core::money::Quantity::zero);
+        if held != withdrawn {
+            let reason = if !held.0.is_positive() {
+                "units never arrived in the operations stream"
+            } else if held.0 < withdrawn.0 {
+                "withdrawn units exceed the holding recorded in the operations stream"
+            } else {
+                "full redemption withdrawal does not retire the entire recorded holding"
+            };
+            tracing::debug!(
+                phase = "map",
+                instrument = %pending.instrument.inner(),
+                withdrawal_operation_id = ?pending.withdrawal_operation_id,
+                redemption_operation_id = %pending.source_operation_id,
+                withdrawn_quantity = %withdrawn.0.inner(),
+                held_quantity = %held.0.inner(),
+                reason,
+                "fund unit redemption set aside; no arrival inferred"
+            );
+            return Ok(Err(FullRedemptionRefusal {
+                reason: format!(
+                    "fund unit redemption of instrument {}: {} units withdrawn; {reason}",
+                    pending.instrument.inner(),
+                    withdrawn.0.inner()
+                ),
+                missing_fund_units: !held.0.is_positive(),
+                zero_holding: held == iaam_core::money::Quantity::zero(),
+            }));
+        }
+    }
+    let Some(quantity) = pending
+        .withdrawn_quantity
+        .or(held)
         .filter(|quantity| quantity.0.is_positive())
     else {
         if tracing::enabled!(tracing::Level::DEBUG) {
             trace_full_redemption_refusal(services, pending, &effective).await;
         }
-        return Ok(Err(format!(
-            "bond redemption reports zero quantity and the journal holds no positive position of this instrument on this account at {}; history may start after the holding",
-            pending.effective_date
-        )));
+        return Ok(Err(FullRedemptionRefusal {
+            reason: format!(
+                "bond redemption reports zero quantity and the journal holds no positive position of this instrument on this account at {}; history may start after the holding",
+                pending.effective_date
+            ),
+            missing_fund_units: false,
+            zero_holding: false,
+        }));
     };
     Ok(Ok(iaam_ingest::SubmittedJournalEvent {
         account: pending.account,
@@ -2132,6 +2369,7 @@ mod market_tests {
                 kind: Some(InstrumentKind::Share),
                 symbol: "SBER".to_owned(),
                 title: "Sberbank".to_owned(),
+                blocked_tca_flag: false,
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,

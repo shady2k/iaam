@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::client::REQUEST_TIMEOUT;
 use crate::destination::Destination;
-use crate::gateway::{BootTime, Clock};
+use crate::gateway::{BootTime, Budget, Clock, DIAGNOSTIC_REQUEST_RESERVE};
 
 const HEADER: &str = "iaam-outbound-tally-v4";
 pub(crate) const TALLY_FILE: &str = "outbound-tally";
@@ -518,6 +518,39 @@ impl OutboundTally {
             (Ok(_), Err(error)) => Err(error),
             (Ok(minted), Ok(())) => Ok(minted),
         }
+    }
+
+    pub(crate) fn diagnostic_allowed(
+        &self,
+        host: &str,
+        budget_key: &str,
+        budget: &Budget,
+        clock: &dyn Clock,
+    ) -> Result<bool, TallyError> {
+        self.transact(|state| {
+            let boot = read_boot(clock)?;
+            let now = boot.elapsed().as_nanos();
+            let mut changed = state.prepare_boot(&boot)?;
+            changed |= state.prune(now);
+            let host_state = state.host_for_boot(host, now);
+            let stopped = Self::active_refusal(host_state, now).is_some()
+                || host_state.pending_since.is_some()
+                || host_state.boot_wait_until.is_some_and(|until| until > now)
+                || host_state.daily_sends.len()
+                    >= DAILY_CEILING.saturating_sub(DIAGNOSTIC_REQUEST_RESERVE) as usize;
+            let used = state
+                .sends
+                .get(&(host.to_owned(), budget_key.to_owned()))
+                .map_or(0, |sent| {
+                    sent.iter()
+                        .filter(|at| now.saturating_sub(**at) < budget.window.as_nanos())
+                        .count()
+                });
+            Ok((
+                !stopped && used < budget.used.saturating_sub(DIAGNOSTIC_REQUEST_RESERVE) as usize,
+                changed,
+            ))
+        })
     }
 
     pub(crate) fn decide_and_record(

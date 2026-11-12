@@ -493,6 +493,7 @@ mod tests {
                 currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
                 metadata: None,
+                blocked_tca_flag: false,
             })
             .expect("instrument");
         let observed_at = "2026-08-27T12:00:00Z";

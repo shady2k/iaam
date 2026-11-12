@@ -47,6 +47,9 @@ mod report;
 #[path = "tinkoff_diagnostics.rs"]
 mod diagnostics;
 
+#[path = "tinkoff_fund_redemption.rs"]
+mod fund_redemption;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
@@ -65,6 +68,7 @@ struct CachedDescription<T = BrokerInstrumentDescription> {
     uid_not_found: bool,
     probes: HashSet<String>,
     broker_instrument_type: Option<String>,
+    request_handle: String,
 }
 
 /// Broker channel implementation for T-Invest.
@@ -152,18 +156,11 @@ impl TinkoffChannel {
         descriptions: &mut HashMap<String, CachedDescription<T>>,
         (method, parse): (DescriptionMethod, DescriptionParser<T>),
     ) -> Result<CachedDescription<T>, BrokerError> {
-        let key = match id_type {
-            InstrumentIdType::Uid => format!(
-                "uid:{}",
-                Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string())
-            ),
-            InstrumentIdType::Figi => format!("figi:{id}"),
-            InstrumentIdType::PositionUid => format!("position_uid:{id}"),
-        };
-        if descriptions
+        let key = description_handle(id, id_type);
+        let cache_hit = descriptions
             .get(&key)
-            .is_none_or(|cached| cached.read_at.elapsed() >= std::time::Duration::from_secs(3600))
-        {
+            .is_some_and(|cached| cached.read_at.elapsed() < std::time::Duration::from_secs(3600));
+        if !cache_hit {
             tracing::info!(
                 phase = "describe_instruments",
                 status = "start",
@@ -207,6 +204,7 @@ impl TinkoffChannel {
                     uid_not_found,
                     probes: HashSet::new(),
                     broker_instrument_type,
+                    request_handle: key.clone(),
                 },
             );
         }
@@ -248,6 +246,7 @@ impl TinkoffChannel {
                                         .as_str()
                                         .map(str::to_owned)
                                 });
+                        cached.request_handle = description_handle(identifier, fallback_type);
                         cached.description = parse(&body);
                         cached.uid_not_found = false;
                         tracing::info!(
@@ -285,6 +284,12 @@ impl TinkoffChannel {
                 }
             }
         }
+        tracing::debug!(
+            phase = "describe_instruments",
+            request_handle = cached.request_handle,
+            cache_hit,
+            "broker description resolved"
+        );
         Ok(cached.clone())
     }
 
@@ -295,11 +300,27 @@ impl TinkoffChannel {
         on: Date,
         context: BrokerRequestContext<'_>,
     ) -> Result<Result<InstrumentId, String>, BrokerError> {
+        Ok(self
+            .resolve_instrument_with_flag(uid, raw, on, context)
+            .await?
+            .map(|(instrument, _)| instrument))
+    }
+
+    async fn resolve_instrument_with_flag(
+        &self,
+        uid: Option<&str>,
+        raw: &serde_json::Value,
+        on: Date,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<Result<(InstrumentId, bool), String>, BrokerError> {
         let (id, id_type) = match uid.filter(|value| !value.is_empty()) {
             Some(uid) => (uid, InstrumentIdType::Uid),
             None => match raw.get("figi").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
                 Some(figi) => (figi, InstrumentIdType::Figi),
-                None => return Ok(Err("instrument description cannot be requested: the row supplies neither instrument UID nor FIGI".to_owned())),
+                None => match raw.get("positionUid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
+                    Some(position) => (position, InstrumentIdType::PositionUid),
+                    None => return Ok(Err("instrument description cannot be requested: the row supplies neither instrument UID, FIGI nor position UID".to_owned())),
+                },
             },
         };
         let mut descriptions = self.descriptions.lock().await;
@@ -314,6 +335,7 @@ impl TinkoffChannel {
                 }),
             )
             .await?;
+        let request_handle = cached.request_handle;
         let description = cached.description;
         let uid_not_found = cached.uid_not_found;
         let broker_instrument_type = cached.broker_instrument_type;
@@ -329,6 +351,12 @@ impl TinkoffChannel {
                 )));
             }
         };
+        tracing::debug!(
+            phase = "describe_instruments",
+            lookup_identifier = id,
+            blocked_tca_flag = description.blocked_tca_flag,
+            "broker instrument description parsed"
+        );
         if description
             .isin
             .as_deref()
@@ -344,19 +372,51 @@ impl TinkoffChannel {
             );
             return Ok(Err(format!("instrument {id} description names no ISIN")));
         }
-        super::catalogue::resolve_or_record(
+        let instrument = super::catalogue::resolve_or_record(
             self.instruments.as_ref(),
             &description,
             self.source,
             on,
         )
         .await
-        .map(Ok)
         .map_err(|error| BrokerError::Adapter {
             broker: BROKER.to_owned(),
             detail: error.to_string(),
-        })
+        })?;
+        self.instruments
+            .update_blocked_tca_flag(instrument, &request_handle, description.blocked_tca_flag)
+            .await
+            .map_err(|error| BrokerError::Adapter {
+                broker: BROKER.to_owned(),
+                detail: error.to_string(),
+            })?;
+        tracing::debug!(
+            phase = "describe_instruments",
+            instrument = %instrument.inner(),
+            request_handle,
+            instrument_uid = raw.get("instrumentUid").and_then(serde_json::Value::as_str),
+            figi = raw.get("figi").and_then(serde_json::Value::as_str),
+            position_uid = raw.get("positionUid").and_then(serde_json::Value::as_str),
+            blocked_tca_flag = description.blocked_tca_flag,
+            "broker instrument blocking flag refreshed"
+        );
+        Ok(Ok((instrument, description.blocked_tca_flag)))
     }
+}
+
+fn description_handle(id: &str, id_type: InstrumentIdType) -> String {
+    let (kind, identifier) = match id_type {
+        InstrumentIdType::Uid | InstrumentIdType::PositionUid => (
+            if id_type == InstrumentIdType::Uid {
+                "uid"
+            } else {
+                "position_uid"
+            },
+            Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string()),
+        ),
+        InstrumentIdType::Figi => ("figi", id.to_owned()),
+    };
+    format!("tinkoff:{kind}:{identifier}")
 }
 
 fn trace_instrument_lookup(
@@ -456,6 +516,27 @@ fn trace_instrument_miss(
     );
 }
 
+fn received_by_type(operations: &[ChannelOperation]) -> std::collections::BTreeMap<&str, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for operation in operations {
+        let kind = operation
+            .raw
+            .get("type")
+            .or_else(|| operation.raw.get("operationType"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or_else(|| {
+                if operation.source_kind.is_empty() {
+                    "<missing>"
+                } else {
+                    &operation.source_kind
+                }
+            });
+        *counts.entry(kind).or_default() += 1;
+    }
+    counts
+}
+
 #[async_trait]
 impl BrokerChannel for TinkoffChannel {
     async fn diagnose_instruments(
@@ -466,6 +547,17 @@ impl BrokerChannel for TinkoffChannel {
         context: BrokerRequestContext<'_>,
     ) {
         self.trace_instrument_history(instruments, broker_account, period, context)
+            .await;
+    }
+
+    async fn diagnose_missing_fund_units(
+        &self,
+        instruments: &[InstrumentId],
+        broker_account: &str,
+        period: (Date, Date),
+        context: BrokerRequestContext<'_>,
+    ) {
+        self.trace_missing_fund_units(instruments, broker_account, period, context)
             .await;
     }
 
@@ -508,6 +600,11 @@ impl BrokerChannel for TinkoffChannel {
                 .await
         })
         .await?;
+        tracing::info!(
+            phase = "fetch_operations",
+            received_by_type = ?received_by_type(&operations),
+            "received T-Invest operation types"
+        );
         let mut diagnostic_operations = diagnostics::capture(&operations);
         self.resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;
@@ -523,15 +620,18 @@ impl BrokerChannel for TinkoffChannel {
         let mut refused = Vec::new();
         let mut currency_cache = HashMap::new();
         let mut currency_rows = HashMap::new();
+        let mut blocking_flags = HashMap::new();
         for (operation_index, mut operation) in operations.into_iter().enumerate() {
             let has_identity = operation.instrument_uid.is_some()
-                || ["figi", "ticker", "isin"].into_iter().any(|key| {
-                    operation
-                        .raw
-                        .get(key)
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
-                });
+                || ["figi", "ticker", "isin", "positionUid"]
+                    .into_iter()
+                    .any(|key| {
+                        operation
+                            .raw
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| !value.is_empty())
+                    });
             let kind = self.dictionary.kind_of(&operation.source_kind);
             let is_currency = operation
                 .raw
@@ -576,7 +676,7 @@ impl BrokerChannel for TinkoffChannel {
                 };
                 match result {
                     Ok(description) => {
-                        tracing::debug!(phase = "describe_currency", iso_currency = description.nominal.currency().code(), settlement = description.settlement.code(), lot = description.lot, nominal = ?description.nominal.value(), "currency description read");
+                        tracing::debug!(phase = "describe_currency", iso_currency = description.nominal.currency().code(), settlement = description.settlement.code(), lot = description.lot, blocked_tca_flag = description.blocked_tca_flag, nominal = ?description.nominal.value(), "currency description read");
                         currency_rows.insert(operation.deduplication_key.clone(), description);
                     }
                     Err(reason) => {
@@ -593,7 +693,7 @@ impl BrokerChannel for TinkoffChannel {
                 && !(is_currency && matches!(kind, ChannelOperationKind::Commission))
             {
                 match self
-                    .resolve_instrument(
+                    .resolve_instrument_with_flag(
                         operation.instrument_uid.as_deref(),
                         &operation.raw,
                         operation.date.unwrap_or(from),
@@ -601,7 +701,8 @@ impl BrokerChannel for TinkoffChannel {
                     )
                     .await?
                 {
-                    Ok(instrument) => {
+                    Ok((instrument, blocked_tca_flag)) => {
+                        blocking_flags.insert(operation.operation_id.clone(), blocked_tca_flag);
                         if let Some(row) = diagnostic_operations.get_mut(operation_index) {
                             row.instrument = Some(instrument);
                         }
@@ -642,6 +743,14 @@ impl BrokerChannel for TinkoffChannel {
         *self.diagnostic_operations.lock().await = diagnostic_operations;
         let (mut parsed, accounting) =
             adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
+        for pending in &mut parsed.pending_redemptions {
+            pending.blocked_tca_flag = pending
+                .withdrawal_operation_id
+                .as_ref()
+                .and_then(|id| blocking_flags.get(id))
+                .copied()
+                .unwrap_or(false);
+        }
         let quarantined_instrument_resolution = refused.len();
         parsed.quarantined.extend(refused);
         tracing::info!(
@@ -658,6 +767,7 @@ impl BrokerChannel for TinkoffChannel {
             quarantined_trade = accounting.quarantined_trade,
             quarantined_conversion = accounting.quarantined_conversion,
             reduced_no_execution_trades = accounting.reduced_no_execution_trades,
+            reduced_paired_fund_withdrawals = accounting.reduced_paired_fund_withdrawals,
             emitted_operations =
                 parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
             "T-Invest operations accounted"
@@ -1067,6 +1177,7 @@ impl RowRefusal {
 struct OperationAccounting {
     source_rows_accepted: usize,
     reduced_no_execution_trades: usize,
+    reduced_paired_fund_withdrawals: usize,
     quarantined_parse: usize,
     quarantined_kind_not_in_dictionary: usize,
     quarantined_securities_transfer: usize,
@@ -1113,7 +1224,9 @@ fn adapt_operations_with_currencies(
     let mut quarantined = Vec::new();
     let mut accounting = OperationAccounting::default();
     let source_rows = operations.len();
-    for mut operation in operations {
+    let mut operations = operations;
+    let pairing = fund_redemption::prepare(&mut operations, dictionary);
+    for (operation_index, mut operation) in operations.into_iter().enumerate() {
         let operation_id = if operation.operation_id.is_empty() {
             operation
                 .raw
@@ -1154,6 +1267,18 @@ fn adapt_operations_with_currencies(
             continue;
         }
 
+        if let Some(reason) = pairing.refusals.get(&operation_index) {
+            quarantined.push(Quarantined {
+                raw,
+                reason: reason.clone(),
+                dimensions: cash_positions(),
+            });
+            continue;
+        }
+        if pairing.withdrawals.contains(&operation_index) {
+            accounting.reduced_paired_fund_withdrawals += 1;
+            continue;
+        }
         if matches!(kind, ChannelOperationKind::Other(_)) {
             accounting.quarantined_kind_not_in_dictionary += 1;
             let dictionary = iaam_broker::tinkoff::dictionary_seed::TINKOFF_SEED_NAME;
@@ -1239,7 +1364,16 @@ fn adapt_operations_with_currencies(
                 .is_some_and(|quantity| quantity == iaam_core::money::Quantity::zero())
             {
                 match pending_redemption(account, &operation, raw.to_string()) {
-                    Ok(pending) => pending_redemptions.push(pending),
+                    Ok(mut pending) => {
+                        if let Some((quantity, operation_id, withdrawal_date)) =
+                            pairing.redemptions.get(&operation_index)
+                        {
+                            pending.withdrawn_quantity = Some(*quantity);
+                            pending.withdrawal_operation_id = Some(operation_id.clone());
+                            pending.withdrawal_date = Some(*withdrawal_date);
+                        }
+                        pending_redemptions.push(pending);
+                    }
                     Err(error) => {
                         trace_quarantined_operation(&operation_id, &source_kind, "conversion");
                         quarantined.push(Quarantined {
@@ -1335,8 +1469,10 @@ fn adapt_operations_with_currencies(
             }
         }
     }
-    accounting.source_rows_accepted =
-        source_rows - quarantined.len() - accounting.reduced_no_execution_trades;
+    accounting.source_rows_accepted = source_rows
+        - quarantined.len()
+        - accounting.reduced_no_execution_trades
+        - accounting.reduced_paired_fund_withdrawals;
     accounting.quarantined_conversion = quarantined.len()
         - accounting.quarantined_parse
         - accounting.quarantined_kind_not_in_dictionary
@@ -1453,6 +1589,10 @@ fn pending_redemption(
         compensation: iaam_core::money::Money::new(payment.amount, payment.currency),
         idempotency_key: operation.deduplication_key.clone(),
         source_operation_id: operation.operation_id.clone(),
+        withdrawn_quantity: None,
+        blocked_tca_flag: false,
+        withdrawal_operation_id: None,
+        withdrawal_date: None,
         raw,
     })
 }
@@ -2269,6 +2409,7 @@ pub(crate) mod fake {
         pub(crate) status: u16,
         pub(crate) body: String,
         pub(crate) reset: Option<Duration>,
+        pub(crate) remaining: Option<u64>,
     }
 
     impl Answer {
@@ -2277,6 +2418,7 @@ pub(crate) mod fake {
                 status,
                 body: body.to_owned(),
                 reset: None,
+                remaining: None,
             }
         }
     }
@@ -2320,6 +2462,8 @@ pub(crate) mod fake {
             Ok(HttpResponse {
                 status: answer.status,
                 body: answer.body.as_bytes().to_vec(),
+                rate_remaining: answer.remaining,
+                rate_reset: answer.reset.map(|reset| reset.as_secs()),
                 retry_after: answer
                     .reset
                     .filter(|_| request.reset_header() == Some("x-ratelimit-reset")),
@@ -2755,8 +2899,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn position_refusal_diagnostics_cancel_a_local_mutex_wait_at_the_sync_deadline() {
-        let (gateway, requests, _) = fake::gateway(Vec::new(), None);
+        let (gateway, requests, _) = fake::gateway(vec![Answer::status(200, "{}")], None);
         let channel = channel(gateway);
+        // A normal sync has already made required calls before diagnostics.
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
         let writer = InstrumentLog::default();
         let captured = writer.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2789,10 +2945,225 @@ mod tests {
             elapsed <= bound + std::time::Duration::from_millis(1),
             "diagnostic outlived its deadline: {elapsed:?}"
         );
-        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 1);
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("phase=\"position_refusal_history\""), "{log}");
         assert!(log.contains("status=\"deadline_elapsed\""), "{log}");
+    }
+
+    #[test]
+    fn received_type_counts_include_unmapped_and_refused_operations() {
+        let mut input = report_operation();
+        input.source_kind = "OPERATION_TYPE_INPUT_SECURITIES".to_owned();
+        input.raw = serde_json::json!({"type":"OPERATION_TYPE_INPUT_SECURITIES"});
+        let mut unknown = report_operation();
+        unknown.source_kind.clear();
+        unknown.raw = serde_json::json!({"type":"OPERATION_TYPE_NOT_IN_DICTIONARY"});
+        unknown.rejection = Some(iaam_broker::tinkoff::ParseError::PartialResponse);
+        assert_eq!(
+            super::received_by_type(&[input.clone(), unknown, input]),
+            std::collections::BTreeMap::from([
+                ("OPERATION_TYPE_INPUT_SECURITIES", 2),
+                ("OPERATION_TYPE_NOT_IN_DICTIONARY", 1),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn position_refusal_diagnostics_skip_low_remaining_without_report_requests() {
+        let (gateway, requests, _) = fake::gateway(
+            vec![Answer {
+                status: 200,
+                body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
+                reset: Some(Duration::from_secs(30)),
+                remaining: Some(5),
+            }],
+            None,
+        );
+        let channel = channel(gateway);
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        channel
+            .trace_instrument_history(
+                &[InstrumentId::new_random()],
+                "invented",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+            )
+            .await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("low_rate_capacity_or_host_pause"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn missing_fund_units_cross_checks_only_formation_windows_without_recording() {
+        let legacy = serde_json::json!({"operations":[
+            {"id":"invented-arrival", "operationType":"OPERATION_TYPE_INPUT_SECURITIES", "figi":"OLD_FIGI", "isin":"INVENTED_TWIN_ISIN", "quantity":"3", "date":"2023-11-01T12:00:00Z"},
+            {"id":"unrelated-legacy", "operationType":"OPERATION_TYPE_OUTPUT", "figi":"UNRELATED"}
+        ]});
+        let report = serde_json::json!({"getBrokerReportResponse":{
+            "brokerReport":[{"figi":"OLD_FIGI", "name":"invented historical fund", "quantity":"3"}, {"figi":"UNRELATED", "name":"unrelated report name"}],
+            "itemsCount":2,"pagesCount":1,"page":0
+        }});
+        let mut answers = vec![Answer::status(200, "{}")];
+        for _ in 0..3 {
+            answers.push(Answer::status(200, &legacy.to_string()));
+        }
+        for _ in 0..3 {
+            answers.push(Answer::status(
+                200,
+                r#"{"generateBrokerReportResponse":{"taskId":"invented-formation-task"}}"#,
+            ));
+            answers.push(Answer::status(200, &report.to_string()));
+        }
+        let (gateway, requests, _) = fake::gateway(answers, None);
+        let channel = channel(gateway);
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let affected = InstrumentId::new_random();
+        let mut operation = report_operation();
+        operation.raw = serde_json::json!({"id":"invented-withdrawal", "figi":"NEW_FIGI", "isin":"INVENTED_TWIN_ISIN", "date":"2026-08-20T00:00:00Z"});
+        let mut rows = super::diagnostics::capture(&[operation]);
+        rows[0].instrument = Some(affected);
+        *channel.diagnostic_operations.lock().await = rows;
+        channel
+            .trace_missing_fund_units(
+                &[affected],
+                "invented",
+                (
+                    time::macros::date!(2015 - 01 - 01),
+                    time::macros::date!(2026 - 11 - 12),
+                ),
+                broker_context(None),
+            )
+            .await;
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 10);
+        let legacy_requests: Vec<serde_json::Value> = sent[1..4]
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(legacy_requests[0]["from"], "2023-10-01T00:00:00Z");
+        assert_eq!(legacy_requests[2]["to"], "2023-12-31T23:59:59.999999999Z");
+        for request in &legacy_requests {
+            let from = time::OffsetDateTime::parse(
+                request["from"].as_str().unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+            let to = time::OffsetDateTime::parse(
+                request["to"].as_str().unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+            assert!(to - from <= time::Duration::days(31));
+        }
+        for (request, legacy) in sent[4..].iter().step_by(2).zip(&legacy_requests) {
+            let request: serde_json::Value = serde_json::from_str(request).unwrap();
+            assert_eq!(
+                request["generateBrokerReportRequest"]["from"],
+                legacy["from"]
+            );
+            assert_eq!(request["generateBrokerReportRequest"]["to"], legacy["to"]);
+        }
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("invented-arrival"), "{log}");
+        assert!(log.contains("invented historical fund"), "{log}");
+        assert!(!log.contains("unrelated-legacy"), "{log}");
+        assert!(!log.contains("unrelated report name"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn missing_fund_units_logs_local_inputs_even_when_network_capacity_is_low() {
+        let (gateway, requests, _) = fake::gateway(
+            vec![Answer {
+                status: 200,
+                body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
+                reset: Some(Duration::from_secs(30)),
+                remaining: Some(5),
+            }],
+            None,
+        );
+        let channel = channel(gateway);
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let mut operation = report_operation();
+        operation.raw = serde_json::json!({"id":"invented-unrelated-input", "type":"OPERATION_TYPE_INPUT_SECURITIES", "figi":"UNRELATED_FIGI", "date":"2023-11-01T00:00:00Z", "quantity":"3"});
+        *channel.diagnostic_operations.lock().await = super::diagnostics::capture(&[operation]);
+        channel
+            .trace_missing_fund_units(
+                &[InstrumentId::new_random()],
+                "invented",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+            )
+            .await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("low_rate_capacity_or_host_pause"), "{log}");
+        assert!(log.contains("invented-unrelated-input"), "{log}");
+        assert!(log.contains("cursor_received"), "{log}");
     }
 
     #[tokio::test]
@@ -2804,6 +3175,7 @@ mod tests {
         ], "itemsCount":2,"pagesCount":1,"page":0}});
         let (gateway, requests, _) = fake::gateway(
             vec![
+                Answer::status(200, "{}"),
                 Answer::status(
                     200,
                     r#"{"generateBrokerReportResponse":{"taskId":"diagnostic-task"}}"#,
@@ -2813,6 +3185,18 @@ mod tests {
             None,
         );
         let channel = channel(gateway);
+        // A normal sync has already made required calls before diagnostics.
+        channel
+            .client
+            .generate_broker_report(
+                "invented",
+                "2026-08-01T00:00:00Z",
+                "2026-08-31T00:00:00Z",
+                None,
+                broker_context(None).allowance,
+            )
+            .await
+            .unwrap();
         let writer = InstrumentLog::default();
         let captured = writer.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2823,7 +3207,7 @@ mod tests {
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
         let mut operation = report_operation();
-        operation.raw = serde_json::json!({"id":"source-proof", "figi":"FIGI1", "description":"invented-history", "payment":{"units":"-1","nano":0}, "brokerAccountId":"hidden-account"});
+        operation.raw = serde_json::json!({"id":"source-proof", "date":"2026-08-20T10:00:00Z", "figi":"FIGI1", "description":"invented-history", "payment":{"units":"-1","nano":0}, "brokerAccountId":"hidden-account"});
         let mut rows = super::diagnostics::capture(&[operation]);
         rows[0].instrument = Some(affected);
         *channel.diagnostic_operations.lock().await = rows;
@@ -2832,13 +3216,30 @@ mod tests {
                 &[affected],
                 "account",
                 (
-                    time::macros::date!(2026 - 08 - 01),
-                    time::macros::date!(2026 - 08 - 31),
+                    time::macros::date!(2015 - 01 - 01),
+                    time::macros::date!(2026 - 11 - 12),
                 ),
                 broker_context(None),
             )
             .await;
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        let request: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        let period = &request["generateBrokerReportRequest"];
+        let from = time::OffsetDateTime::parse(
+            period["from"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let to = time::OffsetDateTime::parse(
+            period["to"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(to - from <= time::Duration::days(31));
+        assert!(from.date() <= time::macros::date!(2026 - 08 - 20));
+        assert!(to.date() >= time::macros::date!(2026 - 08 - 20));
+        drop(sent);
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("invented-history"));
         assert!(log.contains("FIGI1"));
@@ -3057,6 +3458,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn paired_withdrawal_keeps_its_handle_flag_when_isin_is_shared() {
+        for position_handle in [false, true] {
+            for first_blocked in [false, true] {
+                let page = |blocked: bool| {
+                    let identity = |blocked| {
+                        let handle = if blocked {
+                            "BLOCKED_HANDLE"
+                        } else {
+                            "OPEN_HANDLE"
+                        };
+                        if position_handle {
+                            serde_json::json!({"positionUid":handle})
+                        } else {
+                            serde_json::json!({"figi":handle})
+                        }
+                    };
+                    let mut withdrawal = serde_json::json!({
+                        "id":"withdrawal", "cursor":"out", "brokerAccountId":"invented-account",
+                        "date":"2026-08-01T10:00:00Z", "type":"OPERATION_TYPE_OUTPUT_SECURITIES",
+                        "state":"OPERATION_STATE_EXECUTED", "quantity":"12",
+                        "payment":{"currency":"rub","units":"0","nano":0},
+                        "description":"Вывод 12.75 лотов фонда Invented Fund в другой депозитарий"
+                    });
+                    let mut redemption = serde_json::json!({
+                        "id":"redemption", "cursor":"paid", "brokerAccountId":"invented-account",
+                        "date":"2026-08-02T10:00:00Z", "type":"OPERATION_TYPE_BOND_REPAYMENT_FULL",
+                        "state":"OPERATION_STATE_EXECUTED", "quantity":"0",
+                        "payment":{"currency":"rub","units":"71","nano":0}
+                    });
+                    withdrawal
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(identity(blocked).as_object().unwrap().clone());
+                    redemption
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(identity(!blocked).as_object().unwrap().clone());
+                    serde_json::json!({"hasNext":false,"items":[withdrawal, redemption]})
+                        .to_string()
+                };
+                let description = |blocked| {
+                    serde_json::json!({"instrument":{
+                        "isin":"XX0000000042", "ticker":"TEST", "name":"Invented fund",
+                        "instrumentType":"etf", "currency":"rub", "blockedTcaFlag":blocked
+                    }})
+                    .to_string()
+                };
+                let answers = vec![
+                    Answer::status(200, &page(first_blocked)),
+                    Answer::status(200, &description(first_blocked)),
+                    Answer::status(200, &description(!first_blocked)),
+                    Answer::status(200, &page(!first_blocked)),
+                ];
+                let (gateway, requests, _) = fake::gateway_with_instruments(answers, None, true);
+                let mut channel = channel(gateway);
+                let (dictionary, unreadable) = OperationKindDictionary::build(
+                    iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                        .iter()
+                        .copied(),
+                );
+                assert!(unreadable.is_empty());
+                channel.dictionary = dictionary;
+                let mut canonical = None;
+                for expected in [first_blocked, !first_blocked] {
+                    let parsed = fetch(&channel).await.unwrap();
+                    assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+                    assert_eq!(parsed.pending_redemptions.len(), 1);
+                    let pending = &parsed.pending_redemptions[0];
+                    assert_eq!(
+                        pending.withdrawal_operation_id.as_deref(),
+                        Some("withdrawal")
+                    );
+                    assert_eq!(pending.blocked_tca_flag, expected);
+                    assert_eq!(
+                        *canonical.get_or_insert(pending.instrument),
+                        pending.instrument
+                    );
+                    let records = channel.instruments.list_instruments().await.unwrap();
+                    assert!(
+                        records
+                            .iter()
+                            .find(|record| record.id == pending.instrument)
+                            .unwrap()
+                            .blocked_tca_flag
+                    );
+                }
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    4,
+                    "second fetch uses cached descriptions"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reread_description_refreshes_blocking_flag_in_both_directions() {
+        let answers = [true, false, true].map(|blocked| {
+            Answer::status(
+                200,
+                &serde_json::json!({"instrument": {
+                    "isin":"XX0000000042", "ticker":"TEST", "name":"Invented share",
+                    "instrumentType":"share", "currency":"rub", "blockedTcaFlag":blocked
+                }})
+                .to_string(),
+            )
+        });
+        let (gateway, requests, _) = fake::gateway_with_instruments(answers.into(), None, true);
+        let channel = channel(gateway);
+        let mut identity = None;
+        for expected in [true, false, true] {
+            channel.descriptions.lock().await.clear();
+            let instrument = channel
+                .resolve_instrument(
+                    Some("invented-uid"),
+                    &serde_json::json!({}),
+                    time::macros::date!(2026 - 01 - 01),
+                    broker_context(None),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(*identity.get_or_insert(instrument), instrument);
+            let records = channel.instruments.list_instruments().await.unwrap();
+            let record = records
+                .iter()
+                .find(|record| record.id == instrument)
+                .unwrap();
+            assert_eq!(record.blocked_tca_flag, expected);
+        }
+        assert_eq!(requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -5382,6 +5917,7 @@ mod tests {
                     ),
                     lineage: None,
                     metadata: None,
+                    blocked_tca_flag: false,
                 })
                 .expect("seed instrument");
             store
@@ -5506,6 +6042,7 @@ mod tests {
                     status: 429,
                     body: "{}".to_owned(),
                     reset: Some(Duration::from_secs(7)),
+                    remaining: None,
                 },
                 Answer::status(200, &page_json(false, None, Some("operation-1"))),
             ],
@@ -5610,6 +6147,7 @@ mod tests {
                     status: 429,
                     body: "{}".to_owned(),
                     reset: Some(Duration::from_secs(60)),
+                    remaining: None,
                 },
             ],
             None,

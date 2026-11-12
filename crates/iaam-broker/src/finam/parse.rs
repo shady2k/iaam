@@ -302,6 +302,7 @@ pub fn parse_asset_description(
         board: optional("board"),
         lot,
         price_decimals,
+        blocked_tca_flag: false,
     })
 }
 

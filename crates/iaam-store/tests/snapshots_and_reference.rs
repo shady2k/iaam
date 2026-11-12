@@ -692,6 +692,7 @@ fn an_upserted_instrument_reaches_the_table() {
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
         metadata: None,
+        blocked_tca_flag: false,
     };
     store.upsert_instrument(&instrument).unwrap();
 

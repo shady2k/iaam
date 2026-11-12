@@ -51,6 +51,9 @@ use crate::tally::{
 /// The window every per-minute limit below is stated over.
 const MINUTE: Duration = Duration::from_secs(60);
 
+/// Capacity optional diagnostics leave for required broker reads.
+pub(crate) const DIAGNOSTIC_REQUEST_RESERVE: u32 = 5;
+
 /// Attempts per broker call, the first included.
 pub const ATTEMPTS: u32 = 3;
 
@@ -399,6 +402,16 @@ impl Transport for HttpClient {
 /// gateway's transport is: the production one and a test's scripted one are
 /// one type to it, and no generic climbs through the layers above.
 pub trait Outbound: Send + Sync {
+    /// Whether optional diagnostics may use this service without approaching
+    /// its allowance or a known host stop. This never sends a probe.
+    fn diagnostic_allowed<'a>(
+        &'a self,
+        _destination: Destination,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { true })
+    }
+
     /// `Gateway::send`, boxed.
     fn send<'a>(
         &'a self,
@@ -408,6 +421,14 @@ pub trait Outbound: Send + Sync {
 }
 
 impl<T: Transport + 'static> Outbound for Gateway<T> {
+    fn diagnostic_allowed<'a>(
+        &'a self,
+        destination: Destination,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(self.diagnostic_allowed(destination, path))
+    }
+
     fn send<'a>(
         &'a self,
         request: &'a HttpRequest,
@@ -1015,6 +1036,8 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor"
                 | "OperationsService/GetPortfolio"
                 | "OperationsService/GetOperationsByCursor"
+                | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations"
+                | "OperationsService/GetOperations"
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
                 | "OperationsService/GetBrokerReport" => Some("OperationsService"),
                 "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
@@ -1079,6 +1102,8 @@ struct Lane {
     sent: HashMap<Option<&'static str>, VecDeque<Instant>>,
     /// Exhausted server windows, scoped to the same service/method as BUDGETS.
     server_not_before: HashMap<Option<&'static str>, (Instant, Duration)>,
+    /// Last low-capacity server window, scoped to the service budget.
+    diagnostic_low_capacity: HashMap<Option<&'static str>, (Instant, Duration)>,
     /// Calls in a row that failed transiently after all their attempts.
     failures: u32,
     /// Until when the breaker refuses calls, once it has opened.
@@ -1343,6 +1368,48 @@ pub fn initialize_fresh_tally(database: &Path, clock: &dyn Clock) -> Result<bool
 }
 
 impl<T: Transport + 'static> Gateway<T> {
+    /// Optional reads leave five requests for necessary sync work. Unknown
+    /// server capacity uses the existing local tally, not an HTTP probe.
+    pub async fn diagnostic_allowed(&self, destination: Destination, path: &str) -> bool {
+        let request = HttpRequest::get(destination, path);
+        let Ok((budget, key)) = self.budgets.lookup(&request) else {
+            return false;
+        };
+        if self.broker_egress == BrokerEgress::Off {
+            return false;
+        }
+        let Some(lane) = self.lanes.get(destination.base_url()) else {
+            return false;
+        };
+        let Ok(lane) = lane.try_lock() else {
+            return false;
+        };
+        let now = self.clock.now();
+        if lane.refusing(now).is_some()
+            || !lane.named_wait(now).is_zero()
+            || lane
+                .diagnostic_low_capacity
+                .get(&key)
+                .is_some_and(|(at, window)| now.saturating_duration_since(*at) < *window)
+        {
+            return false;
+        }
+        let Some(directory) = &self.egress_directory else {
+            return false;
+        };
+        let Ok(tally) = OutboundTally::new(directory.clone()) else {
+            return false;
+        };
+        tally
+            .diagnostic_allowed(
+                destination.base_url(),
+                key.unwrap_or("*"),
+                &budget,
+                self.clock.as_ref(),
+            )
+            .unwrap_or(false)
+    }
+
     /// A gateway with the documented budgets, system clock and tokio timer
     /// over `transport`.
     ///
@@ -2217,6 +2284,19 @@ impl<T: Transport + 'static> Gateway<T> {
                             None
                         };
                         if let Some((line, _)) = observed.as_ref() {
+                            if let Some(remaining) = line.rate_remaining {
+                                if remaining <= u64::from(DIAGNOSTIC_REQUEST_RESERVE) {
+                                    lane.diagnostic_low_capacity.insert(
+                                        key,
+                                        (
+                                            clock.now(),
+                                            line.rate_reset.map_or(MINUTE, Duration::from_secs),
+                                        ),
+                                    );
+                                } else {
+                                    lane.diagnostic_low_capacity.remove(&key);
+                                }
+                            }
                             let response = match &answer {
                                 Ok(response) => response,
                                 Err(_) => line,
@@ -3290,6 +3370,140 @@ mod tests {
 
         let sent = gateway.transport.sent_at();
         assert_eq!(sent[1] - sent[0], Duration::from_millis(100));
+    }
+
+    #[test]
+    fn legacy_operations_uses_the_existing_operations_service_budget() {
+        for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+            for path in [
+                "OperationsService/GetOperations",
+                "/OperationsService/GetOperations",
+                "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+                "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            ] {
+                assert_eq!(
+                    broker_budget_key(destination, path),
+                    Some("OperationsService")
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn optional_reports_skip_low_capacity_until_its_service_reset() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                rate_remaining: Some(5),
+                rate_reset: Some(17),
+                ..status(200)
+            })),
+        );
+        assert!(
+            gateway
+                .diagnostic_allowed(
+                    Destination::TinkoffProd,
+                    "/OperationsService/GetBrokerReport"
+                )
+                .await
+        );
+        gateway
+            .send(&operations(), None)
+            .await
+            .expect("operation answer");
+        let report = "/OperationsService/GetBrokerReport";
+        assert!(
+            !gateway
+                .diagnostic_allowed(Destination::TinkoffProd, report)
+                .await
+        );
+        assert!(
+            gateway
+                .diagnostic_allowed(Destination::TinkoffProd, "/UsersService/GetAccounts")
+                .await
+        );
+        assert_eq!(gateway.transport.sent_at().len(), 1);
+        time.advance(Duration::from_secs(17));
+        assert!(
+            gateway
+                .diagnostic_allowed(Destination::TinkoffProd, report)
+                .await
+        );
+        assert_eq!(gateway.transport.sent_at().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn optional_reports_leave_local_budget_for_required_reads() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let tally = OutboundTally::new(
+            gateway
+                .egress_directory
+                .as_ref()
+                .expect("directory")
+                .clone(),
+        )
+        .expect("tally");
+        let budget = Budget {
+            used: 6,
+            ..BUDGETS[0]
+        };
+        assert!(
+            tally
+                .diagnostic_allowed(
+                    Destination::TinkoffProd.base_url(),
+                    "OperationsService",
+                    &budget,
+                    time.as_ref()
+                )
+                .expect("fresh capacity")
+        );
+        gateway
+            .send(&operations(), None)
+            .await
+            .expect("required read");
+        assert!(
+            !tally
+                .diagnostic_allowed(
+                    Destination::TinkoffProd.base_url(),
+                    "OperationsService",
+                    &budget,
+                    time.as_ref()
+                )
+                .expect("reserved capacity")
+        );
+        time.advance(MINUTE);
+        assert!(
+            tally
+                .diagnostic_allowed(
+                    Destination::TinkoffProd.base_url(),
+                    "OperationsService",
+                    &budget,
+                    time.as_ref()
+                )
+                .expect("reset capacity")
+        );
+        assert_eq!(gateway.transport.sent_at().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn optional_reports_skip_persisted_host_pause() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 429));
+        assert!(matches!(
+            gateway.send(&operations(), None).await,
+            Err(GatewayError::BrokerHostPaused { .. })
+        ));
+        assert!(
+            !gateway
+                .diagnostic_allowed(
+                    Destination::TinkoffProd,
+                    "/OperationsService/GetBrokerReport"
+                )
+                .await
+        );
+        assert_eq!(gateway.transport.sent_at().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

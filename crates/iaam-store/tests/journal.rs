@@ -143,6 +143,7 @@ fn outbound_securities_transfer_round_trips() {
             currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .unwrap();
     let quantity = Quantity(Dec::one());

@@ -83,6 +83,7 @@ async fn journal_events_still_refuse_an_event_naming_a_custody_the_owner_does_no
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
             metadata: None,
+            blocked_tca_flag: false,
         })
         .expect("seed instrument");
     let adapter = Arc::new(SqliteAdapter::new(store));

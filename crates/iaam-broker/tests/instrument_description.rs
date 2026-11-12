@@ -3,6 +3,50 @@ use iaam_core::instrument::InstrumentKind;
 use iaam_core::money::CurrencyCode;
 
 #[test]
+fn tinkoff_blocking_flag_defaults_false_and_preserves_explicit_values_for_every_kind() {
+    for kind in ["share", "bond", "etf", "currency"] {
+        for flag in [None, Some(false), Some(true)] {
+            let mut body = serde_json::json!({"instrument": {
+                "isin":"XX0000000042", "ticker":"TEST", "name":"Invented instrument",
+                "instrumentType":kind, "currency":"rub"
+            }});
+            if let Some(flag) = flag {
+                body["instrument"]["blockedTcaFlag"] = flag.into();
+            }
+            let description = tinkoff::parse_instrument(&body.to_string()).unwrap();
+            assert_eq!(description.blocked_tca_flag, flag.unwrap_or(false));
+        }
+    }
+}
+
+#[test]
+fn currency_by_blocking_flag_defaults_false_and_preserves_explicit_values() {
+    for flag in [None, Some(false), Some(true)] {
+        let mut body = serde_json::json!({"instrument": {
+            "isoCurrencyName":"usd", "currency":"rub", "lot":1000,
+            "nominal":{"currency":"usd", "units":"1", "nano":0}
+        }});
+        if let Some(flag) = flag {
+            body["instrument"]["blockedTcaFlag"] = flag.into();
+        }
+        let description = tinkoff::parse::parse_currency_description(&body.to_string()).unwrap();
+        assert_eq!(description.blocked_tca_flag, flag.unwrap_or(false));
+    }
+}
+
+#[test]
+fn malformed_blocking_flag_is_not_silently_treated_as_false() {
+    let body = r#"{"instrument":{"ticker":"TEST","name":"Invented share","currency":"rub","blockedTcaFlag":"false"}}"#;
+    assert!(matches!(
+        tinkoff::parse_instrument(body),
+        Err(tinkoff::ParseError::InvalidField {
+            field: "blockedTcaFlag",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn tinkoff_description_keeps_identity_and_native_board() {
     let description = tinkoff::parse_instrument(r#"{"instrument":{"isin":"XX0000000001","ticker":"TEST","name":"Invented share","instrumentType":"share","currency":"rub","classCode":"TQBR","lot":10}}"#).unwrap();
     assert_eq!(description.isin.as_deref(), Some("XX0000000001"));

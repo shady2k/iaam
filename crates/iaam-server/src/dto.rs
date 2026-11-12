@@ -9808,6 +9808,8 @@ pub struct InstrumentDto {
     /// position in money nobody quoted it in.
     pub quote_currency: String,
     pub metadata: Option<InstrumentMetadataDto>,
+    /// Broker-reported trading block. This is not an owner-editable classification.
+    pub blocked_tca_flag: bool,
 }
 
 /// Broker trading details, with missing values left unknown.

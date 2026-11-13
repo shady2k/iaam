@@ -16,7 +16,9 @@
 //! [`crate::report::confidence::CaveatKind::see`] knows the name of a field in
 //! a response it never builds.
 //!
-//! **A key is a call that changes something, and only such a call gets one.**
+//! **A key normally names a call that changes something.** Account discovery
+//! is the explicit exception: it spends broker allowance and needs the agent
+//! scope floor, while promising no database writes.
 //! Both readers of this list point at a call the same way: a resolution's
 //! target is what would settle the item, and a caveat's remedy is what would
 //! close the gap. A read settles and closes nothing, so naming one here would
@@ -143,6 +145,8 @@ pub enum OperationKey {
     /// and records in a single call, which is why it is a remedy entire rather
     /// than the first step of one.
     SyncBroker,
+    /// List broker accounts without recording history; spends broker allowance.
+    ListBrokerAccounts,
     /// Read one institution's own export into an open session, through a source
     /// profile (decision 0019).
     ///
@@ -267,10 +271,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding the twenty-fourth variant to
+    /// The declared length holds every variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -286,6 +290,7 @@ impl OperationKey {
         Self::SubmitOperations,
         Self::OpenImportSession,
         Self::SyncBroker,
+        Self::ListBrokerAccounts,
         Self::ReadImportDocument,
         Self::AddImportRows,
         Self::AnswerImportQuestion,
@@ -316,6 +321,7 @@ impl OperationKey {
             Self::SubmitOperations => "ingest_operations",
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",
+            Self::ListBrokerAccounts => "list_broker_accounts",
             Self::ReadImportDocument => "read_import_document",
             Self::AddImportRows => "add_import_rows",
             Self::AnswerImportQuestion => "answer_import_question",

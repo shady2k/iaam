@@ -595,3 +595,24 @@ struct RawMoneyValue {
 struct RawQuotation {
     value: Option<String>,
 }
+
+/// Metadata published by AccountsService.GetAccount; absent fields stay absent.
+pub fn parse_account_description(
+    account_id: &str,
+    body: &str,
+) -> Result<crate::BrokerAccountDescription, serde_json::Error> {
+    let value: serde_json::Map<String, Value> = serde_json::from_str(body)?;
+    Ok(crate::BrokerAccountDescription {
+        broker_account: account_id.to_owned(),
+        account_type: value.get("type").and_then(Value::as_str).map(str::to_owned),
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        opened: value
+            .get("open_account_date")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        ..Default::default()
+    })
+}

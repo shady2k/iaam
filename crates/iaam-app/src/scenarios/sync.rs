@@ -88,6 +88,59 @@ pub const SYNC_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// session exchange, operations pages and portfolio.
 pub const BROKER_SYNC_REQUEST_CEILING: u32 = 300;
 
+/// One visible broker account and its existing binding for this owner.
+pub struct ListedBrokerAccount {
+    pub description: crate::ports::BrokerAccountDescription,
+    pub bound_account: Option<AccountId>,
+}
+
+/// Read the access's accounts and existing bindings without recording anything.
+pub async fn list_broker_accounts(
+    services: &AppServices,
+    principal: &Principal,
+    broker: &BrokerCode,
+) -> Result<Vec<ListedBrokerAccount>, AppError> {
+    if !principal.scope.may_submit() {
+        return Err(AppError::Invalid {
+            field: "scope".to_owned(),
+            expected: "permission to list broker accounts".to_owned(),
+            actual: principal.scope.code().to_owned(),
+        });
+    }
+    let channel = services
+        .channels
+        .clone()
+        .open_for_account_listing(principal.owner, broker.as_str())
+        .await?;
+    let allowance = RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING);
+    let known = Vec::new();
+    let descriptions = channel
+        .fetch_account_descriptions(BrokerRequestContext {
+            deadline: Some(tokio::time::Instant::now().into_std() + SYNC_DEADLINE),
+            allowance: &allowance,
+            known: &known,
+        })
+        .await
+        .map_err(broker_error)?;
+    let mut bindings = std::collections::HashMap::new();
+    for account in services.store.list_accounts(principal.owner).await? {
+        if let Some(number) = services
+            .store
+            .broker_account_binding(principal.owner, account.id, broker)
+            .await?
+        {
+            bindings.insert(number, account.id);
+        }
+    }
+    Ok(descriptions
+        .into_iter()
+        .map(|description| ListedBrokerAccount {
+            bound_account: bindings.get(&description.broker_account).copied(),
+            description,
+        })
+        .collect())
+}
+
 /// The accounts a broker sync is running for, in this process.
 ///
 /// Two syncs of one account would each read the journal before the other
@@ -230,9 +283,12 @@ pub async fn sync_broker(
         Some(number) => (number, None),
         None => {
             let candidates = broker
-                .fetch_account_numbers(broker_context)
+                .fetch_accounts(broker_context)
                 .await
-                .map_err(broker_error)?;
+                .map_err(broker_error)?
+                .into_iter()
+                .map(|account| account.broker_account)
+                .collect::<Vec<_>>();
             match candidates.as_slice() {
                 [] => {
                     return Err(AppError::BrokerAccountUnseen {

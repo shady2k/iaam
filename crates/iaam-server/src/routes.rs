@@ -4,6 +4,7 @@
 //! the result. There are no arithmetic operations on money here —
 //! this is enforced by the architecture guard (§3.1, §13).
 
+use crate::dto::{BrokerAccountDto, BrokerAccountsDto};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -8242,6 +8243,50 @@ async fn build_directory(
     Ok(directory)
 }
 
+/// List only the accounts this connected access sees. Spends broker allowance,
+/// but records no binding, history or sync run.
+#[utoipa::path(
+    get,
+    path = "/v1/brokers/{broker}/accounts",
+    operation_id = "list_broker_accounts",
+    params(("broker" = String, Path, description = "Broker code")),
+    responses(
+        (status = 200, description = "Accounts visible to the connected access", body = BrokerAccountsDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Invalid broker or request allowance exhausted", body = ApiError),
+        (status = 502, description = "Source refused or unreadable", body = ApiError),
+        (status = 503, description = "Source unavailable or not connected", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_broker_accounts(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(broker): ApiPath<String>,
+) -> Result<Json<BrokerAccountsDto>, ApiFailure> {
+    require(&principal, OperationKey::ListBrokerAccounts)?;
+    let code = broker_code(&broker)?;
+    let accounts = iaam_app::sync::list_broker_accounts(&state.services, &principal, &code).await?;
+    Ok(Json(BrokerAccountsDto {
+        broker,
+        accounts: accounts
+            .into_iter()
+            .map(|account| {
+                let description = account.description;
+                BrokerAccountDto {
+                    broker_account: description.broker_account,
+                    name: description.name,
+                    account_type: description.account_type,
+                    status: description.status,
+                    opened: description.opened,
+                    closed: description.closed,
+                    bound_account: account.bound_account.map(|id| id.inner()),
+                }
+            })
+            .collect(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8539,8 +8584,12 @@ mod tests {
         // either cannot hide in the arithmetic.
         assert_eq!(
             writes,
-            OperationKey::ALL.len() + WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY.len(),
-            "every write is a key or is declared, and every key is a write"
+            OperationKey::ALL
+                .iter()
+                .filter(|key| **key != OperationKey::ListBrokerAccounts)
+                .count()
+                + WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY.len(),
+            "every write is a key or is declared; account discovery is the allowance-spending GET key"
         );
     }
 

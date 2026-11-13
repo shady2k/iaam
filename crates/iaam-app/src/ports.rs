@@ -1,6 +1,7 @@
 //! Object-safe ports. The only place where they exist (§3.2).
 
 use async_trait::async_trait;
+pub use iaam_broker::BrokerAccountDescription;
 use iaam_core::batch::ControlSection;
 use iaam_core::category::CategoryMatcher;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
@@ -198,6 +199,7 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         OperationKey::SubmitOperations
         | OperationKey::OpenImportSession
         | OperationKey::SyncBroker
+        | OperationKey::ListBrokerAccounts
         | OperationKey::ReadImportDocument
         | OperationKey::AddImportRows
         | OperationKey::AnswerImportQuestion
@@ -2297,7 +2299,7 @@ pub struct BrokerRequestContext<'a> {
 /// that sends anything to the broker, nor will there ever be one (§14).
 #[async_trait]
 pub trait BrokerChannel: Send + Sync {
-    /// The account numbers this access sees at the broker, from the
+    /// The accounts this access sees at the broker, with metadata supplied by the
     /// broker's own account listing (`iaam-xzz5.3.2`).
     ///
     /// What a sync without a stored binding asks before it can name an
@@ -2305,10 +2307,19 @@ pub trait BrokerChannel: Send + Sync {
     /// be recorded, several mean the owner must bind one, none mean the
     /// access sees nothing. The channel reads them, and never chooses
     /// between them.
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError>;
+    ) -> Result<Vec<BrokerAccountDescription>, BrokerError>;
+
+    /// Include optional metadata that requires additional account-only reads.
+    /// Sync uses discovery alone so metadata availability cannot change its refusal.
+    async fn fetch_account_descriptions(
+        &self,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<Vec<BrokerAccountDescription>, BrokerError> {
+        self.fetch_accounts(context).await
+    }
 
     /// Account operations for an interval: accepted and sent to quarantine.
     ///
@@ -2382,6 +2393,15 @@ pub trait BrokerChannel: Send + Sync {
 /// of the same value is the only way to share it.
 #[async_trait]
 pub trait BrokerChannelFactory: Send + Sync {
+    /// Open without refreshing stored operation dictionaries for account discovery.
+    async fn open_for_account_listing(
+        self: Arc<Self>,
+        owner: OwnerId,
+        broker: &str,
+    ) -> Result<Arc<dyn BrokerChannel>, AppError> {
+        self.open(owner, broker).await
+    }
+
     async fn open(
         self: Arc<Self>,
         owner: OwnerId,

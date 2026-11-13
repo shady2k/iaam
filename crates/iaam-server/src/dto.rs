@@ -15173,3 +15173,27 @@ impl AnswerRuleForecastDto {
         }
     }
 }
+
+/// Accounts seen by one connected broker access, including when none are visible.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct BrokerAccountsDto {
+    pub broker: String,
+    pub accounts: Vec<BrokerAccountDto>,
+}
+
+/// Source metadata is preserved as supplied; no business meaning is inferred.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct BrokerAccountDto {
+    pub broker_account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
+    pub bound_account: Option<uuid::Uuid>,
+}

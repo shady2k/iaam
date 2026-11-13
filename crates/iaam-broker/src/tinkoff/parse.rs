@@ -854,9 +854,9 @@ pub fn parse_portfolio_positions(body: &str) -> Result<ParsedPortfolioPositions,
 /// entry is an object carrying a non-empty string `id`. An entry that does
 /// not refuses the whole answer rather than shrinking the list — a silently
 /// missing identifier is exactly the ambiguity a binding must not be recorded
-/// over. Nothing else about an entry interests this system, and none of it is
-/// validated: the id is opaque here the way it is opaque in the binding.
-pub fn parse_account_ids(body: &str) -> Result<Vec<String>, ParseError> {
+/// over. Optional source metadata is preserved without interpreting its values;
+/// the id is opaque here the way it is opaque in the binding.
+pub fn parse_accounts(body: &str) -> Result<Vec<crate::BrokerAccountDescription>, ParseError> {
     let value: Value =
         serde_json::from_str(body).map_err(|error| ParseError::Json(error.to_string()))?;
     let accounts = value
@@ -878,9 +878,39 @@ pub fn parse_account_ids(body: &str) -> Result<Vec<String>, ParseError> {
                     value: id.to_owned(),
                 });
             }
-            Ok(id.to_owned())
+            Ok(crate::BrokerAccountDescription {
+                broker_account: id.to_owned(),
+                name: account
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                account_type: account
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                status: account
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                opened: account
+                    .get("openedDate")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                closed: account
+                    .get("closedDate")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
         })
         .collect()
+}
+
+/// Account identifiers for callers that need no metadata.
+pub fn parse_account_ids(body: &str) -> Result<Vec<String>, ParseError> {
+    Ok(parse_accounts(body)?
+        .into_iter()
+        .map(|account| account.broker_account)
+        .collect())
 }
 
 fn parse_portfolio_position_row(
@@ -2077,5 +2107,34 @@ mod tests {
         let accrued = operation.accrued_interest.expect("known zero");
         assert_eq!(accrued.amount.raw(), 0);
         assert_eq!(accrued.currency, iaam_core::money::CurrencyCode::Rub);
+    }
+}
+
+#[cfg(test)]
+mod account_description_tests {
+    #[test]
+    fn account_metadata_is_preserved_without_inference() {
+        let accounts = super::parse_accounts(r#"{"accounts":[
+            {"id":"2000000001","name":"Main","type":"ACCOUNT_TYPE_TINKOFF","status":"ACCOUNT_STATUS_OPEN","openedDate":"2020-01-01T00:00:00Z","closedDate":"2021-01-01T00:00:00Z","accessLevel":"ACCOUNT_ACCESS_LEVEL_READ_ONLY"},
+            {"id":"2000000002"}
+        ]}"#).expect("account descriptions");
+        assert_eq!(
+            accounts[0],
+            crate::BrokerAccountDescription {
+                broker_account: "2000000001".into(),
+                name: Some("Main".into()),
+                account_type: Some("ACCOUNT_TYPE_TINKOFF".into()),
+                status: Some("ACCOUNT_STATUS_OPEN".into()),
+                opened: Some("2020-01-01T00:00:00Z".into()),
+                closed: Some("2021-01-01T00:00:00Z".into()),
+            }
+        );
+        assert_eq!(
+            accounts[1],
+            crate::BrokerAccountDescription {
+                broker_account: "2000000002".into(),
+                ..Default::default()
+            }
+        );
     }
 }

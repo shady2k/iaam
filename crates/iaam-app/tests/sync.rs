@@ -66,12 +66,19 @@ struct FakeBroker {
 
 #[async_trait]
 impl BrokerChannel for FakeBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         self.accounts_requests.fetch_add(1, Ordering::SeqCst);
-        Ok(self.accounts.clone())
+        Ok(self
+            .accounts
+            .iter()
+            .map(|number| iaam_app::ports::BrokerAccountDescription {
+                broker_account: number.clone(),
+                ..Default::default()
+            })
+            .collect())
     }
 
     async fn fetch_operations(
@@ -4165,10 +4172,10 @@ impl HeldBroker {
 
 #[async_trait]
 impl BrokerChannel for HeldBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Ok(Vec::new())
     }
 
@@ -4216,10 +4223,10 @@ struct AllowanceBroker {
 
 #[async_trait]
 impl BrokerChannel for AllowanceBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Ok(Vec::new())
     }
 
@@ -4503,10 +4510,10 @@ struct PanickingBroker(SourceChannel);
 
 #[async_trait]
 impl BrokerChannel for PanickingBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Ok(Vec::new())
     }
 
@@ -6159,11 +6166,11 @@ async fn missing_fund_units_diagnostics_only_cover_missing_paired_redemptions() 
 
     #[async_trait]
     impl BrokerChannel for DiagnosticBroker {
-        async fn fetch_account_numbers(
+        async fn fetch_accounts(
             &self,
             context: BrokerRequestContext<'_>,
-        ) -> Result<Vec<String>, BrokerError> {
-            self.inner.fetch_account_numbers(context).await
+        ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
+            self.inner.fetch_accounts(context).await
         }
 
         async fn fetch_operations(

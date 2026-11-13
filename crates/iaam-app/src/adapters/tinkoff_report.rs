@@ -112,7 +112,12 @@ impl TinkoffChannel {
             .filter(|operation| needs_report_payment(operation))
         {
             match resolve_report_payment(operation, &rows) {
-                Ok(resolved) => *operation = resolved,
+                Ok(mut resolved) => {
+                    resolved
+                        .instrument_uid
+                        .clone_from(&operation.instrument_uid);
+                    *operation = resolved;
+                }
                 Err(reason) => tracing::warn!(
                     phase = "resolve_report_payment",
                     operation_id = operation.operation_id,

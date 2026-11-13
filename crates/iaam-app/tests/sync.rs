@@ -241,6 +241,15 @@ async fn seed_custody(services: &AppServices, owner: OwnerId, custody: CustodyId
 }
 
 fn seed_instrument(store: &SqliteStore, instrument: InstrumentId, symbol: &str) {
+    seed_instrument_from(store, instrument, symbol, date!(2026 - 01 - 01));
+}
+
+fn seed_instrument_from(
+    store: &SqliteStore,
+    instrument: InstrumentId,
+    symbol: &str,
+    valid_from: Date,
+) {
     store
         .upsert_instrument(&iaam_store::reference::InstrumentRecord {
             id: instrument,
@@ -259,7 +268,7 @@ fn seed_instrument(store: &SqliteStore, instrument: InstrumentId, symbol: &str) 
             value: invented_isin(instrument),
             instrument,
             interval: iaam_core::instrument::AliasInterval {
-                valid_from: date!(2026 - 01 - 01),
+                valid_from,
                 valid_to: None,
             },
             source: SourceId::new_random(),
@@ -6998,4 +7007,316 @@ async fn recorded_subminor_multifill_order_skips_all_reports_on_resync() {
 #[tokio::test]
 async fn recorded_fills_after_requested_interval_still_skip_reports_on_resync() {
     resync_reported_fills(date!(2026 - 03 - 14)).await;
+}
+
+struct MixedHistoryReportTinvest {
+    fills: FreshFillReportTinvest,
+    operation_reads: Arc<AtomicUsize>,
+}
+
+impl Transport for MixedHistoryReportTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let mut response = self.fills.send(request).await?;
+        if !request.path().ends_with("/GetOperationsByCursor") {
+            return Ok(response);
+        }
+        self.operation_reads.fetch_add(1, Ordering::SeqCst);
+        let mut page: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("invented operation page");
+        let row = |id: &str, kind: &str, state: &str, payment: &str| {
+            serde_json::json!({
+                "id":id, "cursor":id, "brokerAccountId":"invented-account",
+                "date":"2020-08-12T10:00:00Z", "type":kind, "state":state,
+                "quantityDone":"0",
+                "payment":{"units":payment,"nano":0,"currency":"rub"}
+            })
+        };
+        let mut trade = row(
+            "historical-order",
+            "OPERATION_TYPE_BUY",
+            "OPERATION_STATE_EXECUTED",
+            "-40",
+        );
+        trade["instrumentUid"] = self.fills.instrument.inner().to_string().into();
+        trade["figi"] = "INVENTEDREPORTFIGI".into();
+        trade["positionUid"] = "invented-report-position".into();
+        trade["quantity"] = "2".into();
+        trade["quantityDone"] = "2".into();
+        trade["quantityRest"] = "0".into();
+        trade["tradesInfo"] = serde_json::json!({"trades":[
+            {"num":"old-one", "date":"2020-08-12T10:00:00Z", "quantity":"1",
+             "price":{"units":"20","nano":0,"currency":"rub"}},
+            {"num":"old-two", "date":"2020-08-12T10:01:00Z", "quantity":"1",
+             "price":{"units":"20","nano":0,"currency":"rub"}}
+        ]});
+        // Cancellation does not erase the one execution that preceded it.
+        let mut partial = trade.clone();
+        partial["id"] = "cancelled-partial".into();
+        partial["cursor"] = "cancelled-partial".into();
+        partial["state"] = "OPERATION_STATE_CANCELED".into();
+        partial["quantityDone"] = "1".into();
+        partial["quantityRest"] = "1".into();
+        partial["payment"]["units"] = "-20".into();
+        partial["tradesInfo"]["trades"] = serde_json::json!([
+            {"num":"executed-before-cancel", "date":"2020-08-12T10:00:00Z", "quantity":"1",
+             "price":{"units":"20","nano":0,"currency":"rub"}}
+        ]);
+        page["items"]
+            .as_array_mut()
+            .expect("operation rows")
+            .extend([
+                trade,
+                partial,
+                row(
+                    "historical-fee",
+                    "OPERATION_TYPE_BROKER_FEE",
+                    "OPERATION_STATE_EXECUTED",
+                    "-2",
+                ),
+                row(
+                    "historical-tax",
+                    "OPERATION_TYPE_TAX",
+                    "OPERATION_STATE_EXECUTED",
+                    "-3",
+                ),
+                row(
+                    "historical-deposit",
+                    "OPERATION_TYPE_INPUT",
+                    "OPERATION_STATE_EXECUTED",
+                    "100",
+                ),
+                row(
+                    "historical-withdrawal",
+                    "OPERATION_TYPE_OUTPUT",
+                    "OPERATION_STATE_EXECUTED",
+                    "-5",
+                ),
+                row(
+                    "pending-without-fills",
+                    "OPERATION_TYPE_BUY",
+                    "OPERATION_STATE_PROGRESS",
+                    "0",
+                ),
+                row(
+                    "cancelled-without-fills",
+                    "OPERATION_TYPE_SELL",
+                    "OPERATION_STATE_CANCELED",
+                    "0",
+                ),
+                row(
+                    "cancelled-deposit",
+                    "OPERATION_TYPE_INPUT",
+                    "OPERATION_STATE_CANCELED",
+                    "10",
+                ),
+            ]);
+        response.body = serde_json::to_vec(&page).expect("mixed history JSON");
+        Ok(response)
+    }
+}
+
+async fn resync_mixed_full_history(legacy_fill_source_keys: bool) {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument_from(store, instrument, "MIXEDHISTORY", date!(2020 - 01 - 01));
+    });
+    let generations = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let operation_reads = Arc::new(AtomicUsize::new(0));
+    let source = SourceId::new_random();
+    let make_channel = || {
+        channel_over_with(
+            MixedHistoryReportTinvest {
+                fills: FreshFillReportTinvest {
+                    instrument,
+                    report_generations: Arc::clone(&generations),
+                    report_reads: Arc::clone(&reads),
+                },
+                operation_reads: Arc::clone(&operation_reads),
+            },
+            source,
+            &services,
+        )
+    };
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &make_channel(),
+        account,
+        date!(2020 - 01 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("first mixed full-history sync");
+    assert_eq!(first.duplicates, 0, "{first:?}");
+    assert_eq!(first.possible_duplicates, 0, "{first:?}");
+    assert_eq!(
+        first.set_aside, 1,
+        "only cancelled cash is refused: {first:?}"
+    );
+    assert_eq!(generations.load(Ordering::SeqCst), 1);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    let before = load_all(&services, owner).await;
+    let expected_keys = BTreeSet::from([
+        "report%2Forder%231#fill%2Fone",
+        "report%2Forder%231#fill%23two",
+        "historical-order#old-one",
+        "historical-order#old-two",
+        "cancelled-partial#executed-before-cancel",
+        "historical-fee",
+        "historical-tax",
+        "historical-deposit",
+        "historical-withdrawal",
+    ]);
+    let keys = before
+        .iter()
+        .filter_map(|event| event.provenance.source_operation_id())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(keys, expected_keys, "no facts for reduced or refused rows");
+    let coverage_gaps: Vec<_> = before
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::ImportCoverageGap { .. }))
+        .collect();
+    assert_eq!(coverage_gaps.len(), 1, "one gap for refused cancelled cash");
+    let coverage_gap_id = coverage_gaps[0].id;
+    assert_eq!(
+        before.len(),
+        expected_keys.len() + 1,
+        "nine economic facts and one coverage gap: {before:?}"
+    );
+    assert_eq!(
+        before
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Trade { .. }))
+            .count(),
+        5
+    );
+    assert_eq!(
+        before
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Fee { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        before
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Tax { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        before
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::CashIn { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        before
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::CashOut { .. }))
+            .count(),
+        1
+    );
+
+    // Older rows can retain a pre-migration provenance key while the canonical
+    // idempotency key still identifies the same execution. Seed a separate store
+    // rather than rewriting a recorded journal fact in place.
+    let legacy_services = if legacy_fill_source_keys {
+        let target = services_with(date!(2026 - 03 - 31), |store| {
+            seed_account(store, owner, account, "Main");
+            seed_instrument_from(store, instrument, "MIXEDHISTORY", date!(2020 - 01 - 01));
+        });
+        let events = before
+            .iter()
+            .cloned()
+            .map(|mut event| {
+                if matches!(event.kind, EventKind::Trade { .. }) {
+                    assert!(event.idempotency_key.is_some());
+                    let legacy_key = format!(
+                        "legacy:{}",
+                        event
+                            .provenance
+                            .source_operation_id()
+                            .expect("fill source key")
+                    );
+                    event.provenance = event.provenance.with_source_operation_id(legacy_key);
+                }
+                event
+            })
+            .collect();
+        target
+            .store
+            .append_events(events, IdentityScope::Account)
+            .await
+            .expect("seed legacy fill provenance with canonical idempotency keys");
+        Some(target)
+    } else {
+        None
+    };
+    let resync_services = legacy_services.as_ref().unwrap_or(&services);
+    let before = load_all(resync_services, owner).await;
+    generations.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    // Keep the source identity, but rebuild the gateway so cached reports cannot hide requests.
+    let channel = channel_over_with(
+        MixedHistoryReportTinvest {
+            fills: FreshFillReportTinvest {
+                instrument,
+                report_generations: Arc::clone(&generations),
+                report_reads: Arc::clone(&reads),
+            },
+            operation_reads: Arc::clone(&operation_reads),
+        },
+        source,
+        resync_services,
+    );
+    let second = sync_broker(
+        resync_services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2020 - 01 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("resync mixed full history through a fresh gateway");
+    assert_eq!(operation_reads.load(Ordering::SeqCst), 2);
+    assert_eq!(generations.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        second.duplicates,
+        expected_keys.len() + 1,
+        "nine economic facts and the existing coverage gap: {second:?}"
+    );
+    assert_eq!(second.recorded.iter().filter(|verdict| matches!(verdict, Verdict::Duplicate { existing } if *existing == coverage_gap_id)).count(), 1, "coverage gap duplicate is counted separately from economic facts");
+    assert_eq!(second.possible_duplicates, 0, "{second:?}");
+    assert_eq!(
+        second.set_aside, 1,
+        "cancelled cash remains refused: {second:?}"
+    );
+    assert_eq!(
+        second.recorded.len(),
+        expected_keys.len() + 2,
+        "nine economic duplicates, one gap duplicate and one quarantine: {second:?}"
+    );
+    assert_eq!(
+        load_all(resync_services, owner).await,
+        before,
+        "resync must preserve every fact"
+    );
+}
+
+#[tokio::test]
+async fn mixed_full_history_resync_counts_only_recorded_facts_and_skips_reports() {
+    resync_mixed_full_history(false).await;
+}
+
+#[tokio::test]
+async fn mixed_full_history_with_legacy_fill_provenance_uses_canonical_idempotency_keys() {
+    resync_mixed_full_history(true).await;
 }

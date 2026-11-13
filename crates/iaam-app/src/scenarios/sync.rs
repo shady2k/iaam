@@ -424,7 +424,6 @@ pub async fn sync_broker(
             broker_api_source: Some(channel.source),
             identity_scope: broker.identity_scope(),
         };
-        let key = dedup::choose_key(&operation, &context);
         let normalized = match normalize(
             &operation,
             &NormalizationContext {
@@ -489,8 +488,7 @@ pub async fn sync_broker(
             recorded.push(Verdict::Rejected { rejection });
             continue;
         }
-        let (decision, rule) =
-            dedup::assess_with_rule(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        let (decision, rule) = dedup::assess_operation(&operation, &context, &known);
         trace_dedup_decision(
             row_index,
             channel.source,

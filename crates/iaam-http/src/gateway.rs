@@ -2382,10 +2382,7 @@ impl<T: Transport + 'static> Gateway<T> {
                                 observed_request.path(),
                                 &observed,
                             );
-                            if observed.status == 429
-                                || (!(200..300).contains(&observed.status)
-                                    && observed.retry_after.is_some())
-                            {
+                            if observed.status == 429 {
                                 tracing::warn!(
                                     destination = ?destination,
                                     host = destination.base_url(),
@@ -2416,7 +2413,8 @@ impl<T: Transport + 'static> Gateway<T> {
                                 destination.base_url(),
                                 observed_request.path(),
                                 observed.status,
-                            ) && (observed.rate_remaining == Some(0) || method_limited)
+                            ) && !report_pending
+                                && (observed.rate_remaining == Some(0) || method_limited)
                                 && let Some(delay) = native_reset(&observed)
                             {
                                 *callback_reset
@@ -2498,7 +2496,13 @@ impl<T: Transport + 'static> Gateway<T> {
                             None
                         };
                         if let Some((line, _)) = observed.as_ref() {
-                            if let Some(remaining) = line.rate_remaining {
+                            if !is_tinkoff_report_pending(
+                                destination,
+                                request.path(),
+                                line.status,
+                                &line.body,
+                            ) && let Some(remaining) = line.rate_remaining
+                            {
                                 lane.diagnostic_capacity.insert(
                                     rate_key.clone(),
                                     (
@@ -2742,7 +2746,12 @@ impl<T: Transport + 'static> Gateway<T> {
                             return Ok(scrub_reading_answer(response, request));
                         }
                         status = Some(response.status);
-                        let outcome = match response.retry_after {
+                        let retry_after = if broker && response.status != 429 {
+                            response.retry_after_header
+                        } else {
+                            response.retry_after
+                        };
+                        let outcome = match retry_after {
                             Some(after) => Outcome::status_with_retry_after(response.status, after),
                             None => Outcome::status(response.status),
                         };
@@ -2761,7 +2770,14 @@ impl<T: Transport + 'static> Gateway<T> {
                 if let Some(named) = outcome.named_delay()
                     && is_transient(&outcome)
                 {
-                    lane.hold_until(self.clock.now() + named);
+                    if broker {
+                        lane.server_not_before.insert(
+                            native_rate_key(destination, request.path()).to_owned(),
+                            (self.clock.now(), named),
+                        );
+                    } else {
+                        lane.hold_until(self.clock.now() + named);
+                    }
                 }
                 // A request that may act is sent once: a lost answer does not
                 // say the action was not taken.
@@ -3863,45 +3879,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unscoped_429_and_503_retry_after_still_hold_all_methods() {
-        for native_headers in [false, true] {
-            let time = FakeTime::new();
-            let gateway = gateway(
-                &time,
-                Scripted::answering(&time, 200).then(Ok(HttpResponse {
-                    rate_remaining: native_headers.then_some(0),
-                    rate_reset: native_headers.then_some(17),
-                    retry_after: native_headers.then_some(Duration::from_secs(17)),
-                    retry_after_header: native_headers.then_some(Duration::from_secs(17)),
-                    ..status(if native_headers { 503 } else { 429 })
-                })),
-            );
-            let report = HttpRequest::post(
-                Destination::TinkoffProd,
-                "/OperationsService/GetBrokerReport",
-                crate::RequestBody::Json("{}".to_owned()),
-            )
-            .with_request_allowance(RequestAllowance::new(10));
-            assert!(matches!(
-                gateway.send(&report, None).await,
-                Err(GatewayError::BrokerHostPaused { .. })
-            ));
-            assert!(
-                !gateway
-                    .diagnostic_allowed(Destination::TinkoffProd, operations().path())
-                    .await
-            );
-            assert!(
-                !gateway
-                    .wait_diagnostic_report(Destination::TinkoffProd, report.path(), None)
-                    .await
-            );
-            assert!(matches!(
-                gateway.send(&operations(), None).await,
-                Err(GatewayError::BrokerHostPaused { attempts: 0, .. })
-            ));
-            assert_eq!(gateway.transport.sent_at().len(), 1);
-        }
+    async fn unscoped_429_still_holds_all_methods() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(429))));
+        let report = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/OperationsService/GetBrokerReport",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(10));
+        assert!(matches!(
+            gateway.send(&report, None).await,
+            Err(GatewayError::BrokerHostPaused { .. })
+        ));
+        assert!(
+            !gateway
+                .diagnostic_allowed(Destination::TinkoffProd, operations().path())
+                .await
+        );
+        assert!(
+            !gateway
+                .wait_diagnostic_report(Destination::TinkoffProd, report.path(), None)
+                .await
+        );
+        assert!(matches!(
+            gateway.send(&operations(), None).await,
+            Err(GatewayError::BrokerHostPaused { attempts: 0, .. })
+        ));
+        assert_eq!(gateway.transport.sent_at().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -4325,16 +4330,25 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pending_broker_report_does_not_close_host() {
+        let log = Log::capture();
         let time = FakeTime::new();
         let mut transport = Scripted::answering(&time, 200);
-        for body in [
+        for (index, body) in [
             br#"{"code":30058}"#.as_slice(),
             br#"{"error_code":3,"description":"Task not completed yet, please try again later"}"#,
             br#"{"code":"3","message":"30058"}"#,
             br#"{"code":3,"description":"Task not completed yet, please try again later."}"#,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             transport = transport.then(Ok(HttpResponse {
                 body: body.to_vec(),
+                rate_limit: Some(30),
+                rate_remaining: Some(0),
+                rate_reset: Some(21),
+                retry_after: Some(Duration::from_secs(21)),
+                retry_after_header: (index % 2 == 0).then_some(Duration::from_secs(21)),
                 ..status(400)
             }));
         }
@@ -4351,9 +4365,15 @@ mod tests {
                 gateway.send(&request, None).await,
                 Err(GatewayError::Rejected { status: 400, .. })
             ));
+            assert!(
+                gateway
+                    .diagnostic_allowed(Destination::TinkoffProd, request.path())
+                    .await
+            );
             time.advance(Duration::from_secs(1));
         }
         assert_eq!(gateway.send(&request, None).await.unwrap().status, 200);
+        assert!(time.slept().is_empty());
         assert!(!super::is_tinkoff_report_pending(
             Destination::TinkoffProd,
             "/OperationsService/GetBrokerReport",
@@ -4366,83 +4386,118 @@ mod tests {
             400,
             br#"{"code":30058}"#
         ));
+        assert!(!log.text().contains("outbound broker pause"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn instrument_lookup_misses_do_not_pause_or_close_tinkoff_hosts() {
+        let log = Log::capture();
         for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
-            let time = FakeTime::new();
-            let response = HttpResponse {
-                body: br#"{"code":50002,"message":"instrument not found"}"#.to_vec(),
-                retry_after: Some(Duration::from_secs(2)),
-                rate_remaining: Some(0),
-                rate_reset: Some(2),
-                ..status(404)
-            };
-            let gateway = gateway(
-                &time,
-                Scripted::answering(&time, 200)
-                    .then(Ok(response.clone()))
-                    .then(Ok(response.clone()))
-                    .then(Ok(response.clone())),
-            );
-            let request = HttpRequest::post(
-                destination,
+            for path in [
                 "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
-                crate::RequestBody::Json("{}".to_owned()),
-            )
-            .with_request_allowance(RequestAllowance::new(10))
-            .idempotent();
-            for _ in 0..3 {
-                assert!(matches!(
-                    gateway.send(&request, None).await,
-                    Err(GatewayError::Rejected { status: 404, body, .. })
-                        if body.as_bytes() == response.body.as_slice()
-                ));
-                time.advance(Duration::from_secs(1));
+                "/InstrumentsService/CurrencyBy",
+            ] {
+                let time = FakeTime::new();
+                let response = HttpResponse {
+                    body: br#"{"code":50002,"message":"instrument not found"}"#.to_vec(),
+                    retry_after: Some(Duration::from_secs(14)),
+                    retry_after_header: None,
+                    rate_limit: Some(200),
+                    rate_remaining: Some(17),
+                    rate_reset: Some(14),
+                    ..status(404)
+                };
+                let gateway = gateway(
+                    &time,
+                    Scripted::answering(&time, 200)
+                        .then(Ok(response.clone()))
+                        .then(Ok(response.clone()))
+                        .then(Ok(response.clone())),
+                );
+                let request =
+                    HttpRequest::post(destination, path, crate::RequestBody::Json("{}".to_owned()))
+                        .with_request_allowance(RequestAllowance::new(10))
+                        .idempotent();
+                for _ in 0..3 {
+                    assert!(matches!(
+                        gateway.send(&request, None).await,
+                        Err(GatewayError::Rejected { status: 404, body, .. })
+                            if body.as_bytes() == response.body.as_slice()
+                    ));
+                    time.advance(Duration::from_secs(1));
+                }
+                assert_eq!(
+                    gateway
+                        .send(&request, None)
+                        .await
+                        .expect("host remains open")
+                        .status,
+                    200
+                );
+                assert_eq!(gateway.transport.sent_count(), 4);
+                assert!(time.slept().is_empty());
             }
-            assert_eq!(
-                gateway
-                    .send(&request, None)
-                    .await
-                    .expect("host remains open")
-                    .status,
-                200
-            );
-            assert_eq!(gateway.transport.sent_count(), 4);
-            assert!(time.slept().is_empty());
         }
+        assert!(!log.text().contains("outbound broker pause"));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retry_after_on_a_server_error_is_persisted_before_returning() {
+    async fn server_error_retry_after_paces_only_its_method() {
         let time = FakeTime::new();
         let gateway = gateway(
             &time,
-            Scripted::answering(&time, 200)
-                .then(Ok(with_retry_after(503, Duration::from_secs(30)))),
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                retry_after: Some(Duration::from_secs(30)),
+                retry_after_header: Some(Duration::from_secs(30)),
+                ..status(503)
+            })),
         );
+        let request = operations();
+        let deadline = time.now() + Duration::from_secs(5);
+        assert!(matches!(
+            gateway.send(&request, Some(deadline)).await,
+            Err(GatewayError::DeadlineReached { attempts: 1, .. })
+        ));
+        let other = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/OperationsService/GetPortfolio",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(10))
+        .idempotent();
+        gateway
+            .send(&other, None)
+            .await
+            .expect("another method is available");
+        let sent = gateway.transport.sent_at();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1] - sent[0], Duration::from_secs(1));
+        gateway
+            .send(&request, None)
+            .await
+            .expect("retry after method delay");
+        let sent = gateway.transport.sent_at();
+        assert_eq!(sent[2] - sent[0], Duration::from_secs(30));
+    }
 
-        let first = gateway
+    #[tokio::test(start_paused = true)]
+    async fn server_error_reset_fallback_does_not_replace_retry_backoff() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                retry_after: Some(Duration::from_secs(21)),
+                rate_remaining: Some(17),
+                rate_reset: Some(21),
+                ..status(503)
+            })),
+        );
+        gateway
             .send(&operations(), None)
             .await
-            .expect_err("retry-after pauses even on a server error");
-        let second = gateway
-            .send(&operations(), None)
-            .await
-            .expect_err("the durable pause prevents another send");
-
-        assert!(matches!(
-            first,
-            GatewayError::BrokerHostPaused { attempts: 1, retry_after, .. }
-                if retry_after == Duration::from_secs(30)
-        ));
-        assert!(matches!(
-            second,
-            GatewayError::BrokerHostPaused { attempts: 0, retry_after, .. }
-                if retry_after == Duration::from_secs(30)
-        ));
-        assert_eq!(gateway.transport.sent_count(), 1);
+            .expect("retry succeeds");
+        let sent = gateway.transport.sent_at();
+        assert_eq!(sent[1] - sent[0], Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4779,45 +4834,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_named_delay_refuses_later_calls_until_the_persisted_pause_ends() {
+    async fn a_server_error_named_delay_is_waited_by_later_calls_to_its_method() {
         let time = FakeTime::new();
         let gateway = gateway(
             &time,
-            Scripted::answering(&time, 200)
-                .then(Ok(with_retry_after(503, Duration::from_secs(20)))),
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                retry_after: Some(Duration::from_secs(20)),
+                retry_after_header: Some(Duration::from_secs(20)),
+                ..status(503)
+            })),
         );
         let once = HttpRequest::post(
             Destination::TinkoffProd,
-            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+            operations().path(),
             crate::RequestBody::Json("{}".to_owned()),
         )
-        .with_request_allowance(RequestAllowance::new(u32::MAX));
-
-        let first = gateway
-            .send(&once, None)
-            .await
-            .expect_err("sent once and paused");
-        let blocked = gateway
-            .send(&operations(), None)
-            .await
-            .expect_err("the pause is not waited inside the process");
-        assert_eq!(first.retry_after(), Some(Duration::from_secs(20)));
-        assert!(matches!(
-            blocked,
-            GatewayError::BrokerHostPaused {
-                attempts: 0,
-                retry_after,
-                ..
-            } if retry_after == Duration::from_secs(20)
-        ));
-        assert_eq!(gateway.transport.sent_count(), 1);
-
-        time.advance(Duration::from_secs(20));
+        .with_request_allowance(RequestAllowance::new(10));
+        let start = time.now();
+        let first = gateway.send(&once, None).await.expect_err("sent once");
+        assert!(matches!(first, GatewayError::Exhausted { attempts: 1, .. }));
         gateway
             .send(&operations(), None)
             .await
-            .expect("sent after the reset");
+            .expect("method reset elapsed");
         assert_eq!(gateway.transport.sent_count(), 2);
+        assert_eq!(
+            gateway.transport.sent_at()[1] - start,
+            Duration::from_secs(20)
+        );
     }
 
     #[tokio::test(start_paused = true)]

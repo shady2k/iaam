@@ -214,7 +214,7 @@ fn partial_redemption(date: Date, number: u32) -> Event {
         EventKind::CorporateAction {
             action: CorporateAction::PartialRedemption {
                 instrument: INSTRUMENT,
-                custody: CUSTODY,
+                custody: Some(CUSTODY),
                 quantity: Quantity(dec(PURCHASE_QUANTITY_TEXT)),
                 principal_returned_per_unit: per_unit("500"),
                 compensation,

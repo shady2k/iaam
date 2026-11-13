@@ -2771,65 +2771,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_existing_tinkoff_access_adds_redemption_without_overwriting_decisions() {
+    async fn opening_existing_tinkoff_access_refreshes_principal_returns_without_overwriting_decisions()
+     {
         use crate::adapters::tinkoff::fake;
         use crate::ports::BrokerDictionary;
         use crate::ports::{BrokerEnvironment, BrokerVault};
-        let (gateway, _, _) = fake::gateway(Vec::new(), None);
-        let adapter = Arc::new(SqliteAdapter::with_broker_key(
-            SqliteStore::open_in_memory().unwrap(),
-            Some(Key::from_bytes([7; 32])),
-            gateway,
-        ));
-        let owner = OwnerId::new_random();
-        adapter
-            .add_access(
-                owner,
-                "tinkoff".to_owned(),
-                BrokerEnvironment::Prod,
-                zeroize::Zeroizing::new("invented-token".to_owned()),
-            )
-            .await
-            .unwrap();
-        adapter.blocking(|store| {
-            store.connection().execute("DELETE FROM broker_operation_kinds WHERE source_kind = 'OPERATION_TYPE_BOND_REPAYMENT_FULL'", []).map_err(|error| store_error(error.into()))?;
-            Ok(())
-        }).await.unwrap();
-        adapter.clone().open(owner, "tinkoff").await.unwrap();
-        let broker = BrokerCode::parse("tinkoff").unwrap();
-        assert_eq!(
+        for (source_kind, expected_kind) in [
+            ("OPERATION_TYPE_BOND_REPAYMENT_FULL", "bond_redemption"),
+            ("OPERATION_TYPE_BOND_REPAYMENT", "bond_amortisation"),
+        ] {
+            let (gateway, _, _) = fake::gateway(Vec::new(), None);
+            let adapter = Arc::new(SqliteAdapter::with_broker_key(
+                SqliteStore::open_in_memory().unwrap(),
+                Some(Key::from_bytes([7; 32])),
+                gateway,
+            ));
+            let owner = OwnerId::new_random();
             adapter
-                .operation_kinds(&broker)
+                .add_access(
+                    owner,
+                    "tinkoff".to_owned(),
+                    BrokerEnvironment::Prod,
+                    zeroize::Zeroizing::new("invented-token".to_owned()),
+                )
                 .await
-                .unwrap()
-                .get("OPERATION_TYPE_BOND_REPAYMENT_FULL")
-                .map(String::as_str),
-            Some("bond_redemption")
-        );
-        adapter
-            .blocking(|store| {
-                store
-                    .set_broker_operation_kind(
-                        &BrokerCode::parse("tinkoff").unwrap(),
-                        &BrokerOperationKind {
-                            source_kind: "OPERATION_TYPE_BOND_REPAYMENT_FULL".to_owned(),
-                            kind: "coupon".to_owned(),
-                        },
-                    )
-                    .map_err(store_error)
-            })
-            .await
-            .unwrap();
-        adapter.clone().open(owner, "tinkoff").await.unwrap();
-        assert_eq!(
+                .unwrap();
             adapter
-                .operation_kinds(&broker)
+                .blocking(move |store| {
+                    store
+                        .connection()
+                        .execute(
+                            "DELETE FROM broker_operation_kinds WHERE source_kind = ?1",
+                            [source_kind],
+                        )
+                        .map_err(|error| store_error(error.into()))?;
+                    Ok(())
+                })
                 .await
-                .unwrap()
-                .get("OPERATION_TYPE_BOND_REPAYMENT_FULL")
-                .map(String::as_str),
-            Some("coupon")
-        );
+                .unwrap();
+            adapter.clone().open(owner, "tinkoff").await.unwrap();
+            let broker = BrokerCode::parse("tinkoff").unwrap();
+            assert_eq!(
+                adapter
+                    .operation_kinds(&broker)
+                    .await
+                    .unwrap()
+                    .get(source_kind)
+                    .map(String::as_str),
+                Some(expected_kind)
+            );
+            adapter
+                .blocking(move |store| {
+                    store
+                        .set_broker_operation_kind(
+                            &BrokerCode::parse("tinkoff").unwrap(),
+                            &BrokerOperationKind {
+                                source_kind: source_kind.to_owned(),
+                                kind: "coupon".to_owned(),
+                            },
+                        )
+                        .map_err(store_error)
+                })
+                .await
+                .unwrap();
+            adapter.clone().open(owner, "tinkoff").await.unwrap();
+            assert_eq!(
+                adapter
+                    .operation_kinds(&broker)
+                    .await
+                    .unwrap()
+                    .get(source_kind)
+                    .map(String::as_str),
+                Some("coupon")
+            );
+        }
     }
 
     #[test]

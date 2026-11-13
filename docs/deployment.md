@@ -1240,6 +1240,7 @@ to distinguish a source observation from a defensive control.
   evidence of calendar equivalence. Keep the boundary diagnostics and emit
   counters on every sync; a zero observed count does not establish that such fills cannot
   occur.
+- **Bond amortisation (`iaam-mnz`).** `OPERATION_TYPE_BOND_REPAYMENT` maps to principal-return amortisation from the official T-Invest contract; it has not yet been observed live.
 - **Finam history.** The inspected history reached account opening; no
   history-depth limit was observed. This does not promise an unlimited
   history for every account or future broker response.

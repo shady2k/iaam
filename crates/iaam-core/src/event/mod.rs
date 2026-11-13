@@ -275,9 +275,9 @@ impl Event {
                 | ControlClaim::TaxWithheldTotal { .. } => {}
             },
             EventKind::CorporateAction { action } => match action {
+                CorporateAction::Conversion { custody, .. } => found.push(*custody),
                 CorporateAction::PartialRedemption { custody, .. }
-                | CorporateAction::Conversion { custody, .. } => found.push(*custody),
-                CorporateAction::Redemption { custody, .. } => found.extend(*custody),
+                | CorporateAction::Redemption { custody, .. } => found.extend(*custody),
             },
             EventKind::OfferExercise { action } => match action {
                 OfferExerciseAction::Settled { custody, .. } => found.push(*custody),
@@ -1679,7 +1679,7 @@ mod tests {
                 EventKind::CorporateAction {
                     action: CorporateAction::PartialRedemption {
                         instrument: self.instrument,
-                        custody: self.custody,
+                        custody: Some(self.custody),
                         quantity: qty(10),
                         principal_returned_per_unit: Self::per_unit(returned),
                         compensation: rub(100_000),

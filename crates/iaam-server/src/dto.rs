@@ -7032,7 +7032,7 @@ mod tests {
         let members = [
             CorporateActionDto::PartialRedemption {
                 instrument: Uuid::new_v4(),
-                custody: Uuid::new_v4(),
+                custody: Some(Uuid::new_v4()),
                 quantity: "10".into(),
                 principal_returned_per_unit: amount("100"),
                 compensation: amount("1000.00"),
@@ -10105,7 +10105,8 @@ pub enum CorporateActionDto {
     /// of securities does not change.
     PartialRedemption {
         instrument: Uuid,
-        custody: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custody: Option<Uuid>,
         quantity: String,
         principal_returned_per_unit: AmountDto,
         compensation: AmountDto,
@@ -10190,7 +10191,7 @@ impl CorporateActionDto {
                 grounds,
             } => CorporateAction::PartialRedemption {
                 instrument: InstrumentId(*instrument),
-                custody: CustodyId(*custody),
+                custody: custody.map(CustodyId),
                 quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
                 principal_returned_per_unit: principal_returned_per_unit
                     .to_per_unit("principal_returned_per_unit")?,

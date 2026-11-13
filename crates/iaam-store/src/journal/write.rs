@@ -1104,7 +1104,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::PartialRedemption {
                     instrument: fixture.instrument,
-                    custody: foreign_custody,
+                    custody: Some(foreign_custody),
                     quantity: qty("100"),
                     principal_returned_per_unit: per_unit("200.0000"),
                     compensation,

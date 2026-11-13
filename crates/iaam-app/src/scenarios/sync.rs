@@ -719,9 +719,15 @@ pub async fn sync_broker(
                     .clone()
                     .map(dedup::DedupKey::IdempotencyKey)
             });
+        let enrichment = crate::scenarios::ingest::journal_enrichment(
+            services,
+            &submitted,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
         let normalized = iaam_ingest::normalize_journal_event(
             &submitted,
-            &iaam_ingest::JournalEventEnrichment::default(),
+            &enrichment,
             &NormalizationContext {
                 owner: principal.owner,
                 source: channel.source,

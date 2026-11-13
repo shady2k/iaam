@@ -796,7 +796,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::PartialRedemption {
                     instrument,
-                    custody: CustodyId::new_random(),
+                    custody: Some(CustodyId::new_random()),
                     quantity: qty(100),
                     principal_returned_per_unit: per_unit(&principal_per_unit.to_string()),
                     compensation,

@@ -557,7 +557,7 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
             EventKind::CorporateAction {
                 action: CorporateAction::PartialRedemption {
                     instrument,
-                    custody,
+                    custody: Some(custody),
                     quantity: qty("10"),
                     principal_returned_per_unit: per_unit("200"),
                     compensation: money(200_000),

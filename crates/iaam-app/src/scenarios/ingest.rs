@@ -18,6 +18,53 @@ use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::{Principal, Recorded};
 
+pub(crate) async fn journal_enrichment(
+    services: &AppServices,
+    submitted: &SubmittedJournalEvent,
+    knowledge_as_of: OffsetDateTime,
+) -> Result<JournalEventEnrichment, AppError> {
+    let knowledge_as_of_wire = knowledge_as_of
+        .format(&Rfc3339)
+        .map_err(|error| AppError::Store(error.to_string()))?;
+    let enrichment = match &submitted.fact {
+        JournalFact::CorporateAction(CorporateAction::PartialRedemption {
+            instrument,
+            principal_returned_per_unit,
+            effective_date,
+            ..
+        }) => {
+            let loaded_schedule = {
+                let store = services.market_store.lock().await;
+                let offer_kinds = store
+                    .market_source_codes(MOEX_ISS_SOURCE_ID, "offer_kind")
+                    .map_err(|error| AppError::Store(error.to_string()))?;
+                crate::market_candidate::schedule_from_store(
+                    &store,
+                    *instrument,
+                    &knowledge_as_of_wire,
+                    &offer_kinds,
+                    None,
+                )?
+            };
+            let (schedule, snapshot_id) = match loaded_schedule {
+                Some((schedule, snapshot_id)) => (Some(schedule), snapshot_id),
+                None => (None, String::new()),
+            };
+            JournalEventEnrichment {
+                basis_allocation: iaam_core::rules::resolve_basis_allocation(
+                    *principal_returned_per_unit,
+                    *effective_date,
+                    schedule.as_ref(),
+                    &snapshot_id,
+                    knowledge_as_of,
+                ),
+            }
+        }
+        _ => JournalEventEnrichment::default(),
+    };
+    Ok(enrichment)
+}
+
 /// Where one row came from and which submission carried it.
 ///
 /// The two travel together because they are one answer: the source says «where
@@ -118,9 +165,6 @@ pub async fn submit_journal_events(
     events: &[SubmittedJournalEvent],
 ) -> Result<Vec<Verdict>, AppError> {
     let knowledge_as_of = OffsetDateTime::now_utc();
-    let knowledge_as_of_wire = knowledge_as_of
-        .format(&Rfc3339)
-        .map_err(|error| AppError::Store(error.to_string()))?;
     // One reader for the whole batch, and it is this crate: a journal fact
     // arrives as JSON and nothing outside parsed it.
     let context = NormalizationContext {
@@ -131,42 +175,7 @@ pub async fn submit_journal_events(
     let mut candidates = Vec::with_capacity(events.len());
 
     for submitted in events {
-        let enrichment = match &submitted.fact {
-            JournalFact::CorporateAction(CorporateAction::PartialRedemption {
-                instrument,
-                principal_returned_per_unit,
-                effective_date,
-                ..
-            }) => {
-                let loaded_schedule = {
-                    let store = services.market_store.lock().await;
-                    let offer_kinds = store
-                        .market_source_codes(MOEX_ISS_SOURCE_ID, "offer_kind")
-                        .map_err(|error| AppError::Store(error.to_string()))?;
-                    crate::market_candidate::schedule_from_store(
-                        &store,
-                        *instrument,
-                        &knowledge_as_of_wire,
-                        &offer_kinds,
-                        None,
-                    )?
-                };
-                let (schedule, snapshot_id) = match loaded_schedule {
-                    Some((schedule, snapshot_id)) => (Some(schedule), snapshot_id),
-                    None => (None, String::new()),
-                };
-                JournalEventEnrichment {
-                    basis_allocation: iaam_core::rules::resolve_basis_allocation(
-                        *principal_returned_per_unit,
-                        *effective_date,
-                        schedule.as_ref(),
-                        &snapshot_id,
-                        knowledge_as_of,
-                    ),
-                }
-            }
-            _ => JournalEventEnrichment::default(),
-        };
+        let enrichment = journal_enrichment(services, submitted, knowledge_as_of).await?;
 
         candidates.push(
             normalize_journal_event(submitted, &enrichment, &context).map(|normalized| {

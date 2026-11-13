@@ -90,10 +90,10 @@ struct EmptyChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for EmptyChannel {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Ok(Vec::new())
     }
 
@@ -145,11 +145,14 @@ struct PopulatedChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for PopulatedChannel {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
-        Ok(vec!["invented-one".to_owned()])
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
+        Ok(vec![iaam_app::ports::BrokerAccountDescription {
+            broker_account: "invented-one".to_owned(),
+            ..Default::default()
+        }])
     }
 
     async fn fetch_operations(
@@ -12701,11 +12704,14 @@ struct TwinRowsChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for TwinRowsChannel {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
-        Ok(vec!["invented-one".to_owned()])
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
+        Ok(vec![iaam_app::ports::BrokerAccountDescription {
+            broker_account: "invented-one".to_owned(),
+            ..Default::default()
+        }])
     }
 
     async fn fetch_operations(
@@ -35845,10 +35851,10 @@ struct FailingChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for FailingChannel {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Err(self.error.clone())
     }
 
@@ -36120,6 +36126,66 @@ async fn the_broker_sync_openapi_declares_its_ceiling_unreachable_and_refusing_a
     assert!(ceiling.contains("narrow"), "{ceiling}");
 }
 
+#[tokio::test]
+async fn broker_account_listing_is_read_only_and_never_fetches_history() {
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("listing.db");
+    let channel = recording_channel(&["2000000001", "2000000002"]);
+    let harness = harness_with_factory(
+        SqliteStore::open(&path).expect("database"),
+        Some(Arc::new(FixedChannelFactory {
+            channel: channel.clone(),
+        })),
+    )
+    .await;
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&harness.account, "tinkoff"),
+            &harness.owner_token,
+            &json!({"broker_account": "2000000001"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let before = database_snapshot(&path);
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/brokers/tinkoff/accounts", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"broker": "tinkoff", "accounts": [
+            {"broker_account": "2000000001", "bound_account": harness.account.inner()},
+            {"broker_account": "2000000002", "bound_account": null}
+        ]})
+    );
+    assert_eq!(
+        database_snapshot(&path),
+        before,
+        "every stored row outside the authentication audit is unchanged"
+    );
+    assert_eq!(
+        channel.listings.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(
+        channel.requested.lock().expect("calls").is_empty(),
+        "no history or portfolio requests"
+    );
+    let (status, _) = call(
+        &harness.router,
+        get(
+            "/v1/brokers/tinkoff/accounts",
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 // --- iaam-xzz5.3.2: the binding, and the sync that reads it --------------
 
 /// A broker channel that answers the accounts listing with a fixed set and
@@ -36129,16 +36195,26 @@ async fn the_broker_sync_openapi_declares_its_ceiling_unreachable_and_refusing_a
 struct RecordingChannel {
     source: iaam_core::reconciliation::evidence::SourceChannel,
     accounts: Vec<String>,
+    listings: std::sync::atomic::AtomicUsize,
     requested: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
 impl BrokerChannel for RecordingChannel {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
-        Ok(self.accounts.clone())
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
+        self.listings
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self
+            .accounts
+            .iter()
+            .map(|number| iaam_app::ports::BrokerAccountDescription {
+                broker_account: number.clone(),
+                ..Default::default()
+            })
+            .collect())
     }
 
     async fn fetch_operations(
@@ -36219,6 +36295,7 @@ fn recording_channel(accounts: &[&str]) -> Arc<RecordingChannel> {
             document: None,
         },
         accounts: accounts.iter().map(|value| (*value).to_owned()).collect(),
+        listings: std::sync::atomic::AtomicUsize::new(0),
         requested: std::sync::Mutex::new(Vec::new()),
     })
 }
@@ -36513,4 +36590,177 @@ async fn a_binding_is_an_agent_reachable_statement_a_read_only_token_cannot_writ
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], "forbidden");
+}
+
+#[tokio::test]
+async fn broker_account_listing_has_the_same_refusals_as_sync() {
+    for error in [
+        BrokerError::Unreachable {
+            broker: "tinkoff".into(),
+            detail: "offline".into(),
+            retry_after: None,
+        },
+        BrokerError::Refused {
+            broker: "tinkoff".into(),
+            detail: "access denied".into(),
+        },
+        BrokerError::Unparsable {
+            broker: "tinkoff".into(),
+            detail: "invalid answer".into(),
+        },
+    ] {
+        let (expected_status, _, expected) = sync_through_failing_broker(error.clone()).await;
+        let harness = harness_with_factory(
+            SqliteStore::open_in_memory().expect("database"),
+            Some(Arc::new(FixedChannelFactory {
+                channel: Arc::new(FailingChannel { error }),
+            })),
+        )
+        .await;
+        let (status, response) = call(
+            &harness.router,
+            get("/v1/brokers/tinkoff/accounts", Some(&harness.agent_token)),
+        )
+        .await;
+        assert_eq!(status, expected_status, "{response}");
+        assert_eq!(response["code"], expected["code"]);
+    }
+    let harness = harness().await;
+    let (sync_status, sync_error) = call(
+        &harness.router,
+        post(
+            "/v1/brokers/tinkoff/sync",
+            &harness.agent_token,
+            &sync_body(&harness.account),
+        ),
+    )
+    .await;
+    let (status, response) = call(
+        &harness.router,
+        get("/v1/brokers/tinkoff/accounts", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, sync_status, "{response}");
+    assert_eq!(response["code"], sync_error["code"]);
+    assert!(!response.to_string().contains(BROKER_TOKEN));
+}
+
+#[tokio::test]
+async fn broker_account_listing_keeps_context_when_no_account_is_visible() {
+    let (harness, channel) = binding_harness(&[]).await;
+    let (status, response) = call(
+        &harness.router,
+        get("/v1/brokers/tinkoff/accounts", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response, json!({"broker": "tinkoff", "accounts": []}));
+    assert_eq!(
+        channel.listings.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(channel.requested.lock().expect("calls").is_empty());
+}
+
+#[tokio::test]
+async fn finam_account_listing_returns_published_metadata_without_positions() {
+    let harness = finam_sync_harness(vec![
+        finam_session_token(),
+        json!({"account_ids": ["2000000001", "2000000002"]}).to_string(),
+        json!({"account_id": "2000000001", "type": "individual", "status": "active", "open_account_date": "2020-01-01T00:00:00Z"}).to_string(),
+        json!({"account_id": "2000000002"}).to_string(),
+    ]).await;
+    let (status, response) = call(
+        &harness.router,
+        get("/v1/brokers/finam/accounts", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response,
+        json!({"broker": "finam", "accounts": [
+            {"broker_account": "2000000001", "type": "individual", "status": "active", "opened": "2020-01-01T00:00:00Z", "bound_account": null},
+            {"broker_account": "2000000002", "bound_account": null}
+        ]})
+    );
+}
+
+fn database_snapshot(path: &std::path::Path) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let db = rusqlite::Connection::open(path).expect("connection");
+    let tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("tables")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("table names")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("names");
+    tables
+        .into_iter()
+        // Exclude only token_usage: it is the authentication audit, written
+        // for every request, including this read-only account listing.
+        .filter(|table| table != "token_usage")
+        .map(|table| {
+            let mut statement = db
+                .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))
+                .expect("rows");
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("values");
+            (table, rows)
+        })
+        .collect::<Vec<_>>()
+}
+
+#[tokio::test]
+async fn real_broker_factory_account_listing_preserves_the_database_after_startup_refresh() {
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("real-listing.db");
+    let harness = harness_with_everything(
+        SqliteStore::open(&path).expect("database"),
+        HarnessSetup {
+            channel_factory: None,
+            provisioned: true,
+            with_account: true,
+            with_broker_access: true,
+            broker_access_broker: None,
+            rate_limit: GENEROUS_RATE_LIMIT,
+            http: Arc::new(UnavailableOutboundHttp),
+            broker_gateway: Some(FinamScript::gateway(vec![
+                json!({"accounts":[{
+                    "id":"2000000001", "name":"Main", "type":"ACCOUNT_TYPE_TINKOFF",
+                    "status":"ACCOUNT_STATUS_OPEN", "openedDate":"2020-01-01T00:00:00Z"
+                }]})
+                .to_string(),
+            ])),
+        },
+    )
+    .await;
+    // Match serve startup: refresh embedded dictionaries before serving requests.
+    iaam_app::adapters::sqlite::refresh_broker_operation_dictionaries(
+        &mut SqliteStore::open(&path).expect("startup connection"),
+    )
+    .expect("startup dictionary refresh");
+    let before = database_snapshot(&path);
+    let (status, response) = call(
+        &harness.router,
+        get("/v1/brokers/tinkoff/accounts", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["accounts"][0],
+        json!({"broker_account":"2000000001", "name":"Main", "type":"ACCOUNT_TYPE_TINKOFF", "status":"ACCOUNT_STATUS_OPEN", "opened":"2020-01-01T00:00:00Z", "bound_account":null})
+    );
+    assert_eq!(
+        database_snapshot(&path),
+        before,
+        "listing after serve startup changes no rows outside the authentication audit"
+    );
 }

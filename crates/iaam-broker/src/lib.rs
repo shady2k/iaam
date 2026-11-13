@@ -6,6 +6,17 @@
 //! object-safe async traits exist only there (§3.2), and the application
 //! adapter connects them, as it already does for SQLite.
 
+/// An account exactly as the broker describes it; metadata is not inferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BrokerAccountDescription {
+    pub broker_account: String,
+    pub name: Option<String>,
+    pub account_type: Option<String>,
+    pub status: Option<String>,
+    pub opened: Option<String>,
+    pub closed: Option<String>,
+}
+
 pub mod credentials;
 pub mod environment;
 pub mod finam;

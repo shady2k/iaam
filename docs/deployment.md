@@ -1102,6 +1102,25 @@ database holds. Deleting or emptying that pair after the first enabling
 spends the day (§2.1); the command then refuses with the ceiling it finds,
 and nothing restores the allowance.
 
+#### List the accounts a connected access sees
+
+`GET /v1/brokers/{broker}/accounts` returns `broker` and `accounts`, including
+an empty list when the access sees none. Each entry carries `broker_account`
+(the number used in bindings), optional source-supplied `name`, `type`,
+`status`, `opened` and `closed`, and `bound_account` (the existing iaam account
+id for this owner, or null). Dates and status/type strings are preserved as
+published by the broker. Missing metadata is omitted, not inferred.
+
+This agent-scope call changes no owner or sync data: no binding, journal
+fact, sync run or dictionary change after serve startup. Authentication records
+token usage for every request, including this listing. It requests only account
+listings and account descriptions, never operations, portfolio positions or
+broker reports.
+It spends broker allowance through the same gateway, deadline, request ceiling,
+cache, outbound tally and logging as sync account discovery. Finam reads one
+account description per visible id. The response exposes no stored credential.
+Use the numbers it returns to bind the iaam accounts before a dry-run sync.
+
 ### 6.9 How broker descriptions fill the instrument catalogue
 
 Both brokers resolve securities by **ISIN**, not by a broker's private

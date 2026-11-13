@@ -15,7 +15,7 @@ use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, ChannelOrderState,
     ChannelPortfolioPosition, GetOperationsByCursorRequest, InstrumentIdType, ParseError,
-    TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError, parse_account_ids, parse_operations,
+    TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError, parse_accounts, parse_operations,
     parse_portfolio, parse_portfolio_positions,
 };
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -698,10 +698,10 @@ impl BrokerChannel for TinkoffChannel {
             .await;
     }
 
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<crate::ports::BrokerAccountDescription>, BrokerError> {
         let BrokerRequestContext {
             deadline,
             allowance,
@@ -711,7 +711,7 @@ impl BrokerChannel for TinkoffChannel {
         // frozen signature predates the sync's deadline — so the bound is
         // taken here, the way the Finam channel bounds every call.
         let body = bounded(deadline, self.client.get_accounts(allowance)).await?;
-        parse_account_ids(&body).map_err(parse_error)
+        parse_accounts(&body).map_err(parse_error)
     }
 
     async fn fetch_operations(
@@ -4636,11 +4636,16 @@ mod tests {
         );
 
         let ids = channel(gateway)
-            .fetch_account_numbers(broker_context(None))
+            .fetch_accounts(broker_context(None))
             .await
             .expect("the listing parses");
 
-        assert_eq!(ids, ["first", "second"]);
+        assert_eq!(
+            ids.iter()
+                .map(|account| account.broker_account.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
         assert_eq!(log.lock().expect("log").len(), 1);
     }
 

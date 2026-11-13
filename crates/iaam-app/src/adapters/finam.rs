@@ -86,21 +86,52 @@ impl FinamChannel {
 
 #[async_trait]
 impl BrokerChannel for FinamChannel {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<crate::ports::BrokerAccountDescription>, BrokerError> {
+        let ids = bounded(
+            context.deadline,
+            "the Finam sessions request",
+            self.client.get_account_ids(context.allowance),
+        )
+        .await?;
+        Ok(ids
+            .into_iter()
+            .map(|broker_account| crate::ports::BrokerAccountDescription {
+                broker_account,
+                ..Default::default()
+            })
+            .collect())
+    }
+
+    async fn fetch_account_descriptions(
+        &self,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<Vec<crate::ports::BrokerAccountDescription>, BrokerError> {
         let BrokerRequestContext {
             deadline,
             allowance,
             ..
         } = context;
-        bounded(
+        let ids = bounded(
             deadline,
             "the Finam sessions request",
             self.client.get_account_ids(allowance),
         )
-        .await
+        .await?;
+        let mut accounts = Vec::new();
+        for id in ids {
+            accounts.push(
+                bounded(
+                    deadline,
+                    "the Finam account description request",
+                    self.client.get_account_description(&id, allowance),
+                )
+                .await?,
+            );
+        }
+        Ok(accounts)
     }
 
     async fn fetch_operations(
@@ -1330,11 +1361,16 @@ mod tests {
         );
 
         let ids = channel
-            .fetch_account_numbers(broker_context(None))
+            .fetch_accounts(broker_context(None))
             .await
             .expect("the listing parses");
 
-        assert_eq!(ids, ["invented-one", "invented-two"]);
+        assert_eq!(
+            ids.iter()
+                .map(|account| account.broker_account.as_str())
+                .collect::<Vec<_>>(),
+            ["invented-one", "invented-two"]
+        );
     }
 
     #[tokio::test]

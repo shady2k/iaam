@@ -49,6 +49,8 @@ iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
 iaam-http = { path = "../iaam-http", version = "0.1.0" }
 iaam-store = { path = "../iaam-store", version = "0.1.0", features = ["test-support"] }
 ciborium = "0.2"
+rusqlite = "0.42"
+tempfile = "3"
 tower = "0.5"
 
 [lints]

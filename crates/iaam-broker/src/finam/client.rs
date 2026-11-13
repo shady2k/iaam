@@ -355,6 +355,18 @@ impl FinamClient {
         Ok(ids)
     }
 
+    /// Read the metadata published for one account, through the shared account request.
+    pub async fn get_account_description(
+        &self,
+        account_id: &str,
+        allowance: &RequestAllowance,
+    ) -> Result<crate::BrokerAccountDescription, FinamError> {
+        validate_account_id(account_id)?;
+        let (body, _) = self.get_account(account_id, "", &[], allowance).await?;
+        super::parse::parse_account_description(account_id, &body)
+            .map_err(|_| FinamError::MalformedResponse)
+    }
+
     /// Send a reading call over the session token: the body and the moment
     /// the answer was observed, as the authorized plumbing surfaced them.
     async fn get_account(

@@ -66,12 +66,19 @@ struct FakeBroker {
 
 #[async_trait]
 impl BrokerChannel for FakeBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         self.accounts_requests.fetch_add(1, Ordering::SeqCst);
-        Ok(self.accounts.clone())
+        Ok(self
+            .accounts
+            .iter()
+            .map(|number| iaam_app::ports::BrokerAccountDescription {
+                broker_account: number.clone(),
+                ..Default::default()
+            })
+            .collect())
     }
 
     async fn fetch_operations(
@@ -4165,10 +4172,10 @@ impl HeldBroker {
 
 #[async_trait]
 impl BrokerChannel for HeldBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Ok(Vec::new())
     }
 
@@ -4216,10 +4223,10 @@ struct AllowanceBroker {
 
 #[async_trait]
 impl BrokerChannel for AllowanceBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Ok(Vec::new())
     }
 
@@ -4503,10 +4510,10 @@ struct PanickingBroker(SourceChannel);
 
 #[async_trait]
 impl BrokerChannel for PanickingBroker {
-    async fn fetch_account_numbers(
+    async fn fetch_accounts(
         &self,
         _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
         Ok(Vec::new())
     }
 
@@ -6159,11 +6166,11 @@ async fn missing_fund_units_diagnostics_only_cover_missing_paired_redemptions() 
 
     #[async_trait]
     impl BrokerChannel for DiagnosticBroker {
-        async fn fetch_account_numbers(
+        async fn fetch_accounts(
             &self,
             context: BrokerRequestContext<'_>,
-        ) -> Result<Vec<String>, BrokerError> {
-            self.inner.fetch_account_numbers(context).await
+        ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
+            self.inner.fetch_accounts(context).await
         }
 
         async fn fetch_operations(
@@ -7319,4 +7326,174 @@ async fn mixed_full_history_resync_counts_only_recorded_facts_and_skips_reports(
 #[tokio::test]
 async fn mixed_full_history_with_legacy_fill_provenance_uses_canonical_idempotency_keys() {
     resync_mixed_full_history(true).await;
+}
+
+// No fetch_account_descriptions override: exercise the port's discovery default.
+struct AccountListingBroker;
+
+#[async_trait]
+impl BrokerChannel for AccountListingBroker {
+    async fn fetch_accounts(
+        &self,
+        _context: BrokerRequestContext<'_>,
+    ) -> Result<Vec<iaam_app::ports::BrokerAccountDescription>, BrokerError> {
+        Ok(vec![
+            iaam_app::ports::BrokerAccountDescription {
+                broker_account: "2000000001".to_owned(),
+                name: Some("Main".to_owned()),
+                account_type: Some("individual".to_owned()),
+                status: Some("active".to_owned()),
+                opened: Some("2020-01-01T00:00:00Z".to_owned()),
+                closed: None,
+            },
+            iaam_app::ports::BrokerAccountDescription {
+                broker_account: "2000000002".to_owned(),
+                name: Some("Savings".to_owned()),
+                ..Default::default()
+            },
+        ])
+    }
+
+    async fn fetch_operations(
+        &self,
+        _account: AccountId,
+        _broker_account: &str,
+        _from: Date,
+        _to: Date,
+        _context: BrokerRequestContext<'_>,
+    ) -> Result<ParsedOperations, BrokerError> {
+        panic!("account listing must not fetch operations")
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _broker_account: &str,
+        _at: Date,
+        _context: BrokerRequestContext<'_>,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        panic!("account listing must not fetch portfolio")
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Source
+    }
+
+    fn channel(&self) -> SourceChannel {
+        panic!("account listing needs no history source")
+    }
+}
+
+struct AccountListingFactory;
+
+#[async_trait]
+impl iaam_app::ports::BrokerChannelFactory for AccountListingFactory {
+    async fn open(
+        self: Arc<Self>,
+        _owner: OwnerId,
+        broker: &str,
+    ) -> Result<Arc<dyn BrokerChannel>, AppError> {
+        assert_eq!(broker, "tinkoff");
+        Ok(Arc::new(AccountListingBroker))
+    }
+}
+
+#[tokio::test]
+async fn broker_account_listing_returns_all_descriptions_and_existing_bindings() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    services.channels = Arc::new(AccountListingFactory);
+    services
+        .store
+        .record_broker_account_binding(owner, account, &broker_code(), "2000000001".to_owned())
+        .await
+        .expect("binding");
+    let mut caller = principal(owner);
+    caller.scope = Scope::Agent;
+    let listed = iaam_app::sync::list_broker_accounts(&services, &caller, &broker_code())
+        .await
+        .expect("listing");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0].description,
+        iaam_app::ports::BrokerAccountDescription {
+            broker_account: "2000000001".to_owned(),
+            name: Some("Main".to_owned()),
+            account_type: Some("individual".to_owned()),
+            status: Some("active".to_owned()),
+            opened: Some("2020-01-01T00:00:00Z".to_owned()),
+            closed: None,
+        }
+    );
+    assert_eq!(listed[0].bound_account, Some(account));
+    assert_eq!(
+        listed[1].description,
+        iaam_app::ports::BrokerAccountDescription {
+            broker_account: "2000000002".to_owned(),
+            name: Some("Savings".to_owned()),
+            account_type: None,
+            status: None,
+            opened: None,
+            closed: None,
+        }
+    );
+    assert_eq!(listed[1].bound_account, None);
+}
+
+#[tokio::test]
+async fn broker_account_listing_refuses_read_only_scope_before_opening_a_channel() {
+    // The default unavailable factory would fail differently if scope were ignored.
+    let services = services();
+    let mut caller = principal(OwnerId::new_random());
+    caller.scope = Scope::ReadOnly;
+    let result = iaam_app::sync::list_broker_accounts(&services, &caller, &broker_code()).await;
+    match result {
+        Err(AppError::Invalid {
+            field,
+            expected,
+            actual,
+        }) => {
+            assert_eq!(field, "scope");
+            assert_eq!(expected, "permission to list broker accounts");
+            assert_eq!(actual, "read_only");
+        }
+        _ => panic!("expected read-only scope refusal"),
+    }
+}
+
+#[tokio::test]
+async fn default_account_descriptions_preserve_every_discovered_account_and_metadata() {
+    let allowance = RequestAllowance::new(10);
+    let descriptions = AccountListingBroker
+        .fetch_account_descriptions(BrokerRequestContext {
+            deadline: None,
+            allowance: &allowance,
+            known: &[],
+        })
+        .await
+        .expect("descriptions");
+    assert_eq!(
+        descriptions,
+        vec![
+            iaam_app::ports::BrokerAccountDescription {
+                broker_account: "2000000001".to_owned(),
+                name: Some("Main".to_owned()),
+                account_type: Some("individual".to_owned()),
+                status: Some("active".to_owned()),
+                opened: Some("2020-01-01T00:00:00Z".to_owned()),
+                closed: None,
+            },
+            iaam_app::ports::BrokerAccountDescription {
+                broker_account: "2000000002".to_owned(),
+                name: Some("Savings".to_owned()),
+                account_type: None,
+                status: None,
+                opened: None,
+                closed: None,
+            },
+        ]
+    );
 }

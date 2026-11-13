@@ -801,7 +801,7 @@ mod tests {
             custody,
             crate::event::corporate_action::CorporateAction::PartialRedemption {
                 instrument,
-                custody,
+                custody: Some(custody),
                 quantity: qty(10),
                 principal_returned_per_unit: per_unit("200"),
                 compensation: rub(200_000),
@@ -838,7 +838,7 @@ mod tests {
             custody,
             crate::event::corporate_action::CorporateAction::PartialRedemption {
                 instrument,
-                custody,
+                custody: Some(custody),
                 quantity: qty(10),
                 principal_returned_per_unit: per_unit("200"),
                 compensation: rub(200_000),

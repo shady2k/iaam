@@ -372,7 +372,7 @@ mod tests {
     fn partial_redemption() -> CorporateAction {
         CorporateAction::PartialRedemption {
             instrument: InstrumentId::new_random(),
-            custody: CustodyId::new_random(),
+            custody: Some(CustodyId::new_random()),
             quantity: qty("10"),
             principal_returned_per_unit: PerUnitAmount::new(dec("100"), CurrencyCode::Rub),
             compensation: rub(100_000),
@@ -629,7 +629,7 @@ mod tests {
             &submitted(JournalFact::CorporateAction(
                 CorporateAction::PartialRedemption {
                     instrument: InstrumentId::new_random(),
-                    custody: CustodyId::new_random(),
+                    custody: Some(CustodyId::new_random()),
                     quantity: qty("10"),
                     principal_returned_per_unit: PerUnitAmount::new(dec("0"), CurrencyCode::Rub),
                     compensation: rub(0),

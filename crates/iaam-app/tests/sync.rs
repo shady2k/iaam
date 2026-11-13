@@ -3096,6 +3096,222 @@ async fn a_full_bond_repayment_persists_principal_and_removes_quantity_only_once
     assert_eq!(redemptions_after, vec![redemption]);
 }
 
+#[tokio::test]
+async fn a_partial_bond_repayment_preserves_quantity_and_is_recorded_only_once() {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::event::leg::LegKind;
+    use iaam_core::projection::lots::{LotBook, LotKey};
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000006").expect("invented bond UID"),
+    );
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDAMORTISINGBOND");
+    });
+    let mut store = services.market_store.lock().await;
+    seed_instrument(&store, instrument, "INVENTEDAMORTISINGBOND");
+    let snapshot = store
+        .record_schedule_snapshot(
+            &iaam_store::schedule::ScheduleSnapshotRow {
+                instrument_id: instrument.inner().to_string(),
+                source_id: "moex-iss".to_owned(),
+                observed_at: "2026-03-01T00:00:00Z".to_owned(),
+                content_hash: "invented-amortising-bond-schedule".to_owned(),
+            },
+            &[],
+            &[
+                iaam_store::schedule::PrincipalRepaymentRow {
+                    repayment_date: "2026-03-15".to_owned(),
+                    share_percent: "20".to_owned(),
+                    source_kind: "maturity".to_owned(),
+                    source_entry_id: Some("invented-first-repayment".to_owned()),
+                },
+                iaam_store::schedule::PrincipalRepaymentRow {
+                    repayment_date: "2026-12-15".to_owned(),
+                    share_percent: "80".to_owned(),
+                    source_kind: "maturity".to_owned(),
+                    source_entry_id: Some("invented-final-repayment".to_owned()),
+                },
+            ],
+            &[],
+        )
+        .expect("invented repayment schedule");
+    store
+        .record_schedule_completeness(&snapshot.snapshot_id, true, true, None, &[0])
+        .expect("validated invented schedule");
+    store
+        .record_issue_terms(&iaam_store::schedule::IssueTermsRow {
+            instrument_id: instrument.inner().to_string(),
+            source_id: "moex-iss".to_owned(),
+            observed_at: "2026-03-01T00:00:00Z".to_owned(),
+            effective_from: Some("2026-03-01".to_owned()),
+            maturity_date: Some("2026-12-15".to_owned()),
+            initial_face_value: Some("1000".to_owned()),
+            face_currency_code: Some("RUB".to_owned()),
+            coupon_periods_per_year: None,
+            day_count: None,
+            calendar: None,
+            default_declared: false,
+            default_technical: false,
+        })
+        .expect("invented initial principal");
+    drop(store);
+    seed_redemption_history(
+        &services,
+        owner,
+        account,
+        instrument,
+        &[(date!(2026 - 03 - 01), 2)],
+    )
+    .await;
+    let channel = channel_over(
+        CatalogueTinvest {
+            descriptions_asked: Arc::new(AtomicUsize::new(0)),
+            description: serde_json::json!({"instrument": {
+                "isin":invented_isin(instrument), "ticker":"INVENTEDAMORTISINGBOND",
+                "name":"Invented amortising bond", "instrumentType":"bond",
+                "currency":"rub", "classCode":"TQOB", "lot":1
+            }})
+            .to_string(),
+            inner: ScriptedTinvest {
+                accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+                operations: r#"{"hasNext":false,"items":[{
+                    "cursor":"amortisation-cursor", "brokerAccountId":"solo",
+                    "id":"invented-partial-repayment", "date":"2026-03-15T10:00:00Z",
+                    "type":"OPERATION_TYPE_BOND_REPAYMENT",
+                    "state":"OPERATION_STATE_EXECUTED",
+                    "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000006",
+                    "positionUid":"aaaaaaaa-0000-0000-0000-000000000006",
+                    "quantity":"2", "quantityDone":"2", "quantityRest":"0",
+                    "payment":{"units":"400","nano":0,"currency":"rub"}
+                }]}"#,
+                portfolio: r#"{"positions":[]}"#.to_owned(),
+            },
+        },
+        &services,
+    );
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("partial repayment sync");
+    assert_eq!(first.set_aside, 0, "{:?}", first.recorded);
+    assert_eq!(first.duplicates, 0, "{:?}", first.recorded);
+    let events = load_all(&services, owner).await;
+    let amortisations: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::PartialRedemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(amortisations.len(), 1, "{events:?}");
+    let amortisation = amortisations[0];
+    let held = iaam_core::money::Quantity(Dec::new(rust_decimal::Decimal::from(2)));
+    match &amortisation.kind {
+        EventKind::CorporateAction {
+            action:
+                CorporateAction::PartialRedemption {
+                    instrument: actual_instrument,
+                    custody,
+                    quantity,
+                    principal_returned_per_unit,
+                    compensation,
+                    effective_date,
+                    ..
+                },
+        } => {
+            assert_eq!(*actual_instrument, instrument);
+            assert_eq!(*custody, None, "an opaque position UID is not custody");
+            assert_eq!(*quantity, held);
+            assert_eq!(
+                principal_returned_per_unit.value(),
+                Dec::new(rust_decimal::Decimal::from(200))
+            );
+            assert_eq!(principal_returned_per_unit.currency(), CurrencyCode::Rub);
+            assert_eq!(compensation.amount().raw(), 40_000);
+            assert_eq!(compensation.currency(), CurrencyCode::Rub);
+            assert_eq!(*effective_date, date!(2026 - 03 - 15));
+        }
+        other => panic!("expected partial redemption, got {other:?}"),
+    }
+    assert_eq!(amortisation.legs.len(), 1);
+    let leg = &amortisation.legs[0];
+    assert_eq!(leg.kind, LegKind::Principal);
+    assert_eq!(leg.account, account);
+    assert_eq!(leg.instrument, Some(instrument));
+    assert_eq!(
+        leg.cash_effect().expect("principal inflow").amount().raw(),
+        40_000
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::Income { .. } | EventKind::CashIn { .. }
+    )));
+    let mut book = LotBook::new(iaam_core::rules::LotRuleVersion(1));
+    let rules = iaam_core::rules::RuleRegistry::with_defaults();
+    let mut ordered: Vec<_> = events.iter().collect();
+    ordered.sort_by_key(|event| event.dates.effective_date());
+    for event in ordered {
+        book.apply(event, &rules)
+            .expect("project invented bond history");
+    }
+    let entry = book
+        .entry(&LotKey {
+            account,
+            instrument,
+        })
+        .expect("bond position");
+    assert_eq!(entry.quantity().unwrap(), held);
+    assert_eq!(entry.gap(), None);
+    assert_eq!(
+        entry.remaining_basis().unwrap().unwrap().amount().raw(),
+        160_000
+    );
+    assert_eq!(entry.released_basis().unwrap().amount().raw(), 40_000);
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("repeat partial repayment sync");
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+    assert_eq!(second.duplicates, 1, "{:?}", second.recorded);
+    assert!(second.recorded.iter().any(|verdict| matches!(verdict,
+        Verdict::Duplicate { existing } if *existing == amortisation.id
+    )));
+    let after = load_all(&services, owner).await;
+    let amortisations_after: Vec<_> = after
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::PartialRedemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(amortisations_after, vec![amortisation]);
+}
+
 fn zero_quantity_repayment_channel(services: &AppServices) -> TinkoffChannel {
     let instrument = InstrumentId(
         uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").expect("invented bond UID"),

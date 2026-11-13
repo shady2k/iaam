@@ -27,8 +27,8 @@ pub enum CorporateAction {
         /// Custody location is a fact about the payment, **not** a lot lookup key:
         /// `LotKey` intentionally does not distinguish between depositories
         /// (`projection/lots.rs`), and moving a security between them
-        /// does not create a lot.
-        custody: CustodyId,
+        /// does not create a lot. `None` means the source did not assert it.
+        custody: Option<CustodyId>,
         /// The quantity covered by the payment. The projection checks it,
         /// rather than scaling face value by it: a position mismatch —
         /// bad source data, not a reason to recalculate.
@@ -172,7 +172,7 @@ mod tests {
     fn sample_partial_redemption() -> CorporateAction {
         CorporateAction::PartialRedemption {
             instrument: InstrumentId::new_random(),
-            custody: CustodyId::new_random(),
+            custody: Some(CustodyId::new_random()),
             quantity: Quantity(dec("100")),
             principal_returned_per_unit: per_unit("200.0000"),
             compensation: rub(2_000_000),

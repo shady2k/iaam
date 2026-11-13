@@ -1109,7 +1109,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::PartialRedemption {
                     instrument,
-                    custody: CustodyId::new_random(),
+                    custody: Some(CustodyId::new_random()),
                     quantity: Quantity(Dec::new(Decimal::from(100))),
                     principal_returned_per_unit: PerUnitAmount::new(
                         Dec::new(Decimal::from(200)),

@@ -516,7 +516,7 @@ fn corporate_action_to_row(
             Ok(CorporateActionRow {
                 action_kind: "partial_redemption".to_owned(),
                 instrument: Some(instrument.inner().to_string()),
-                custody: Some(custody.inner().to_string()),
+                custody: custody.map(|id| id.inner().to_string()),
                 quantity: Some(dec_to_text(quantity.0)),
                 principal_returned_per_unit_value: Some(dec_to_text(
                     principal_returned_per_unit.value(),
@@ -1123,10 +1123,7 @@ fn corporate_action_from_row(
                 field,
                 &require_str(field, row.instrument.as_deref())?,
             )?),
-            custody: CustodyId(parse_uuid(
-                field,
-                &require_str(field, row.custody.as_deref())?,
-            )?),
+            custody,
             quantity: Quantity(dec_from_text(
                 field,
                 &require_str(field, row.quantity.as_deref())?,
@@ -2553,7 +2550,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::PartialRedemption {
                     instrument: f.instrument,
-                    custody: f.custody,
+                    custody: Some(f.custody),
                     quantity: qty("10"),
                     principal_returned_per_unit: per_unit("200"),
                     compensation: rub(2_000_000),
@@ -2569,7 +2566,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::PartialRedemption {
                     instrument: f.instrument,
-                    custody: f.custody,
+                    custody: Some(f.custody),
                     quantity: qty("10"),
                     principal_returned_per_unit: per_unit("200.0000"),
                     compensation: rub(i64::MAX),
@@ -2588,6 +2585,15 @@ mod tests {
             },
             vec![Leg::principal(f.account, f.instrument, rub(i64::MAX))],
         ));
+
+        let mut partial_without_custody = events.last().unwrap().clone();
+        if let EventKind::CorporateAction {
+            action: CorporateAction::PartialRedemption { custody, .. },
+        } = &mut partial_without_custody.kind
+        {
+            *custody = None;
+        }
+        events.push(partial_without_custody);
 
         // --- CorporateAction: Redemption --------------------------------------
         events.push(f.event(

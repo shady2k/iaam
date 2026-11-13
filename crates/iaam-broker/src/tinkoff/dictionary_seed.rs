@@ -17,7 +17,7 @@
 //!
 //! Full bond repayment is a redemption: the payment returns principal and
 //! the reported quantity leaves the position. It is not investment income.
-//! Partial repayment is not seeded here until its journal mapping is available.
+//! Partial repayment returns principal without reducing the position quantity.
 
 /// “Channel code → kind name” pairs for initial seeding.
 pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
@@ -36,6 +36,9 @@ pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
     ("OPERATION_TYPE_TAX", "tax"),
     ("OPERATION_TYPE_TAX_CORRECTION", "tax"),
     ("OPERATION_TYPE_BOND_REPAYMENT_FULL", "bond_redemption"),
+    // RussianInvestments/investAPI operations.proto: value 10, «Частичное погашение облигаций».
+    // Contract evidence, not an observed live response from the owner's history.
+    ("OPERATION_TYPE_BOND_REPAYMENT", "bond_amortisation"),
     ("OPERATION_TYPE_BROKER_FEE", "commission"),
     ("OPERATION_TYPE_SERVICE_FEE", "commission"),
     ("OPERATION_TYPE_MARGIN_FEE", "commission"),
@@ -143,6 +146,16 @@ mod tests {
         assert_eq!(
             dictionary.kind_of("OPERATION_TYPE_BOND_REPAYMENT_FULL"),
             ChannelOperationKind::BondRedemption
+        );
+    }
+
+    #[test]
+    fn partial_bond_repayment_is_seeded_as_amortisation_not_income() {
+        let (dictionary, _) =
+            OperationKindDictionary::build(TINKOFF_OPERATION_KINDS.iter().copied());
+        assert_eq!(
+            dictionary.kind_of("OPERATION_TYPE_BOND_REPAYMENT"),
+            ChannelOperationKind::BondAmortisation
         );
     }
 

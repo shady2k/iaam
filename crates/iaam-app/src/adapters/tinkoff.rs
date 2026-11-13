@@ -3402,7 +3402,7 @@ mod tests {
             ));
             answers.push(Answer::status(200, &report.to_string()));
         }
-        let (gateway, requests, _) = fake::gateway(answers, None);
+        let (gateway, requests, time) = fake::gateway(answers, None);
         let channel = channel(gateway);
         channel
             .client
@@ -3443,6 +3443,10 @@ mod tests {
             .await;
         let sent = requests.lock().unwrap();
         assert_eq!(sent.len(), 10);
+        assert!(
+            time.slept().iter().sum::<Duration>() >= Duration::from_secs(60),
+            "formation evidence waits for the four-per-minute report bucket"
+        );
         let legacy_requests: Vec<serde_json::Value> = sent[1..4]
             .iter()
             .map(|body| serde_json::from_str(body).unwrap())

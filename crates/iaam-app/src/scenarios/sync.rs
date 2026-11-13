@@ -195,9 +195,24 @@ pub async fn sync_broker(
     // when the runtime clock is paused independently of real setup time.
     let deadline = Some(tokio::time::Instant::now().into_std() + SYNC_DEADLINE);
     let allowance = RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING);
+    // Position checks and recording remain bounded to the requested interval.
+    let bounded_events = services
+        .store
+        .load_events_through(principal.owner, to)
+        .await?;
+    let mut known = known_records(&bounded_events);
+    // A broker may return an operation outside its requested interval. Its exact
+    // recorded identity still avoids redundant enrichment, wherever it was dated.
+    let initial_known = known_records(
+        &services
+            .store
+            .load_events_through(principal.owner, Date::MAX)
+            .await?,
+    );
     let broker_context = BrokerRequestContext {
         deadline,
         allowance: &allowance,
+        known: &initial_known,
     };
 
     // The account the broker is asked for is its own number, never our
@@ -253,20 +268,15 @@ pub async fn sync_broker(
         "broker sync phase complete"
     );
     let channel = broker.channel();
-    // Deduplication belongs to the requested interval; it must not treat later facts
-    // as part of this sync.
-    let bounded_events = services
-        .store
-        .load_events_through(principal.owner, to)
-        .await?;
     // A gateway may filter by order date while the fact uses its trade date.
     // Keep the fact, but do not assert completeness for an interval it falls outside.
-    let has_out_of_interval_trade = parsed.accepted.iter().any(|operation| {
-        operation
-            .dates
-            .trade
-            .is_some_and(|trade| trade < from || trade > to)
-    });
+    let has_out_of_interval_trade = parsed.has_out_of_interval_trade
+        || parsed.accepted.iter().any(|operation| {
+            operation
+                .dates
+                .trade
+                .is_some_and(|trade| trade < from || trade > to)
+        });
     // Both answers are fetched before the first write: a portfolio that fails
     // after the operations were recorded would leave a journal the refusal
     // claims is unchanged. An out-of-interval trade withholds every
@@ -326,9 +336,14 @@ pub async fn sync_broker(
     let mut diagnostic_instruments =
         audit_outbound_transfers(&bounded_events, account, broker_context.deadline)?;
     let mut missing_fund_units = std::collections::BTreeSet::new();
-    let mut known = known_records(&bounded_events);
-    let mut recorded = Vec::new();
-    let mut duplicates = 0;
+    let mut recorded: Vec<_> = parsed
+        .duplicates
+        .iter()
+        .map(|existing| Verdict::Duplicate {
+            existing: *existing,
+        })
+        .collect();
+    let mut duplicates = parsed.duplicates.len();
     let mut possible_duplicates = 0;
     // Every refused row is named. A row the source identified is keyed by that
     // identifier; one it did not is keyed by a fingerprint of its raw payload,
@@ -409,7 +424,6 @@ pub async fn sync_broker(
             broker_api_source: Some(channel.source),
             identity_scope: broker.identity_scope(),
         };
-        let key = dedup::choose_key(&operation, &context);
         let normalized = match normalize(
             &operation,
             &NormalizationContext {
@@ -474,8 +488,7 @@ pub async fn sync_broker(
             recorded.push(Verdict::Rejected { rejection });
             continue;
         }
-        let (decision, rule) =
-            dedup::assess_with_rule(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        let (decision, rule) = dedup::assess_operation(&operation, &context, &known);
         trace_dedup_decision(
             row_index,
             channel.source,

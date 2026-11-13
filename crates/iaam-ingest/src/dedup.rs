@@ -220,6 +220,58 @@ pub fn assess(
     assess_with_rule(key, fingerprint, context, known).0
 }
 
+/// Assess an available key without requiring monetary normalization.
+#[must_use]
+pub fn assess_key(
+    key: &DedupKey,
+    context: &DocumentContext,
+    known: &[KnownRecord],
+) -> Option<EventId> {
+    known
+        .iter()
+        .find(|record| matches_key(record, key, context))
+        .map(|existing| existing.event)
+}
+
+/// Broker storage accepts either stable identity, in this order. A legacy
+/// source-operation ID does not hide an otherwise identical idempotency key.
+#[must_use]
+pub fn assess_identity(
+    source_operation_id: Option<&str>,
+    idempotency_key: Option<&str>,
+    context: &DocumentContext,
+    known: &[KnownRecord],
+) -> Option<(DedupKey, EventId)> {
+    let keys = source_operation_id
+        .map(|id| DedupKey::SourceOperationId(id.to_owned()))
+        .into_iter()
+        .chain(idempotency_key.map(|key| DedupKey::IdempotencyKey(key.to_owned())));
+    keys.filter_map(|key| assess_key(&key, context, known).map(|event| (key, event)))
+        .next()
+}
+
+/// Assess a mapped broker row using the same stable-key fallback as storage.
+#[must_use]
+pub fn assess_operation(
+    operation: &SubmittedOperation,
+    context: &DocumentContext,
+    known: &[KnownRecord],
+) -> (DedupDecision, DedupRule) {
+    if let Some((key, existing)) = assess_identity(
+        operation.source_operation_id.as_deref(),
+        operation.idempotency_key.as_deref(),
+        context,
+        known,
+    ) {
+        return (
+            DedupDecision::Duplicate { key, existing },
+            DedupRule::KeyMatch,
+        );
+    }
+    let key = choose_key(operation, context);
+    assess_with_rule(key.as_ref(), &fingerprint(operation), context, known)
+}
+
 /// Evidence for the assessment, including why an equal fingerprint was fresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupRule {
@@ -250,14 +302,12 @@ pub fn assess_with_rule(
     known: &[KnownRecord],
 ) -> (DedupDecision, DedupRule) {
     if let Some(key) = key
-        && let Some(existing) = known
-            .iter()
-            .find(|record| matches_key(record, key, context))
+        && let Some(existing) = assess_key(key, context, known)
     {
         return (
             DedupDecision::Duplicate {
                 key: key.clone(),
-                existing: existing.event,
+                existing,
             },
             DedupRule::KeyMatch,
         );

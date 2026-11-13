@@ -2221,6 +2221,10 @@ pub struct PendingFullRedemption {
 /// reach the caller together with the reason and original JSON.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedOperations {
+    /// Exact recorded matches omitted before broker enrichment.
+    pub duplicates: Vec<iaam_core::ids::EventId>,
+    /// A discarded duplicate trade falls outside the requested interval.
+    pub has_out_of_interval_trade: bool,
     pub accepted: Vec<SubmittedOperation>,
     pub journal: Vec<iaam_ingest::SubmittedJournalEvent>,
     pub pending_redemptions: Vec<PendingFullRedemption>,
@@ -2276,6 +2280,8 @@ pub(crate) const BROKER_DIAGNOSTIC_RESERVE: std::time::Duration = std::time::Dur
 pub struct BrokerRequestContext<'a> {
     pub deadline: Option<std::time::Instant>,
     pub allowance: &'a RequestAllowance,
+    /// Recorded facts available to skip redundant broker enrichment.
+    pub known: &'a [iaam_ingest::dedup::KnownRecord],
 }
 
 /// Broker channel: a second way to obtain the same data.

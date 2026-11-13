@@ -2767,6 +2767,7 @@ mod tests {
         crate::ports::BrokerRequestContext {
             deadline,
             allowance: &ALLOWANCE,
+            known: &[],
         }
     }
 

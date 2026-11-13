@@ -520,6 +520,17 @@ impl OutboundTally {
         }
     }
 
+    pub(crate) fn report_allowed(&self, host: &str, clock: &dyn Clock) -> Result<bool, TallyError> {
+        self.transact(|state| {
+            let boot = read_boot(clock)?;
+            let now = boot.elapsed().as_nanos();
+            let mut changed = state.prepare_boot(&boot)?;
+            changed |= state.prune(now);
+            let host_state = state.host_for_boot(host, now);
+            Ok((Self::active_refusal(host_state, now).is_none(), changed))
+        })
+    }
+
     pub(crate) fn diagnostic_allowed(
         &self,
         host: &str,
@@ -670,6 +681,7 @@ impl OutboundTally {
         self.record_response_for_request(host, "", status, retry_after, clock)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_response_for_request(
         &self,
         host: &str,
@@ -678,18 +690,18 @@ impl OutboundTally {
         retry_after: Option<Duration>,
         clock: &dyn Clock,
     ) -> Result<TallyResponseDecision, TallyError> {
-        self.record_response_with_pending(host, path, (status, false), retry_after, clock)
+        self.record_response_with_pending(host, path, (status, false, false), retry_after, clock)
     }
 
     pub(crate) fn record_response_with_pending(
         &self,
         host: &str,
         path: &str,
-        response: (u16, bool),
+        response: (u16, bool, bool),
         retry_after: Option<Duration>,
         clock: &dyn Clock,
     ) -> Result<TallyResponseDecision, TallyError> {
-        let (status, report_pending) = response;
+        let (status, report_pending, method_limited) = response;
         let lookup_miss = is_instrument_lookup_miss(host, path, status) || report_pending;
         self.transact(|state| {
             let boot = read_boot(clock)?;
@@ -709,10 +721,11 @@ impl OutboundTally {
             let host_state = state.host_for_boot(host, now_nanos);
             host_state.pending_since = None;
             host_state.pending_budget_key = None;
-            let named_pause = (!is_instrument_lookup_miss(host, path, status)
-                && !(200..300).contains(&status))
-            .then(|| retry_after.map(|delay| delay.as_nanos().min(DAY_NANOS)))
-            .flatten();
+            // A reset header also accompanies ordinary application errors.
+            // Only an unscoped 429 is evidence of a host-wide rate pause.
+            let named_pause = (status == 429 && !method_limited)
+                .then(|| retry_after.map(|delay| delay.as_nanos().min(DAY_NANOS)))
+                .flatten();
             if let Some(pause) = named_pause {
                 let paused_until = now_nanos.saturating_add(pause);
                 if host_state
@@ -724,7 +737,7 @@ impl OutboundTally {
                 }
             }
             match status {
-                429 => {
+                429 if !method_limited => {
                     host_state.rate_limits.push(now_nanos);
                     let pause = named_pause
                         .unwrap_or(RATE_LIMIT_PAUSE_NANOS)
@@ -748,7 +761,7 @@ impl OutboundTally {
                         host_state.closed_reason = Some(ClosureReason::RateLimits);
                     }
                 }
-                400..=499 if !lookup_miss => {
+                400..=499 if !lookup_miss && !method_limited => {
                     host_state.refusals.push(now_nanos);
                     if host_state.refusals.len() >= 3 {
                         let closed_until = now_nanos.saturating_add(CLOSURE_NANOS);
@@ -1805,55 +1818,21 @@ mod tests {
     }
 
     #[test]
-    fn a_shorter_overlapping_retry_after_never_shortens_the_longer_pause() {
-        let (_temporary, _directory, tally) = tally("overlapping-pause");
-        let host = "https://broker.invalid";
-        let sent = ready_send(&tally, host, Duration::from_secs(10_000));
-        assert!(matches!(
-            tally.record_response(
-                host,
-                503,
-                Some(Duration::from_secs(120)),
-                &sent
-            ),
-            Ok(TallyResponseDecision::Paused { retry_after })
-                if retry_after == Duration::from_secs(120)
-        ));
-
-        let later = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(10));
-        tally
-            .transact(|state| {
-                let now = later.elapsed().as_nanos();
-                state
-                    .sends
-                    .entry((host.to_owned(), "method".to_owned()))
-                    .or_default()
-                    .push(now);
-                let host_state = state
-                    .hosts
-                    .get_mut(host)
-                    .expect("the first response created host state");
-                host_state.daily_sends.push(now);
-                host_state.pending_since = Some(now);
-                host_state.pending_budget_key = Some("method".to_owned());
-                Ok(((), true))
-            })
-            .expect("an overlapping admitted request is persisted");
-        assert!(matches!(
-            tally.record_response(
-                host,
-                503,
-                Some(Duration::from_secs(30)),
-                &later
-            ),
-            Ok(TallyResponseDecision::Paused { retry_after })
-                if retry_after == Duration::from_secs(110)
-        ));
-        assert!(matches!(
-            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &later),
-            Ok(TallyDecision::Paused { retry_after })
-                if retry_after == Duration::from_secs(110)
-        ));
+    fn non_429_retry_after_does_not_pause_the_host() {
+        for status in [400, 404, 500, 503] {
+            let (_temporary, _directory, tally) = tally("non-429-named-delay");
+            let host = "https://broker.invalid";
+            let sent = ready_send(&tally, host, Duration::from_secs(10_000));
+            assert!(matches!(
+                tally.record_response(host, status, Some(Duration::from_secs(120)), &sent),
+                Ok(TallyResponseDecision::Recorded)
+            ));
+            let later = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(1));
+            assert!(matches!(
+                tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &later),
+                Ok(TallyDecision::Send)
+            ));
+        }
     }
 
     #[test]

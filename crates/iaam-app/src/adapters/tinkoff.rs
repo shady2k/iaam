@@ -95,6 +95,7 @@ pub struct TinkoffChannel {
     instruments: Arc<dyn InstrumentDirectory>,
     descriptions: tokio::sync::Mutex<HashMap<String, CachedDescription>>,
     diagnostic_operations: tokio::sync::Mutex<Vec<diagnostics::ReceivedOperation>>,
+    question_reports_enabled: bool,
 }
 
 impl TinkoffChannel {
@@ -114,6 +115,8 @@ impl TinkoffChannel {
             instruments,
             descriptions: tokio::sync::Mutex::new(HashMap::new()),
             diagnostic_operations: tokio::sync::Mutex::new(Vec::new()),
+            question_reports_enabled: std::env::var("IAAM_TINVEST_QUESTION_REPORTS")
+                .is_ok_and(|value| value == "1"),
         }
     }
     // FindInstrument results are diagnostic only; typed lookups resolve identity.
@@ -528,6 +531,128 @@ fn trace_instrument_miss(
     );
 }
 
+struct TradeFillIdentity {
+    source_operation_id: String,
+    idempotency_key: String,
+}
+
+// The prospective identity does not require payment to be posted. Keep this
+// shared with trade emission so report admission cannot invent another key.
+fn trade_fill_identity(account: &str, operation_id: &str, trade_id: &str) -> TradeFillIdentity {
+    TradeFillIdentity {
+        source_operation_id: fill_source_id(operation_id, trade_id),
+        idempotency_key: composite_identity(account, operation_id, trade_id),
+    }
+}
+
+fn fill_source_id(operation_id: &str, trade_id: &str) -> String {
+    format!(
+        "{}#{}",
+        escape_component(operation_id),
+        escape_component(trade_id)
+    )
+}
+
+// Remove only the unposted field, rather than substituting made-up cash.
+// Parsing again exposes defects hidden by the parser's first-error policy.
+fn subminor_nonpayment_is_valid(operation: &ChannelOperation) -> bool {
+    let mut raw = operation.raw.clone();
+    if let Some(object) = raw.as_object_mut() {
+        object.remove("payment");
+    }
+    let body = serde_json::json!({ "hasNext": false, "items": [raw] });
+    let reparsed = parse_operations(&body.to_string());
+    reparsed.is_ok_and(|page| page.operations.len() == 1 && page.operations[0].rejection.is_none())
+}
+
+enum ReportAdmission {
+    Recorded(Vec<iaam_core::ids::EventId>),
+    Fresh,
+    Unmapped,
+}
+
+/// Use the actual mapper before enriching a row. Unposted payment is the one
+/// exception: its prospective fill identities come from the emission helper.
+fn report_admission(
+    operation: &ChannelOperation,
+    account: AccountId,
+    source: SourceId,
+    known: &[iaam_ingest::dedup::KnownRecord],
+    dictionary: &OperationKindDictionary,
+    currency_rows: &HashMap<String, iaam_broker::tinkoff::parse::CurrencyDescription>,
+) -> Result<ReportAdmission, BrokerError> {
+    use iaam_ingest::dedup::{self, DedupDecision, DocumentContext};
+    let kind = dictionary.kind_of(&operation.source_kind);
+    if !matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell)
+        || operation.trades.is_empty()
+        || currency_rows.contains_key(&operation.deduplication_key)
+    {
+        return Ok(ReportAdmission::Unmapped);
+    }
+    let context = DocumentContext {
+        account,
+        broker_api_source: Some(source),
+        document: None,
+        sheet: None,
+        row: None,
+        identity_scope: IdentityScope::Account,
+    };
+    let existing = if iaam_broker::tinkoff::needs_report_payment(operation) {
+        if order_state_reason(&kind, &operation.state).is_some()
+            || operation.operation_id.is_empty()
+            || required_instrument(operation).is_err()
+            || operation.figi.as_deref().is_none_or(str::is_empty)
+            || !subminor_nonpayment_is_valid(operation)
+            || trade_nonpayment_reason(operation).is_some()
+            || operation
+                .trades
+                .iter()
+                .any(|trade| trade.num.is_empty() || operation.date != Some(trade.at.date()))
+        {
+            return Ok(ReportAdmission::Unmapped);
+        }
+        operation
+            .trades
+            .iter()
+            .map(|trade| {
+                let identity = trade_fill_identity(
+                    &operation.broker_account_id,
+                    &operation.operation_id,
+                    &trade.num,
+                );
+                dedup::assess_identity(
+                    Some(&identity.source_operation_id),
+                    Some(&identity.idempotency_key),
+                    &context,
+                    known,
+                )
+                .map(|(_, existing)| existing)
+            })
+            .collect::<Option<Vec<_>>>()
+    } else {
+        let (preview, _) = adapt_operations_with_currencies(
+            account,
+            vec![operation.clone()],
+            dictionary,
+            currency_rows,
+        )?;
+        if preview.accepted.is_empty() || !preview.quarantined.is_empty() {
+            return Ok(ReportAdmission::Unmapped);
+        }
+        preview
+            .accepted
+            .iter()
+            .map(
+                |mapped| match dedup::assess_operation(mapped, &context, known).0 {
+                    DedupDecision::Duplicate { existing, .. } => Some(existing),
+                    _ => None,
+                },
+            )
+            .collect::<Option<Vec<_>>>()
+    };
+    Ok(existing.map_or(ReportAdmission::Fresh, ReportAdmission::Recorded))
+}
+
 fn received_by_type(operations: &[ChannelOperation]) -> std::collections::BTreeMap<&str, usize> {
     let mut counts = std::collections::BTreeMap::new();
     for operation in operations {
@@ -580,6 +705,7 @@ impl BrokerChannel for TinkoffChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            known: _,
         } = context;
         // The accounts listing has no deadline parameter on the client — its
         // frozen signature predates the sync's deadline — so the bound is
@@ -599,6 +725,7 @@ impl BrokerChannel for TinkoffChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            known: _,
         } = context;
         // The broker is asked for its own account number; the returned rows
         // are stamped with the owner's account in this system.
@@ -606,7 +733,7 @@ impl BrokerChannel for TinkoffChannel {
         request.from = Some(rfc3339_midnight(from));
         request.to = Some(rfc3339_operation_end(to));
         request.limit = Some(OPERATIONS_PAGE_LIMIT);
-        let mut operations = fetch_operation_pages(request, |request| async move {
+        let operations = fetch_operation_pages(request, |request| async move {
             self.client
                 .get_operations_by_cursor(&request, deadline, allowance)
                 .await
@@ -618,12 +745,12 @@ impl BrokerChannel for TinkoffChannel {
             "received T-Invest operation types"
         );
         questions_timestamps::trace_timestamps(&operations, from, to);
-        let mut diagnostic_operations = diagnostics::capture(&operations);
-        let settlement_rows = self
-            .resolve_report_payments(&mut operations, broker_account, from, to, context)
-            .await?;
-        let question_operations = operations.clone();
+        questions_commission::trace_commission(&operations, &[]);
+        questions_zone::trace_trading_zone(&operations, &[]);
         let received = operations.len();
+        let mut duplicates = Vec::new();
+        let mut has_out_of_interval_trade = false;
+        let mut diagnostic_operations = diagnostics::capture(&operations);
         tracing::info!(
             phase = "resolve_instruments",
             status = "start",
@@ -704,7 +831,8 @@ impl BrokerChannel for TinkoffChannel {
                     }
                 }
             } else if has_identity
-                && operation.rejection.is_none()
+                && (operation.rejection.is_none()
+                    || iaam_broker::tinkoff::needs_report_payment(&operation))
                 && !(is_currency && matches!(kind, ChannelOperationKind::Commission))
             {
                 match self
@@ -756,6 +884,80 @@ impl BrokerChannel for TinkoffChannel {
             "broker sync phase complete"
         );
         *self.diagnostic_operations.lock().await = diagnostic_operations;
+        let mut fresh_operations = Vec::new();
+        let mut recorded_facts = 0;
+        let mut retained = Vec::new();
+        for operation in checked {
+            match report_admission(
+                &operation,
+                account,
+                self.source,
+                context.known,
+                &self.dictionary,
+                &currency_rows,
+            )? {
+                ReportAdmission::Recorded(existing) => {
+                    recorded_facts += existing.len();
+                    if iaam_broker::tinkoff::needs_report_payment(&operation) {
+                        for (row_index, trade) in operation.trades.iter().enumerate() {
+                            tracing::debug!(
+                                phase = "map", row_index,
+                                source = %self.source.inner(),
+                                source_operation_id = fill_source_id(&operation.operation_id, &trade.num),
+                                rule = "key_match", verdict = "duplicate",
+                                "broker sync dedup assessment"
+                            );
+                        }
+                        duplicates.extend(existing);
+                        has_out_of_interval_trade |= operation.trades.iter().any(|trade| {
+                            let date = trade.at.to_offset(time::UtcOffset::UTC).date();
+                            date < from || date > to
+                        });
+                        continue;
+                    }
+                }
+                ReportAdmission::Fresh => {
+                    if iaam_broker::tinkoff::needs_report_payment(&operation)
+                        || operation.commission.is_some()
+                        || (self.question_reports_enabled
+                            && (!questions_commission::affected_dates(std::slice::from_ref(
+                                &operation,
+                            ))
+                            .is_empty()
+                                || !questions_zone::affected_dates(std::slice::from_ref(
+                                    &operation,
+                                ))
+                                .is_empty()))
+                    {
+                        fresh_operations.push(operation.clone());
+                    }
+                }
+                ReportAdmission::Unmapped => {}
+            }
+            retained.push(operation);
+        }
+        tracing::debug!(
+            received,
+            fresh_mapped_trades = fresh_operations.len(),
+            recorded_facts,
+            question_reports_enabled = self.question_reports_enabled,
+            "T-Invest report enrichment admission"
+        );
+        let settlement_rows = self
+            .resolve_report_payments(&mut fresh_operations, broker_account, from, to, context)
+            .await?;
+        // Payment resolution reparses source JSON. Copy the resolved rows back
+        // without losing the instrument identities already resolved above.
+        for operation in &mut retained {
+            if let Some(resolved) = fresh_operations
+                .iter()
+                .find(|fresh| fresh.deduplication_key == operation.deduplication_key)
+            {
+                *operation = resolved.clone();
+            }
+        }
+        let question_operations = fresh_operations;
+        let mut checked = retained;
         let report_rows = self
             .read_question_reports(
                 &question_operations,
@@ -766,6 +968,12 @@ impl BrokerChannel for TinkoffChannel {
             )
             .await;
         for operation in &mut checked {
+            if !question_operations
+                .iter()
+                .any(|fresh| fresh.deduplication_key == operation.deduplication_key)
+            {
+                continue;
+            }
             match iaam_broker::tinkoff::resolve_report_commissions(operation, &report_rows) {
                 Ok(resolved) => *operation = resolved,
                 Err(error) => operation.rejection = Some(error),
@@ -773,6 +981,8 @@ impl BrokerChannel for TinkoffChannel {
         }
         let (mut parsed, accounting) =
             adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
+        parsed.duplicates = duplicates;
+        parsed.has_out_of_interval_trade = has_out_of_interval_trade;
         for pending in &mut parsed.pending_redemptions {
             pending.blocked_tca_flag = pending
                 .withdrawal_operation_id
@@ -802,8 +1012,10 @@ impl BrokerChannel for TinkoffChannel {
                 parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
             "T-Invest operations accounted"
         );
-        questions_commission::trace_commission(&question_operations, &report_rows);
-        questions_zone::trace_trading_zone(&question_operations, &report_rows);
+        if self.question_reports_enabled {
+            questions_commission::trace_commission(&question_operations, &report_rows);
+            questions_zone::trace_trading_zone(&question_operations, &report_rows);
+        }
         Ok(parsed)
     }
 
@@ -817,6 +1029,7 @@ impl BrokerChannel for TinkoffChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            known: _,
         } = context;
         let _ = account;
         let (body, observed_at) = self
@@ -1526,6 +1739,8 @@ fn adapt_operations_with_currencies(
         - accounting.quarantined_trade;
     Ok((
         ParsedOperations {
+            duplicates: Vec::new(),
+            has_out_of_interval_trade: false,
             accepted,
             journal,
             pending_redemptions,
@@ -1996,7 +2211,7 @@ fn operation_to_submitted(
     })
 }
 
-fn trade_row_reason(operation: &ChannelOperation, kind: &ChannelOperationKind) -> Option<String> {
+fn trade_nonpayment_reason(operation: &ChannelOperation) -> Option<String> {
     if !operation.trades.is_empty() && operation.position_uid.is_none() {
         return Some("trading operation does not contain positionUid".to_owned());
     }
@@ -2041,15 +2256,6 @@ fn trade_row_reason(operation: &ChannelOperation, kind: &ChannelOperationKind) -
     {
         return Some("trades report more than one currency".to_owned());
     }
-    let Some(payment) = operation.payment else {
-        return Some("trading order does not report payment".to_owned());
-    };
-    if payment.currency != currency {
-        return Some(format!(
-            "payment currency {:?} does not match trade currency {:?}",
-            payment.currency, currency
-        ));
-    }
     if let Some(commission) = operation.commission {
         if commission.currency() != currency {
             return Some(format!(
@@ -2090,6 +2296,26 @@ fn trade_row_reason(operation: &ChannelOperation, kind: &ChannelOperationKind) -
             ));
         }
     }
+    None
+}
+
+fn trade_row_reason(operation: &ChannelOperation, kind: &ChannelOperationKind) -> Option<String> {
+    if let Some(reason) = trade_nonpayment_reason(operation) {
+        return Some(reason);
+    }
+    let currency = operation.trades.first()?.price.currency();
+    let Some(payment) = operation.payment else {
+        return Some("trading order does not report payment".to_owned());
+    };
+    if payment.currency != currency {
+        return Some(format!(
+            "payment currency {:?} does not match trade currency {:?}",
+            payment.currency, currency
+        ));
+    }
+    let accrued = operation
+        .accrued_interest
+        .map_or(0, |value| value.amount.raw());
     match kind {
         ChannelOperationKind::Buy if payment.amount.raw() >= 0 => {
             return Some(format!(
@@ -2167,6 +2393,11 @@ fn trade_operations(
         .zip(accrued_allocations)
         .zip(gross_allocation.amounts)
         .map(|(((trade, commission), accrued), gross)| {
+            let identity = trade_fill_identity(
+                &operation.broker_account_id,
+                &operation.operation_id,
+                &trade.num,
+            );
             let gross_minor = gross.raw();
             let basis_fee = calc_money_from_minor(commission, currency);
             let accrued_interest_minor = accrued_known.then_some(accrued);
@@ -2206,16 +2437,8 @@ fn trade_operations(
                     ..OperationDates::default()
                 },
                 source_time: Some(at.time()),
-                idempotency_key: Some(composite_identity(
-                    &operation.broker_account_id,
-                    &operation.operation_id,
-                    &trade.num,
-                )),
-                source_operation_id: Some(format!(
-                    "{}#{}",
-                    escape_component(&operation.operation_id),
-                    escape_component(&trade.num)
-                )),
+                idempotency_key: Some(identity.idempotency_key),
+                source_operation_id: Some(identity.source_operation_id),
                 // Verbatim: `trade_row_reason` has already refused every
                 // trade whose order carries no `positionUid`, so this is
                 // always present here.
@@ -2964,6 +3187,7 @@ mod tests {
         crate::ports::BrokerRequestContext {
             deadline,
             allowance: &ALLOWANCE,
+            known: &[],
         }
     }
 
@@ -3392,7 +3616,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn report_generation_polls_pending_then_reads_every_page() {
         let report_row = serde_json::json!({"tradeId":"trade-1", "figi":"FIGI1", "quantity":"92",
             "tradeDatetime":"2026-08-20T10:00:00Z", "clearValueDate":"2026-08-21T00:00:00Z",
@@ -3600,6 +3824,239 @@ mod tests {
         }
     }
 
+    #[test]
+    fn report_admission_previews_the_emitted_row_and_does_not_admit_refusals() {
+        use iaam_core::event::provenance::RawHash;
+        use iaam_ingest::dedup::KnownRecord;
+        let account = AccountId::new_random();
+        let source = SourceId::new_random();
+        let mut operation = report_operation();
+        operation.rejection = None;
+        operation.payment = Some(iaam_broker::tinkoff::ChannelMoney {
+            amount: iaam_core::money::PostedMinor::new(-17_393),
+            currency: iaam_core::money::CurrencyCode::Rub,
+        });
+        operation.quantity_done = operation.trades[0].quantity;
+        operation.position_uid = Some("position".to_owned());
+        operation.instrument_uid = Some(InstrumentId::new_random().inner().to_string());
+        let mapped =
+            trade_operations(account, operation.clone(), super::ChannelOperationKind::Buy).unwrap();
+        let record = KnownRecord {
+            event: EventId::new_random(),
+            source,
+            account,
+            source_operation_id: Some("legacy source key".to_owned()),
+            idempotency_key: mapped[0].idempotency_key.clone(),
+            fingerprint: RawHash::parse(&"a".repeat(64)).unwrap(),
+            document: None,
+            sheet: None,
+            row: None,
+        };
+        let dictionary = dictionary();
+        let currencies = std::collections::HashMap::new();
+        assert!(matches!(
+            super::report_admission(
+                &operation,
+                account,
+                source,
+                &[record],
+                &dictionary,
+                &currencies,
+            )
+            .unwrap(),
+            super::ReportAdmission::Recorded(_)
+        ));
+        assert!(matches!(
+            super::report_admission(&operation, account, source, &[], &dictionary, &currencies,)
+                .unwrap(),
+            super::ReportAdmission::Fresh
+        ));
+        operation.position_uid = None;
+        assert!(matches!(
+            super::report_admission(&operation, account, source, &[], &dictionary, &currencies,)
+                .unwrap(),
+            super::ReportAdmission::Unmapped
+        ));
+    }
+
+    #[test]
+    fn report_admission_rejects_subminor_rows_without_report_identity_or_with_hidden_errors() {
+        let mut operation = report_operation();
+        operation.quantity_done = operation.trades[0].quantity;
+        operation.position_uid = Some("position".to_owned());
+        operation.instrument_uid = Some(InstrumentId::new_random().inner().to_string());
+        let dictionary = dictionary();
+        let currencies = std::collections::HashMap::new();
+        let account = AccountId::new_random();
+        let source = SourceId::new_random();
+        let admission = |operation: &iaam_broker::tinkoff::ChannelOperation| {
+            super::report_admission(operation, account, source, &[], &dictionary, &currencies)
+                .unwrap()
+        };
+        assert!(matches!(
+            admission(&operation),
+            super::ReportAdmission::Fresh
+        ));
+        let mut missing_figi = operation.clone();
+        missing_figi.figi = None;
+        assert!(matches!(
+            admission(&missing_figi),
+            super::ReportAdmission::Unmapped
+        ));
+        operation.raw["commission"] = serde_json::json!({
+            "currency": "rub", "units": "not a number", "nano": 0
+        });
+        // Payment remains the first reported parse defect. Admission must
+        // expose the commission defect before planning any report request.
+        assert!(iaam_broker::tinkoff::needs_report_payment(&operation));
+        assert!(matches!(
+            admission(&operation),
+            super::ReportAdmission::Unmapped
+        ));
+    }
+
+    #[test]
+    fn report_admission_uses_every_fill_key_and_keeps_partial_orders_fresh() {
+        use iaam_core::{event::provenance::RawHash, ids::EventId};
+        use iaam_ingest::dedup::KnownRecord;
+        let account = AccountId::new_random();
+        let source = SourceId::new_random();
+        let mut operation = report_operation();
+        operation.operation_id = "order/#%".to_owned();
+        operation.position_uid = Some("position".to_owned());
+        operation.instrument_uid = Some(InstrumentId::new_random().inner().to_string());
+        operation.trades[0].num = "fill/#%".to_owned();
+        let mut second = operation.trades[0].clone();
+        second.num = "second".to_owned();
+        operation.trades.push(second);
+        operation.quantity_done = iaam_core::money::sum_quantities(
+            &operation
+                .trades
+                .iter()
+                .map(|trade| trade.quantity)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let dictionary = dictionary();
+        let currency_rows = std::collections::HashMap::new();
+        let mut records: Vec<_> = operation
+            .trades
+            .iter()
+            .map(|trade| {
+                let identity = super::trade_fill_identity(
+                    &operation.broker_account_id,
+                    &operation.operation_id,
+                    &trade.num,
+                );
+                KnownRecord {
+                    event: EventId::new_random(),
+                    source,
+                    account,
+                    source_operation_id: Some(identity.source_operation_id),
+                    idempotency_key: Some(identity.idempotency_key),
+                    fingerprint: RawHash::parse(&"a".repeat(64)).unwrap(),
+                    document: None,
+                    sheet: None,
+                    row: None,
+                }
+            })
+            .collect();
+        let admission = |operation: &iaam_broker::tinkoff::ChannelOperation,
+                         account,
+                         records: &[KnownRecord]| {
+            super::report_admission(
+                operation,
+                account,
+                source,
+                records,
+                &dictionary,
+                &currency_rows,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            admission(&operation, account, &records[..1]),
+            super::ReportAdmission::Fresh
+        ));
+        let super::ReportAdmission::Recorded(existing) = admission(&operation, account, &records)
+        else {
+            panic!("every fill is recorded");
+        };
+        assert_eq!(
+            existing,
+            records
+                .iter()
+                .map(|record| record.event)
+                .collect::<Vec<_>>()
+        );
+        // Storage also recognizes an older source key through idempotency.
+        for record in &mut records {
+            record.source_operation_id = Some("legacy source key".to_owned());
+        }
+        assert!(matches!(
+            admission(&operation, account, &records),
+            super::ReportAdmission::Recorded(_)
+        ));
+        assert!(matches!(
+            admission(&operation, AccountId::new_random(), &records),
+            super::ReportAdmission::Recorded(_)
+        ));
+        operation.trades.clear();
+        assert!(matches!(
+            admission(&operation, account, &records),
+            super::ReportAdmission::Unmapped
+        ));
+    }
+
+    #[tokio::test]
+    async fn question_report_windows_require_explicit_opt_in() {
+        let mut operation = report_operation();
+        operation.rejection = None;
+        operation.commission = None;
+        operation.trades[0].at = time::macros::datetime!(2026-08-20 22:00 UTC);
+        operation.raw["tradesInfo"]["trades"][0]["date"] =
+            serde_json::json!("2026-08-20T22:00:00Z");
+        for enabled in [false, true] {
+            let mut answers = if enabled {
+                vec![
+                    Answer::status(
+                        200,
+                        r#"{"generateBrokerReportResponse":{"taskId":"question"}}"#,
+                    ),
+                    Answer::status(
+                        200,
+                        r#"{"getBrokerReportResponse":{"brokerReport":[],"itemsCount":0,"pagesCount":0,"page":0}}"#,
+                    ),
+                ]
+            } else {
+                vec![]
+            };
+            answers.insert(0, Answer::status(200, "{}"));
+            let (gateway, requests, _) = fake::gateway(answers, None);
+            let mut channel = channel(gateway);
+            channel.question_reports_enabled = enabled;
+            channel
+                .client
+                .get_accounts(broker_context(None).allowance)
+                .await
+                .unwrap();
+            requests.lock().unwrap().clear();
+            channel
+                .read_question_reports(
+                    &[operation.clone()],
+                    "invented",
+                    (
+                        time::macros::date!(2026 - 08 - 01),
+                        time::macros::date!(2026 - 08 - 31),
+                    ),
+                    broker_context(None),
+                    &[],
+                )
+                .await;
+            assert_eq!(requests.lock().unwrap().len(), if enabled { 2 } else { 0 });
+        }
+    }
+
     #[tokio::test]
     async fn commissions_reuse_settlement_rows_without_another_report() {
         let operation = report_operation();
@@ -3750,6 +4207,7 @@ mod tests {
                     BrokerRequestContext {
                         deadline: expired.then(|| tokio::time::Instant::now().into_std()),
                         allowance: &allowance,
+                        known: &[],
                     },
                 )
                 .await;
@@ -4068,6 +4526,7 @@ mod tests {
         let context = crate::ports::BrokerRequestContext {
             deadline: None,
             allowance: &allowance,
+            known: &[],
         };
         let result = channel
             .resolve_instrument(
@@ -6366,6 +6825,7 @@ mod tests {
                 BrokerRequestContext {
                     deadline: None,
                     allowance: &allowance,
+                    known: &[],
                 },
             )
             .await
@@ -6384,11 +6844,9 @@ mod tests {
         assert!(message.contains("narrow"), "{message}");
     }
 
-    /// T-Invest limits a caller with 429 and names a reset shorter than the
-    /// mandatory pause. Once the first-send safety wait has elapsed, the fetch
-    /// stops on the response and exposes the full minute before another call.
+    /// A native method reset does not impose the host-wide minimum pause.
     #[tokio::test]
-    async fn a_multi_page_fetch_stops_at_a_limit_and_exposes_the_host_pause() {
+    async fn a_multi_page_fetch_stops_at_a_limit_and_exposes_the_method_reset() {
         let (gateway, log, time) = fake::gateway(
             vec![
                 Answer {
@@ -6404,7 +6862,7 @@ mod tests {
 
         let error = fetch(&channel(gateway))
             .await
-            .expect_err("the broker host is paused");
+            .expect_err("the broker method is paused");
 
         assert!(
             matches!(
@@ -6413,8 +6871,8 @@ mod tests {
                     detail,
                     retry_after: Some(retry_after),
                     ..
-                } if detail.contains("paused after status 429")
-                    && *retry_after == Duration::from_secs(60)
+                } if detail.contains("last status Some(429)")
+                    && *retry_after == Duration::from_secs(7)
             ),
             "{error:?}"
         );
@@ -6489,7 +6947,7 @@ mod tests {
     }
 
     /// A 429 stops a multi-page fetch without waiting in the request and says
-    /// how many pages had arrived before the persisted host pause.
+    /// how many pages had arrived before the native method pause.
     #[tokio::test]
     async fn a_fetch_limited_after_two_pages_is_unreachable_and_names_the_pages_fetched() {
         let (gateway, log, time) = fake::gateway(
@@ -6540,7 +6998,7 @@ mod tests {
                     detail,
                     retry_after: Some(retry_after),
                     ..
-                } if detail.contains("reopens at")
+                } if detail.contains("last status Some(429)")
                     && detail.ends_with("operation pages fetched before it: 2")
                     && *retry_after == Duration::from_secs(60)
             ),

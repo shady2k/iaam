@@ -2054,25 +2054,6 @@ impl BrokerChannelFactory for SqliteAdapter {
         owner: OwnerId,
         broker: &str,
     ) -> Result<Arc<dyn BrokerChannel>, AppError> {
-        self.open_channel(owner, broker, true).await
-    }
-
-    async fn open_for_account_listing(
-        self: Arc<Self>,
-        owner: OwnerId,
-        broker: &str,
-    ) -> Result<Arc<dyn BrokerChannel>, AppError> {
-        self.open_channel(owner, broker, false).await
-    }
-}
-
-impl SqliteAdapter {
-    async fn open_channel(
-        self: Arc<Self>,
-        owner: OwnerId,
-        broker: &str,
-        refresh_dictionary: bool,
-    ) -> Result<Arc<dyn BrokerChannel>, AppError> {
         let code = BrokerCode::parse(broker).ok_or_else(|| AppError::Invalid {
             field: "broker".to_owned(),
             expected: "a supported broker code".to_owned(),
@@ -2154,9 +2135,7 @@ impl SqliteAdapter {
         let code = code.clone();
         let rows = self
             .blocking(move |store| {
-                if refresh_dictionary {
-                    refresh_broker_operation_dictionary(store, &code).map_err(store_error)?;
-                }
+                refresh_broker_operation_dictionary(store, &code).map_err(store_error)?;
                 store.broker_operation_kinds(&code).map_err(store_error)
             })
             .await?;

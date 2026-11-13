@@ -199,7 +199,6 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         OperationKey::SubmitOperations
         | OperationKey::OpenImportSession
         | OperationKey::SyncBroker
-        | OperationKey::ListBrokerAccounts
         | OperationKey::ReadImportDocument
         | OperationKey::AddImportRows
         | OperationKey::AnswerImportQuestion
@@ -2393,15 +2392,6 @@ pub trait BrokerChannel: Send + Sync {
 /// of the same value is the only way to share it.
 #[async_trait]
 pub trait BrokerChannelFactory: Send + Sync {
-    /// Open without refreshing stored operation dictionaries for account discovery.
-    async fn open_for_account_listing(
-        self: Arc<Self>,
-        owner: OwnerId,
-        broker: &str,
-    ) -> Result<Arc<dyn BrokerChannel>, AppError> {
-        self.open(owner, broker).await
-    }
-
     async fn open(
         self: Arc<Self>,
         owner: OwnerId,

@@ -8264,7 +8264,9 @@ pub async fn list_broker_accounts(
     Extension(principal): Extension<Principal>,
     ApiPath(broker): ApiPath<String>,
 ) -> Result<Json<BrokerAccountsDto>, ApiFailure> {
-    require(&principal, OperationKey::ListBrokerAccounts)?;
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
     let code = broker_code(&broker)?;
     let accounts = iaam_app::sync::list_broker_accounts(&state.services, &principal, &code).await?;
     Ok(Json(BrokerAccountsDto {
@@ -8584,12 +8586,8 @@ mod tests {
         // either cannot hide in the arithmetic.
         assert_eq!(
             writes,
-            OperationKey::ALL
-                .iter()
-                .filter(|key| **key != OperationKey::ListBrokerAccounts)
-                .count()
-                + WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY.len(),
-            "every write is a key or is declared; account discovery is the allowance-spending GET key"
+            OperationKey::ALL.len() + WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY.len(),
+            "every write is a key or is declared, and every key is a write"
         );
     }
 

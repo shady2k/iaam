@@ -6303,9 +6303,6 @@ mod tests {
 
         let orphans: Vec<&str> = OperationKey::ALL
             .iter()
-            // Account discovery spends allowance and needs an agent floor,
-            // but deliberately settles no journal work.
-            .filter(|key| **key != OperationKey::ListBrokerAccounts)
             .filter(|key| !offered.contains(&format!("{key:?}")))
             .map(|key| key.as_str())
             .collect();

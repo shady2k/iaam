@@ -94,7 +94,7 @@ pub struct ListedBrokerAccount {
     pub bound_account: Option<AccountId>,
 }
 
-/// Read the access's accounts and existing bindings without recording anything.
+/// Read the access's accounts and existing bindings without changing owner or sync data.
 pub async fn list_broker_accounts(
     services: &AppServices,
     principal: &Principal,
@@ -110,7 +110,7 @@ pub async fn list_broker_accounts(
     let channel = services
         .channels
         .clone()
-        .open_for_account_listing(principal.owner, broker.as_str())
+        .open(principal.owner, broker.as_str())
         .await?;
     let allowance = RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING);
     let known = Vec::new();

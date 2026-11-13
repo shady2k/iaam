@@ -35,8 +35,9 @@ pub fn bearer(request: &Request) -> Option<String> {
 
 /// Authentication and rate-limiting layer.
 ///
-/// Token usage is logged for accepted authentication, except account discovery,
-/// whose contract forbids database writes. Unknown tokens are never stored.
+/// Token usage is logged for **every** request, including
+/// rejected ones: attempts using a revoked token are precisely why
+/// the log is needed (§14).
 pub async fn authenticate(
     State(state): State<ServerState>,
     mut request: Request,
@@ -72,20 +73,11 @@ pub async fn authenticate(
         return Err(ApiFailure::invalid_token());
     };
 
-    // Account discovery promises no database writes, including token usage.
-    // Authentication and the in-memory rate limit still apply.
-    let account_discovery = request.method() == axum::http::Method::GET
-        && route
-            .strip_prefix("/v1/brokers/")
-            .and_then(|path| path.strip_suffix("/accounts"))
-            .is_some_and(|broker| !broker.is_empty() && !broker.contains('/'));
-    if !account_discovery {
-        let _ = state
-            .services
-            .store
-            .record_token_use(hash, route, "accepted".into())
-            .await;
-    }
+    let _ = state
+        .services
+        .store
+        .record_token_use(hash, route, "accepted".into())
+        .await;
 
     request.extensions_mut().insert(principal);
     Ok(next.run(request).await)

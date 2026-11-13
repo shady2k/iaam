@@ -36165,7 +36165,7 @@ async fn broker_account_listing_is_read_only_and_never_fetches_history() {
     assert_eq!(
         database_snapshot(&path),
         before,
-        "every stored row is unchanged"
+        "every stored row outside the authentication audit is unchanged"
     );
     assert_eq!(
         channel.listings.load(std::sync::atomic::Ordering::SeqCst),
@@ -36696,6 +36696,9 @@ fn database_snapshot(path: &std::path::Path) -> Vec<(String, Vec<Vec<rusqlite::t
         .expect("names");
     tables
         .into_iter()
+        // Exclude only token_usage: it is the authentication audit, written
+        // for every request, including this read-only account listing.
+        .filter(|table| table != "token_usage")
         .map(|table| {
             let mut statement = db
                 .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))
@@ -36716,7 +36719,7 @@ fn database_snapshot(path: &std::path::Path) -> Vec<(String, Vec<Vec<rusqlite::t
 }
 
 #[tokio::test]
-async fn real_broker_factory_account_listing_does_not_seed_a_dictionary() {
+async fn real_broker_factory_account_listing_preserves_the_database_after_startup_refresh() {
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("real-listing.db");
     let harness = harness_with_everything(
@@ -36739,6 +36742,11 @@ async fn real_broker_factory_account_listing_does_not_seed_a_dictionary() {
         },
     )
     .await;
+    // Match serve startup: refresh embedded dictionaries before serving requests.
+    iaam_app::adapters::sqlite::refresh_broker_operation_dictionaries(
+        &mut SqliteStore::open(&path).expect("startup connection"),
+    )
+    .expect("startup dictionary refresh");
     let before = database_snapshot(&path);
     let (status, response) = call(
         &harness.router,
@@ -36753,6 +36761,6 @@ async fn real_broker_factory_account_listing_does_not_seed_a_dictionary() {
     assert_eq!(
         database_snapshot(&path),
         before,
-        "opening the real factory never seeds dictionary rows"
+        "listing after serve startup changes no rows outside the authentication audit"
     );
 }

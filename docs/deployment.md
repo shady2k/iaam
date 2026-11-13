@@ -1111,9 +1111,11 @@ an empty list when the access sees none. Each entry carries `broker_account`
 id for this owner, or null). Dates and status/type strings are preserved as
 published by the broker. Missing metadata is omitted, not inferred.
 
-This agent-scope call writes nothing to the database: no binding, journal
-fact, sync run or token-usage row. It requests only account listings and
-account descriptions, never operations, portfolio positions or broker reports.
+This agent-scope call changes no owner or sync data: no binding, journal
+fact, sync run or dictionary change after serve startup. Authentication records
+token usage for every request, including this listing. It requests only account
+listings and account descriptions, never operations, portfolio positions or
+broker reports.
 It spends broker allowance through the same gateway, deadline, request ceiling,
 cache, outbound tally and logging as sync account discovery. Finam reads one
 account description per visible id. The response exposes no stored credential.

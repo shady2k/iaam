@@ -115,6 +115,16 @@ pub const BUDGETS: &[Budget] = &[
         used: 50,
         window: MINUTE,
     },
+    // https://developer.tbank.ru/invest/intro/intro/limits: report generation,
+    // 5/min in the gRPC table. No separate REST figure is published, so use
+    // that conservative bound for generation and polling alike.
+    Budget {
+        destination: Destination::TinkoffProd,
+        scope: MethodScope::Named("OperationsService.GetBrokerReport"),
+        documented: Some(5),
+        used: 2,
+        window: MINUTE,
+    },
     // T-Invest REST, UsersService: documented 50/min, use 25/min.
     Budget {
         destination: Destination::TinkoffProd,
@@ -139,6 +149,16 @@ pub const BUDGETS: &[Budget] = &[
         scope: MethodScope::Named("OperationsService"),
         documented: Some(100),
         used: 50,
+        window: MINUTE,
+    },
+    // https://developer.tbank.ru/invest/intro/intro/limits: report generation,
+    // 5/min in the gRPC table. No separate REST figure is published, so use
+    // that conservative bound for generation and polling alike.
+    Budget {
+        destination: Destination::TinkoffSandbox,
+        scope: MethodScope::Named("OperationsService.GetBrokerReport"),
+        documented: Some(5),
+        used: 2,
         window: MINUTE,
     },
     Budget {
@@ -1111,9 +1131,11 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
                 | "OperationsService/GetPortfolio"
                 | "OperationsService/GetOperationsByCursor"
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations"
-                | "OperationsService/GetOperations"
-                | "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
-                | "OperationsService/GetBrokerReport" => Some("OperationsService"),
+                | "OperationsService/GetOperations" => Some("OperationsService"),
+                // Lookup and tally take one key per request. Prefer the stricter
+                // method budget over the broader OperationsService allowance.
+                "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
+                | "OperationsService/GetBrokerReport" => Some("OperationsService.GetBrokerReport"),
                 "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
                 | "InstrumentsService/GetInstrumentBy"
                 | "tinkoff.public.invest.api.contract.v1.InstrumentsService/CurrencyBy"
@@ -4329,6 +4351,56 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn pending_report_polls_spend_the_report_budget() {
+        let time = FakeTime::new();
+        let response = HttpResponse {
+            body: br#"{"code":30058}"#.to_vec(),
+            ..status(400)
+        };
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(response.clone()))
+                .then(Ok(response)),
+        );
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/OperationsService/GetBrokerReport",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(10))
+        .idempotent();
+        for _ in 0..2 {
+            assert!(
+                gateway
+                    .diagnostic_allowed(request.destination(), request.path())
+                    .await
+            );
+            assert!(matches!(
+                gateway.send(&request, None).await,
+                Err(GatewayError::Rejected { status: 400, .. })
+            ));
+            time.advance(Duration::from_secs(1));
+        }
+        assert!(
+            !gateway
+                .diagnostic_allowed(request.destination(), request.path())
+                .await
+        );
+        assert!(
+            gateway
+                .diagnostic_allowed(Destination::TinkoffProd, operations().path())
+                .await
+        );
+        time.advance(MINUTE);
+        assert!(
+            gateway
+                .diagnostic_allowed(request.destination(), request.path())
+                .await
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pending_broker_report_does_not_close_host() {
         let log = Log::capture();
         let time = FakeTime::new();
@@ -4370,7 +4442,8 @@ mod tests {
                     .diagnostic_allowed(Destination::TinkoffProd, request.path())
                     .await
             );
-            time.advance(Duration::from_secs(1));
+            // Isolate host-refusal classification from the report minute cap.
+            time.advance(MINUTE);
         }
         assert_eq!(gateway.send(&request, None).await.unwrap().status, 200);
         assert!(time.slept().is_empty());

@@ -136,6 +136,8 @@ fn budget_limit(host: &str, method: &str) -> Result<usize, String> {
 fn method_for_target(target: &str) -> Option<&'static str> {
     if target.contains("UsersService/") {
         Some("UsersService")
+    } else if target.contains("OperationsService/GetBrokerReport") {
+        Some("OperationsService.GetBrokerReport")
     } else if target.contains("OperationsService/") {
         Some("OperationsService")
     } else if target.contains("InstrumentsService/") {
@@ -3114,6 +3116,61 @@ async fn process_death_measurement() -> Measurements {
     measured
 }
 
+#[tokio::test]
+async fn concurrent_account_reports_share_the_instance_budget() {
+    for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+        let scenario = Scenario::new(
+            "account-report-budget",
+            destination,
+            std::iter::repeat_n(LoopbackReply::complete(200, "{}"), 7),
+            Duration::from_secs(5),
+            true,
+        );
+        let sync_account = |account: &'static str| {
+            let outbound = Arc::clone(&scenario.outbound);
+            async move {
+                for index in 0..3 {
+                    let body = if index == 0 {
+                        format!(r#"{{"generateBrokerReportRequest":{{"accountId":"{account}"}}}}"#)
+                    } else {
+                        format!(
+                            r#"{{"getBrokerReportRequest":{{"taskId":"task-{account}","page":{index}}}}}"#
+                        )
+                    };
+                    let request = HttpRequest::post(
+                        destination,
+                        "/tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport",
+                        RequestBody::Json(body),
+                    )
+                    .idempotent()
+                    .with_request_allowance(RequestAllowance::new(10));
+                    outbound.send(&request, None).await.expect("report request");
+                }
+            }
+        };
+        tokio::join!(sync_account("account-one"), sync_account("account-two"));
+        let reports = scenario.records();
+        assert_eq!(reports.len(), 6);
+        let references: Vec<_> = reports.iter().collect();
+        assert_eq!(
+            max_window_by(&references, MINUTE, |record| record.logical_at),
+            2
+        );
+        let before = scenario.clock.logical_now();
+        let portfolio = direct_request(destination, "/OperationsService/GetPortfolio");
+        scenario
+            .outbound
+            .send(&portfolio, None)
+            .await
+            .expect("portfolio unaffected");
+        assert_eq!(
+            scenario.clock.logical_now() - before,
+            Duration::from_secs(1)
+        );
+        scenario.verify_and_print("account-reports", destination, None);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executable_ceiling_proof() {
     print_header();
@@ -3342,7 +3399,7 @@ fn documented_budget_table_keeps_half_the_published_limits() {
     } in BUDGETS
     {
         if let Some(published) = documented {
-            assert_eq!(*used * 2, *published);
+            assert_eq!(*used, *published / 2);
         }
     }
 }

@@ -402,6 +402,47 @@ fn assert_never_more_than(limit: usize, window: Duration, sent: &[SystemTime]) {
 }
 
 #[tokio::test]
+async fn broker_reports_have_a_shared_rolling_minute_budget() {
+    for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+        let directory = TempDir::create("report-budget");
+        let tally = empty_tally(&directory);
+        let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        let transport = RecordingTransport::answering(&time);
+        let gateway = gateway(transport.clone(), &time, &tally);
+        for index in 0..5 {
+            let path = if index % 2 == 0 {
+                "/OperationsService/GetBrokerReport"
+            } else {
+                "/tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
+            };
+            let request = HttpRequest::post(destination, path, RequestBody::Json("{}".to_owned()))
+                .idempotent()
+                .with_request_allowance(RequestAllowance::new(10));
+            gateway.send(&request, None).await.expect("report sent");
+        }
+        let sent: Vec<_> = transport.sent().into_iter().map(|(_, at)| at).collect();
+        assert_eq!(sent.len(), 5);
+        assert_eq!(elapsed(sent[1], sent[0]), Duration::from_secs(1));
+        assert_never_more_than(2, Duration::from_secs(60), &sent);
+        let portfolio = HttpRequest::post(
+            destination,
+            "/OperationsService/GetPortfolio",
+            RequestBody::Json("{}".to_owned()),
+        )
+        .idempotent()
+        .with_request_allowance(RequestAllowance::new(1));
+        gateway
+            .send(&portfolio, None)
+            .await
+            .expect("portfolio has its own budget");
+        assert_eq!(
+            elapsed(transport.sent()[5].1, sent[4]),
+            Duration::from_secs(1)
+        );
+    }
+}
+
+#[tokio::test]
 async fn first_send_waits_sixty_seconds_then_spacing_and_minute_budget_hold() {
     let directory = TempDir::create("windows");
     let tally = empty_tally(&directory);

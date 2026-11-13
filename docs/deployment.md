@@ -1152,7 +1152,15 @@ cache. Repeated rows in one sync share the description, including operations
 and portfolio positions. Finam retains its existing half-limit budget.
 T-Invest InstrumentsService has a documented limit of 200 requests per minute;
 iaam uses 100 per minute on each environment, half that limit, without raising
-any existing budget. See the broker's
+any existing budget. T-Invest `OperationsService/GetBrokerReport` has its own
+budget on production and sandbox: **documented 5/min, used 2/min, rolling
+60 seconds**, shared by every account, sync and token of the instance.
+Generation and polling after `30058` (task not completed yet) both count.
+The published gRPC report-generation limit is the conservative bound because
+no separate REST figure is published. The gateway accounts one budget key per
+request, so reports spend this method budget, not the 50/min OperationsService
+budget used by portfolio and operation reads. Native remaining/reset handling,
+host spacing and the daily ceiling still apply unchanged. See the broker's
 [request limits](https://developer.tbank.ru/invest/intro/intro/limits).
 These are hard ceilings, not a promise of the broker's current allowance:
 T-Invest can apply dynamic limits shared by the owner's accounts and tools.

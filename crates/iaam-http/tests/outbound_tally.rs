@@ -423,7 +423,8 @@ async fn broker_reports_have_a_shared_rolling_minute_budget() {
         let sent: Vec<_> = transport.sent().into_iter().map(|(_, at)| at).collect();
         assert_eq!(sent.len(), 5);
         assert_eq!(elapsed(sent[1], sent[0]), Duration::from_secs(1));
-        assert_never_more_than(2, Duration::from_secs(60), &sent);
+        assert_eq!(elapsed(sent[3], sent[0]), Duration::from_secs(3));
+        assert_never_more_than(4, Duration::from_secs(60), &sent);
         let portfolio = HttpRequest::post(
             destination,
             "/OperationsService/GetPortfolio",

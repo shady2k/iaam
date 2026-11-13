@@ -3154,7 +3154,7 @@ async fn concurrent_account_reports_share_the_instance_budget() {
         let references: Vec<_> = reports.iter().collect();
         assert_eq!(
             max_window_by(&references, MINUTE, |record| record.logical_at),
-            2
+            4
         );
         let before = scenario.clock.logical_now();
         let portfolio = direct_request(destination, "/OperationsService/GetPortfolio");
@@ -3393,13 +3393,21 @@ async fn executable_ceiling_proof() {
 }
 
 #[test]
-fn documented_budget_table_keeps_half_the_published_limits() {
+fn documented_budget_table_obeys_the_owners_margins() {
     for Budget {
-        documented, used, ..
+        scope,
+        documented,
+        used,
+        ..
     } in BUDGETS
     {
         if let Some(published) = documented {
-            assert_eq!(*used, *published / 2);
+            if *scope == MethodScope::Named("OperationsService.GetBrokerReport") {
+                assert_eq!(*published, 5);
+                assert_eq!(*used, 4);
+            } else {
+                assert_eq!(*used, *published / 2);
+            }
         }
     }
 }

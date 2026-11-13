@@ -103,9 +103,8 @@ pub struct Budget {
 
 /// The documented limits and the share of each this process uses.
 ///
-/// Half of every documented limit: the documented number is the point at
-/// which the destination starts refusing, and the owner's other tools (a
-/// terminal, a mobile app) spend from the same account's allowance.
+/// Half of each documented limit, except the owner's report-only allowance
+/// below: other tools (a terminal, a mobile app) share the broker's limits.
 pub const BUDGETS: &[Budget] = &[
     // T-Invest REST, OperationsService: documented 100/min, use 50/min.
     Budget {
@@ -116,13 +115,15 @@ pub const BUDGETS: &[Budget] = &[
         window: MINUTE,
     },
     // https://developer.tbank.ru/invest/intro/intro/limits: report generation,
-    // 5/min in the gRPC table. No separate REST figure is published, so use
-    // that conservative bound for generation and polling alike.
+    // 5/min in the gRPC table; no separate REST figure is published.
+    // Owner decision (2026-11-13): only iaam orders reports through the API;
+    // full-history syncs need dozens of windows. Use 4/min for generation and
+    // polling, leaving one request/min as margin against the rolling window.
     Budget {
         destination: Destination::TinkoffProd,
         scope: MethodScope::Named("OperationsService.GetBrokerReport"),
         documented: Some(5),
-        used: 2,
+        used: 4,
         window: MINUTE,
     },
     // T-Invest REST, UsersService: documented 50/min, use 25/min.
@@ -152,13 +153,15 @@ pub const BUDGETS: &[Budget] = &[
         window: MINUTE,
     },
     // https://developer.tbank.ru/invest/intro/intro/limits: report generation,
-    // 5/min in the gRPC table. No separate REST figure is published, so use
-    // that conservative bound for generation and polling alike.
+    // 5/min in the gRPC table; no separate REST figure is published.
+    // Owner decision (2026-11-13): only iaam orders reports through the API;
+    // full-history syncs need dozens of windows. Use 4/min for generation and
+    // polling, leaving one request/min as margin against the rolling window.
     Budget {
         destination: Destination::TinkoffSandbox,
         scope: MethodScope::Named("OperationsService.GetBrokerReport"),
         documented: Some(5),
-        used: 2,
+        used: 4,
         window: MINUTE,
     },
     Budget {
@@ -4361,6 +4364,8 @@ mod tests {
             &time,
             Scripted::answering(&time, 200)
                 .then(Ok(response.clone()))
+                .then(Ok(response.clone()))
+                .then(Ok(response.clone()))
                 .then(Ok(response)),
         );
         let request = HttpRequest::post(
@@ -4370,7 +4375,7 @@ mod tests {
         )
         .with_request_allowance(RequestAllowance::new(10))
         .idempotent();
-        for _ in 0..2 {
+        for _ in 0..4 {
             assert!(
                 gateway
                     .diagnostic_allowed(request.destination(), request.path())
@@ -6633,9 +6638,14 @@ mod tests {
     }
 
     #[test]
-    fn every_budget_in_the_table_is_at_most_half_its_documented_limit() {
+    fn every_budget_obeys_the_owners_documented_margin() {
         for row in BUDGETS {
             if let Some(documented) = row.documented {
+                if row.scope == MethodScope::Named("OperationsService.GetBrokerReport") {
+                    assert_eq!(documented, 5);
+                    assert_eq!(row.used, 4);
+                    continue;
+                }
                 assert!(
                     row.used * 2 <= documented,
                     "{:?} {:?} uses more than half",

@@ -106,6 +106,8 @@ impl BrokerChannel for EmptyChannel {
         _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
+            duplicates: Vec::new(),
+            has_out_of_interval_trade: false,
             journal: Vec::new(),
             pending_redemptions: Vec::new(),
             accepted: Vec::new(),
@@ -159,6 +161,8 @@ impl BrokerChannel for PopulatedChannel {
         _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
+            duplicates: Vec::new(),
+            has_out_of_interval_trade: false,
             journal: Vec::new(),
             pending_redemptions: Vec::new(),
             accepted: vec![SubmittedOperation {
@@ -12734,6 +12738,8 @@ impl BrokerChannel for TwinRowsChannel {
             counterparty: None,
         };
         Ok(ParsedOperations {
+            duplicates: Vec::new(),
+            has_out_of_interval_trade: false,
             journal: Vec::new(),
             pending_redemptions: Vec::new(),
             accepted: vec![row("twin-a"), row("twin-b")],
@@ -36148,6 +36154,8 @@ impl BrokerChannel for RecordingChannel {
             .unwrap_or_else(|error| error.into_inner())
             .push(broker_account.to_owned());
         Ok(ParsedOperations {
+            duplicates: Vec::new(),
+            has_out_of_interval_trade: false,
             journal: Vec::new(),
             pending_redemptions: Vec::new(),
             accepted: vec![SubmittedOperation {

@@ -9,6 +9,8 @@ use iaam_broker::tinkoff::{
 // The live broker rejects periods over 31 inclusive calendar days (30064).
 const REPORT_PERIOD_DAYS: i64 = 31;
 const REPORT_OPERATION_MARGIN_DAYS: i64 = 15;
+// Also bound callers that have no sync deadline.
+const REPORT_PENDING_RETRIES: u32 = 8;
 
 /// Read near affected operations, rather than replaying the full sync history.
 pub(super) fn report_windows(dates: &[Date], from: Date, to: Date) -> Vec<(Date, Date)> {
@@ -60,6 +62,12 @@ fn split_report_period(from: Date, to: Date) -> Vec<(Date, Date)> {
         start = end.saturating_add(time::Duration::days(1));
     }
     windows
+}
+
+fn poll_fits_deadline(deadline: Option<Instant>, delay: std::time::Duration) -> bool {
+    deadline.is_none_or(|deadline| {
+        deadline.saturating_duration_since(tokio::time::Instant::now().into_std()) > delay
+    })
 }
 
 impl TinkoffChannel {
@@ -158,17 +166,18 @@ impl TinkoffChannel {
         diagnostic: bool,
     ) -> Result<Vec<serde_json::Value>, BrokerError> {
         let (from, to) = period;
-        if diagnostic
-            && (context.allowance.remaining() <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
-                || !self.client.wait_diagnostic_report(context.deadline).await)
+        if (diagnostic
+            && context.allowance.remaining() <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE)
+            || !self.client.wait_diagnostic_report(context.deadline).await
+            || (diagnostic && !self.client.diagnostic_report_allowed().await)
         {
             tracing::debug!(
                 phase = "broker_report", account, from = %from, to = %to,
                 status = "skipped", reason = "low_rate_capacity_or_host_pause",
-                "broker report diagnostic deferred"
+                "broker report deferred"
             );
             return Err(unparsable(
-                "diagnostic report deferred to preserve broker capacity".to_owned(),
+                "broker report deferred to preserve broker capacity".to_owned(),
             ));
         }
         tracing::debug!(
@@ -204,18 +213,19 @@ impl TinkoffChannel {
             // The shared allowance and deadline apply to every poll, too.
             let mut polls = 0;
             let body = loop {
-                if diagnostic
-                    && (context.allowance.remaining()
-                        <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
-                        || !self.client.wait_diagnostic_report(context.deadline).await)
+                if (diagnostic
+                    && context.allowance.remaining()
+                        <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE)
+                    || !self.client.wait_diagnostic_report(context.deadline).await
+                    || (diagnostic && !self.client.diagnostic_report_allowed().await)
                 {
                     tracing::debug!(
                         phase = "broker_report", account, from = %from, to = %to,
                         page = page_number, status = "skipped", reason = "low_rate_capacity_or_host_pause",
-                        "broker report diagnostic deferred"
+                        "broker report deferred"
                     );
                     return Err(unparsable(
-                        "diagnostic report deferred to preserve broker capacity".to_owned(),
+                        "broker report deferred to preserve broker capacity".to_owned(),
                     ));
                 }
                 tracing::debug!(
@@ -230,9 +240,28 @@ impl TinkoffChannel {
                 trace_report_response("get", Some(page_number), account, period, &response);
                 match response {
                     Err(TinkoffError::UnexpectedStatus { status: 400, body })
-                        if report_not_ready(&body) && polls < 2 =>
+                        if report_not_ready(&body) && polls < REPORT_PENDING_RETRIES =>
                     {
+                        let delay = std::time::Duration::from_secs((1 << polls).min(30));
+                        if !poll_fits_deadline(context.deadline, delay) {
+                            tracing::debug!(
+                                phase = "broker_report", step = "get", account,
+                                from = %from, to = %to, page = page_number,
+                                wait_ms = delay.as_millis(), reason = "sync_deadline_before_poll",
+                                "broker report pending poll omitted"
+                            );
+                            return Err(unparsable(
+                                "broker report pending past sync deadline".to_owned(),
+                            ));
+                        }
                         polls += 1;
+                        tracing::debug!(
+                            phase = "broker_report", step = "get", account,
+                            from = %from, to = %to, page = page_number, poll = polls,
+                            wait_ms = delay.as_millis(), reason = "report_task_not_ready",
+                            "broker report pending poll waits"
+                        );
+                        tokio::time::sleep(delay).await;
                     }
                     response => break response.map_err(tinkoff_error)?,
                 }
@@ -299,11 +328,14 @@ fn report_error_fields(body: &str) -> (Option<String>, Option<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return (None, None);
     };
-    let code = value.get("code").and_then(|code| {
-        code.as_str()
-            .map(str::to_owned)
-            .or_else(|| code.as_u64().map(|code| code.to_string()))
-    });
+    let code = value
+        .get("code")
+        .or_else(|| value.get("error_code"))
+        .and_then(|code| {
+            code.as_str()
+                .map(str::to_owned)
+                .or_else(|| code.as_u64().map(|code| code.to_string()))
+        });
     let message = value
         .get("message")
         .and_then(|message| message.as_str())
@@ -359,7 +391,10 @@ fn trace_report_response(
             );
         };
     }
-    if response.is_ok() || code.as_deref() == Some("30058") {
+    let pending = matches!(response,
+        Err(TinkoffError::UnexpectedStatus { status: 400, body }) if report_not_ready(body)
+    );
+    if response.is_ok() || pending {
         trace_response!(debug);
     } else {
         trace_response!(warn);
@@ -367,10 +402,29 @@ fn trace_report_response(
 }
 
 fn report_not_ready(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("code").cloned())
-        .is_some_and(|code| code.as_str() == Some("30058") || code.as_u64() == Some(30058))
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let code_is = |expected: u64| {
+        ["code", "error_code"].iter().any(|field| {
+            value.get(field).is_some_and(|code| {
+                code.as_u64() == Some(expected)
+                    || code.as_str().and_then(|code| code.parse::<u64>().ok()) == Some(expected)
+            })
+        })
+    };
+    code_is(30058)
+        || (code_is(3)
+            && ["message", "description"].iter().any(|field| {
+                matches!(
+                    value.get(field).and_then(serde_json::Value::as_str),
+                    Some(
+                        "30058"
+                            | "Task not completed yet, please try again later"
+                            | "Task not completed yet, please try again later."
+                    )
+                )
+            }))
 }
 
 #[cfg(test)]
@@ -434,6 +488,7 @@ mod tests {
                 BrokerRequestContext {
                     deadline: None,
                     allowance: &allowance,
+                    known: &[],
                 },
             )
             .with_subscriber(subscriber)
@@ -455,6 +510,110 @@ mod tests {
         for excluded in ["private-extra", "payment", "invented-report-token"] {
             assert!(!logs.contains(excluded), "leaked {excluded}: {logs}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_report_polls_wait_and_stop_at_the_retry_bound() {
+        let (gateway, requests, _) = fake::gateway(
+            vec![Answer::status(
+                200,
+                r#"{"generateBrokerReportResponse":{"taskId":"invented-task"}}"#,
+            )],
+            Some(Answer::status(400, r#"{"code":30058}"#)),
+        );
+        let channel = report_channel(gateway);
+        let allowance = iaam_http::RequestAllowance::new(16);
+        let start = tokio::time::Instant::now();
+        let result = channel
+            .read_settlement_report(
+                "invented-report-account",
+                time::macros::date!(2026 - 01 - 01),
+                time::macros::date!(2026 - 01 - 02),
+                BrokerRequestContext {
+                    deadline: None,
+                    allowance: &allowance,
+                    known: &[],
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(BrokerError::Refused { .. })));
+        assert_eq!(requests.lock().expect("requests").len(), 10);
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(121));
+    }
+
+    #[tokio::test]
+    async fn both_report_uses_wait_for_the_method_reset() {
+        for diagnostic in [false, true] {
+            let mut generated = Answer::status(
+                200,
+                r#"{"generateBrokerReportResponse":{"taskId":"invented-task"}}"#,
+            );
+            generated.remaining = Some(0);
+            generated.reset = Some(std::time::Duration::from_secs(7));
+            let mut answers = vec![
+                generated,
+                Answer::status(
+                    200,
+                    r#"{"getBrokerReportResponse":{"brokerReport":[],"itemsCount":0,"pagesCount":0,"page":0}}"#,
+                ),
+            ];
+            if diagnostic {
+                answers.insert(0, Answer::status(200, "{}"));
+            }
+            let (gateway, requests, clock) = fake::gateway(answers, None);
+            let channel = report_channel(gateway);
+            if diagnostic {
+                channel
+                    .client
+                    .get_accounts(&iaam_http::RequestAllowance::new(16))
+                    .await
+                    .unwrap();
+                requests.lock().unwrap().clear();
+            }
+            let allowance = iaam_http::RequestAllowance::new(16);
+            let rows = channel
+                .read_report_window(
+                    "invented-report-account",
+                    (
+                        time::macros::date!(2026 - 01 - 01),
+                        time::macros::date!(2026 - 01 - 02),
+                    ),
+                    BrokerRequestContext {
+                        deadline: None,
+                        allowance: &allowance,
+                        known: &[],
+                    },
+                    diagnostic,
+                )
+                .await
+                .expect("report after method reset");
+            assert!(rows.is_empty());
+            assert_eq!(requests.lock().expect("requests").len(), 2);
+            assert!(
+                clock
+                    .slept()
+                    .iter()
+                    .any(|wait| *wait >= std::time::Duration::from_secs(7))
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_report_does_not_wait_past_the_original_deadline() {
+        let start = tokio::time::Instant::now();
+        assert!(!poll_fits_deadline(
+            Some(start.into_std() + std::time::Duration::from_millis(500)),
+            std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        assert!(!poll_fits_deadline(
+            Some(start.into_std()),
+            std::time::Duration::from_secs(1)
+        ));
+        assert!(poll_fits_deadline(
+            Some(start.into_std() + std::time::Duration::from_secs(2)),
+            std::time::Duration::from_secs(1)
+        ));
     }
 
     #[tokio::test]
@@ -481,6 +640,7 @@ mod tests {
                 BrokerRequestContext {
                     deadline: None,
                     allowance: &allowance,
+                    known: &[],
                 },
             )
             .await
@@ -581,6 +741,7 @@ mod tests {
                 BrokerRequestContext {
                     deadline: None,
                     allowance: &allowance,
+                    known: &[],
                 },
             )
             .await
@@ -622,6 +783,31 @@ mod tests {
     fn only_report_pending_code_is_polled() {
         assert!(super::report_not_ready(r#"{"code":30058}"#));
         assert!(super::report_not_ready(r#"{"code":"30058"}"#));
+        assert!(super::report_not_ready(
+            r#"{"error_code":3,"message":"Task not completed yet, please try again later"}"#
+        ));
+        assert!(super::report_not_ready(
+            r#"{"code":"3","message":"Task not completed yet, please try again later."}"#
+        ));
+        assert!(super::report_not_ready(r#"{"code":3,"message":"30058"}"#));
+        assert!(super::report_not_ready(
+            r#"{"error_code":3,"description":"Task not completed yet, please try again later"}"#
+        ));
+        assert!(super::report_not_ready(
+            r#"{"code":3,"description":"Task not completed yet, please try again later."}"#
+        ));
+        assert!(!super::report_not_ready(
+            r#"{"code":3,"description":"other failure"}"#
+        ));
+        assert!(!super::report_not_ready(
+            r#"{"code":3,"message":"other failure"}"#
+        ));
+        assert!(!super::report_not_ready(
+            r#"{"code":3,"message":"prefix Task not completed yet, please try again later"}"#
+        ));
+        assert!(!super::report_not_ready(
+            r#"{"code":30059,"message":"Task not completed yet, please try again later"}"#
+        ));
         assert!(!super::report_not_ready(r#"{"code":30059}"#));
         assert!(!super::report_not_ready("invalid"));
     }

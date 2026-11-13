@@ -50,15 +50,16 @@ impl TinkoffChannel {
                     .map(|trade| trade.at.to_offset(time::UtcOffset::UTC).date())
             })
             .collect();
-        dates.extend(questions_commission::affected_dates(&uncovered));
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if self.question_reports_enabled {
+            dates.extend(questions_commission::affected_dates(&uncovered));
             dates.extend(questions_zone::affected_dates(&uncovered));
         }
         let mut rows = existing_rows.to_vec();
         if !dates.is_empty() {
             let windows = report::report_windows(&dates, from, to);
             tracing::debug!(window_count = windows.len(), windows = ?windows,
-                "planned shared question report windows");
+                question_reports_enabled = self.question_reports_enabled,
+                "planned shared fresh-operation report windows");
             for (from, to) in windows {
                 if context.deadline.is_some_and(|deadline| {
                     deadline.saturating_duration_since(tokio::time::Instant::now().into_std())

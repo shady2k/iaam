@@ -93,6 +93,7 @@ impl BrokerChannel for FinamChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            ..
         } = context;
         bounded(
             deadline,
@@ -113,6 +114,7 @@ impl BrokerChannel for FinamChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            ..
         } = context;
         // The broker is asked for its own account number; the returned rows
         // are stamped with the owner's account in this system.
@@ -142,6 +144,7 @@ impl BrokerChannel for FinamChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            ..
         } = context;
         let _ = account;
         let (body, observed_at) = bounded(
@@ -547,6 +550,8 @@ async fn adapt_operations(
         }
     }
     Ok(ParsedOperations {
+        duplicates: Vec::new(),
+        has_out_of_interval_trade: false,
         journal: Vec::new(),
         pending_redemptions: Vec::new(),
         accepted,
@@ -1113,6 +1118,7 @@ mod tests {
         BrokerRequestContext {
             deadline,
             allowance: &ALLOWANCE,
+            known: &[],
         }
     }
 

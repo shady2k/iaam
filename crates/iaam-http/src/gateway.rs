@@ -1038,11 +1038,49 @@ fn is_tinkoff_report_pending(
     status: u16,
     body: &[u8],
 ) -> bool {
-    is_tinkoff_report_400(destination, path, status)
-        && serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| value.get("code").cloned())
-            .is_some_and(|code| code.as_str() == Some("30058") || code.as_u64() == Some(30058))
+    if !is_tinkoff_report_400(destination, path, status) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let code_is = |expected: u64| {
+        ["code", "error_code"].iter().any(|field| {
+            value.get(field).is_some_and(|code| {
+                code.as_u64() == Some(expected)
+                    || code.as_str().and_then(|code| code.parse::<u64>().ok()) == Some(expected)
+            })
+        })
+    };
+    code_is(30058)
+        || (code_is(3)
+            && ["message", "description"].iter().any(|field| {
+                matches!(
+                    value.get(field).and_then(serde_json::Value::as_str),
+                    Some(
+                        "30058"
+                            | "Task not completed yet, please try again later"
+                            | "Task not completed yet, please try again later."
+                    )
+                )
+            }))
+}
+
+fn native_method_limit(destination: Destination, path: &str, response: &HttpResponse) -> bool {
+    matches!(
+        destination,
+        Destination::TinkoffProd | Destination::TinkoffSandbox
+    ) && broker_budget_key(destination, path).is_some()
+        && response.status == 429
+        && (response.rate_reset.is_some()
+            || (response.rate_remaining == Some(0) && response.retry_after.is_some()))
+}
+
+fn native_reset(response: &HttpResponse) -> Option<Duration> {
+    response
+        .rate_reset
+        .map(Duration::from_secs)
+        .or(response.retry_after)
 }
 
 fn native_rate_key(destination: Destination, path: &str) -> &str {
@@ -1121,6 +1159,8 @@ enum TallyLatch {
     Response {
         path: String,
         status: u16,
+        report_pending: bool,
+        method_limited: bool,
         retry_after: Option<Duration>,
     },
 }
@@ -1425,6 +1465,10 @@ impl<T: Transport + 'static> Gateway<T> {
         if lane.refusing(now).is_some()
             || !lane.named_wait(now).is_zero()
             || lane
+                .server_not_before
+                .get(native_rate_key(destination, path))
+                .is_some_and(|(at, window)| now.saturating_duration_since(*at) < *window)
+            || lane
                 .diagnostic_capacity
                 .get(native_rate_key(destination, path))
                 .is_some_and(|(remaining, at, window)| {
@@ -1466,29 +1510,21 @@ impl<T: Transport + 'static> Gateway<T> {
             if deadline.is_some_and(|end| now >= end) {
                 return false;
             }
-            let Some(lane) = self.lanes.get(destination.base_url()) else {
-                return false;
-            };
-            let Ok(lane) = lane.try_lock() else {
-                return false;
-            };
-            if lane.refusing(now).is_some() || !lane.named_wait(now).is_zero() {
-                return false;
-            }
-            let wait = lane
-                .diagnostic_capacity
-                .get(native_rate_key(destination, path))
-                .map_or(Duration::ZERO, |(remaining, at, window)| {
-                    if *remaining == 0 {
+            let wait = if let Some(lane) = self.lanes.get(destination.base_url()) {
+                let Ok(lane) = lane.try_lock() else {
+                    return false;
+                };
+                if lane.refusing(now).is_some() || !lane.named_wait(now).is_zero() {
+                    return false;
+                }
+                lane.server_not_before
+                    .get(native_rate_key(destination, path))
+                    .map_or(Duration::ZERO, |(at, window)| {
                         window.saturating_sub(now.saturating_duration_since(*at))
-                    } else {
-                        Duration::ZERO
-                    }
-                });
-            drop(lane);
-            if wait.is_zero() {
-                return self.diagnostic_allowed(destination, path).await;
-            }
+                    })
+            } else {
+                Duration::ZERO
+            };
             if wait > MAX_NAMED_WAIT {
                 tracing::debug!(
                     destination = ?destination,
@@ -1509,11 +1545,11 @@ impl<T: Transport + 'static> Gateway<T> {
                 );
                 return false;
             }
-            // A persisted host stop must not turn into an optional method wait.
-            let request = HttpRequest::get(destination, path);
-            let Ok((budget, key)) = self.budgets.lookup(&request) else {
+            // Required report polling must honor persisted host stops, but
+            // send owns its daily, service and sync allowance admission.
+            if self.broker_egress == BrokerEgress::Off {
                 return false;
-            };
+            }
             let Some(directory) = &self.egress_directory else {
                 return false;
             };
@@ -1521,15 +1557,13 @@ impl<T: Transport + 'static> Gateway<T> {
                 return false;
             };
             if !tally
-                .diagnostic_allowed(
-                    destination.base_url(),
-                    key.unwrap_or("*"),
-                    &budget,
-                    self.clock.as_ref(),
-                )
+                .report_allowed(destination.base_url(), self.clock.as_ref())
                 .unwrap_or(false)
             {
                 return false;
+            }
+            if wait.is_zero() {
+                return true;
             }
             tracing::debug!(
                 destination = ?destination,
@@ -2063,13 +2097,15 @@ impl<T: Transport + 'static> Gateway<T> {
                         TallyLatch::Response {
                             path: latched_path,
                             status: latched_status,
+                            report_pending,
+                            method_limited,
                             retry_after: latched_retry_after,
                         } => {
                             let recorded = tally
-                                .record_response_for_request(
+                                .record_response_with_pending(
                                     destination.base_url(),
                                     &latched_path,
-                                    latched_status,
+                                    (latched_status, report_pending, method_limited),
                                     latched_retry_after,
                                     self.clock.as_ref(),
                                 )
@@ -2149,6 +2185,16 @@ impl<T: Transport + 'static> Gateway<T> {
                     return Err(cut(attempts, status, wait));
                 }
                 if !wait.is_zero() {
+                    if !named.is_zero() {
+                        tracing::debug!(
+                            destination = ?destination,
+                            host = destination.base_url(),
+                            method = %rate_key,
+                            scope = if lane.named_wait(now) >= server_wait { "host" } else { "method" },
+                            wait_ms = millis(named),
+                            "outbound pause admission"
+                        );
+                    }
                     let reason = if named >= budget_wait {
                         "named reset"
                     } else {
@@ -2331,6 +2377,25 @@ impl<T: Transport + 'static> Gateway<T> {
                         let callback_path = tally_path.clone();
                         let observed_request = request.clone();
                         let observe = Box::new(move |observed: HttpResponse| {
+                            let method_limited = native_method_limit(
+                                destination,
+                                observed_request.path(),
+                                &observed,
+                            );
+                            if observed.status == 429
+                                || (!(200..300).contains(&observed.status)
+                                    && observed.retry_after.is_some())
+                            {
+                                tracing::warn!(
+                                    destination = ?destination,
+                                    host = destination.base_url(),
+                                    method = native_rate_key(destination, observed_request.path()),
+                                    scope = if method_limited { "method" } else { "host" },
+                                    status = observed.status,
+                                    rate_reset = observed.rate_reset,
+                                    "outbound broker pause"
+                                );
+                            }
                             tracing::info!(
                                 destination = ?destination,
                                 method = observed_request.path(),
@@ -2351,13 +2416,13 @@ impl<T: Transport + 'static> Gateway<T> {
                                 destination.base_url(),
                                 observed_request.path(),
                                 observed.status,
-                            ) && observed.rate_remaining == Some(0)
-                                && let Some(seconds) = observed.rate_reset
+                            ) && (observed.rate_remaining == Some(0) || method_limited)
+                                && let Some(delay) = native_reset(&observed)
                             {
                                 *callback_reset
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some((callback_clock.now(), Duration::from_secs(seconds)));
+                                    Some((callback_clock.now(), delay));
                             }
                             let retry_after =
                                 observed.retry_after.map(|delay| delay.min(TALLY_RETENTION));
@@ -2365,7 +2430,7 @@ impl<T: Transport + 'static> Gateway<T> {
                                 .record_response_with_pending(
                                     destination.base_url(),
                                     observed_request.path(),
-                                    (observed.status, report_pending),
+                                    (observed.status, report_pending, method_limited),
                                     retry_after,
                                     callback_clock.as_ref(),
                                 )
@@ -2456,6 +2521,17 @@ impl<T: Transport + 'static> Gateway<T> {
                                 TallyLatch::Response {
                                     path: request.path().to_owned(),
                                     status: line.status,
+                                    report_pending: is_tinkoff_report_pending(
+                                        destination,
+                                        request.path(),
+                                        line.status,
+                                        &line.body,
+                                    ),
+                                    method_limited: native_method_limit(
+                                        destination,
+                                        request.path(),
+                                        line,
+                                    ),
                                     retry_after: line.retry_after,
                                 }
                             });
@@ -2521,6 +2597,8 @@ impl<T: Transport + 'static> Gateway<T> {
                         Some(Ok(response)) => response,
                         _ => &observed_line,
                     };
+                    let method_limited = native_method_limit(destination, request.path(), response);
+                    let method_reset = native_reset(response);
                     match recorded {
                         Ok(TallyResponseDecision::Recorded) => {}
                         Ok(TallyResponseDecision::Paused { retry_after }) => {
@@ -2553,6 +2631,16 @@ impl<T: Transport + 'static> Gateway<T> {
                             }
                         }
                         Err(error) => return Err(error),
+                    }
+                    if method_limited {
+                        // Return the 429 to the caller. Its next call is gated by
+                        // the native method reset, without holding other methods.
+                        return Err(GatewayError::Deferred {
+                            destination,
+                            status: Some(429),
+                            attempts,
+                            retry_after: method_reset.unwrap_or_default(),
+                        });
                     }
                     // A status line is an endpoint answer even when its body
                     // later stalls or fails. Keep a 4xx/5xx from becoming a
@@ -3642,6 +3730,181 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn report_native_429_holds_only_report_until_reset() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                rate_remaining: Some(0),
+                rate_reset: Some(17),
+                retry_after: Some(Duration::from_secs(17)),
+                ..status(429)
+            })),
+        );
+        let report = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/OperationsService/GetBrokerReport",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(20))
+        .idempotent();
+        assert!(matches!(
+            gateway.send(&report, None).await,
+            Err(GatewayError::Deferred {
+                status: Some(429),
+                attempts: 1,
+                ..
+            })
+        ));
+        assert!(
+            !gateway
+                .diagnostic_allowed(Destination::TinkoffProd, report.path())
+                .await
+        );
+        assert!(
+            gateway
+                .diagnostic_allowed(Destination::TinkoffProd, operations().path())
+                .await
+        );
+        let before = time.now();
+        assert!(
+            !gateway
+                .wait_diagnostic_report(
+                    Destination::TinkoffProd,
+                    report.path(),
+                    Some(before + Duration::from_secs(10)),
+                )
+                .await
+        );
+        assert!(matches!(
+            gateway
+                .send(&report, Some(before + Duration::from_secs(10)))
+                .await,
+            Err(GatewayError::DeadlineReached { attempts: 0, .. })
+        ));
+        assert_eq!(gateway.transport.sent_at().len(), 1);
+        for path in [
+            "/OperationsService/GetOperationsByCursor",
+            "/OperationsService/GetPortfolio",
+            "/InstrumentsService/GetInstrumentBy",
+        ] {
+            let request = HttpRequest::post(
+                Destination::TinkoffProd,
+                path,
+                crate::RequestBody::Json("{}".to_owned()),
+            )
+            .with_request_allowance(RequestAllowance::new(20))
+            .idempotent();
+            gateway
+                .send(&request, None)
+                .await
+                .expect("unrelated method remains available");
+        }
+        assert!(time.now() - before < Duration::from_secs(17));
+        assert!(
+            gateway
+                .wait_diagnostic_report(
+                    Destination::TinkoffProd,
+                    report.path(),
+                    Some(before + Duration::from_secs(30)),
+                )
+                .await
+        );
+        assert_eq!(time.now() - before, Duration::from_secs(17));
+        gateway
+            .send(&report, None)
+            .await
+            .expect("report reset elapsed");
+        assert_eq!(gateway.transport.sent_at().len(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tinkoff_native_429_retry_after_is_method_scoped() {
+        for path in [
+            "/OperationsService/GetBrokerReport",
+            "/OperationsService/GetPortfolio",
+            "/InstrumentsService/GetInstrumentBy",
+        ] {
+            let time = FakeTime::new();
+            let gateway = gateway(
+                &time,
+                Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                    rate_remaining: Some(0),
+                    retry_after: Some(Duration::from_secs(17)),
+                    retry_after_header: Some(Duration::from_secs(17)),
+                    ..status(429)
+                })),
+            );
+            let request = HttpRequest::post(
+                Destination::TinkoffProd,
+                path,
+                crate::RequestBody::Json("{}".to_owned()),
+            )
+            .with_request_allowance(RequestAllowance::new(10))
+            .idempotent();
+            assert!(matches!(gateway.send(&request, None).await,
+                Err(GatewayError::Deferred { status: Some(429), attempts: 1, retry_after, .. })
+                    if retry_after == Duration::from_secs(17)
+            ));
+            let now = time.now();
+            assert!(matches!(
+                gateway
+                    .send(&request, Some(now + Duration::from_secs(10)))
+                    .await,
+                Err(GatewayError::DeadlineReached { attempts: 0, .. })
+            ));
+            gateway
+                .send(&operations(), None)
+                .await
+                .expect("another method is available");
+            assert_eq!(gateway.transport.sent_at().len(), 2);
+            assert!(time.now() - now < Duration::from_secs(17));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unscoped_429_and_503_retry_after_still_hold_all_methods() {
+        for native_headers in [false, true] {
+            let time = FakeTime::new();
+            let gateway = gateway(
+                &time,
+                Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                    rate_remaining: native_headers.then_some(0),
+                    rate_reset: native_headers.then_some(17),
+                    retry_after: native_headers.then_some(Duration::from_secs(17)),
+                    retry_after_header: native_headers.then_some(Duration::from_secs(17)),
+                    ..status(if native_headers { 503 } else { 429 })
+                })),
+            );
+            let report = HttpRequest::post(
+                Destination::TinkoffProd,
+                "/OperationsService/GetBrokerReport",
+                crate::RequestBody::Json("{}".to_owned()),
+            )
+            .with_request_allowance(RequestAllowance::new(10));
+            assert!(matches!(
+                gateway.send(&report, None).await,
+                Err(GatewayError::BrokerHostPaused { .. })
+            ));
+            assert!(
+                !gateway
+                    .diagnostic_allowed(Destination::TinkoffProd, operations().path())
+                    .await
+            );
+            assert!(
+                !gateway
+                    .wait_diagnostic_report(Destination::TinkoffProd, report.path(), None)
+                    .await
+            );
+            assert!(matches!(
+                gateway.send(&operations(), None).await,
+                Err(GatewayError::BrokerHostPaused { attempts: 0, .. })
+            ));
+            assert_eq!(gateway.transport.sent_at().len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn ordinary_instrument_diagnostics_still_reserve_five() {
         let time = FakeTime::new();
         let gateway = gateway(
@@ -4028,19 +4291,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn fresh_report_wait_allows_send_but_reopened_gateway_obeys_host_stop() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 429));
+        let path = "/OperationsService/GetBrokerReport";
+        assert!(
+            gateway
+                .wait_diagnostic_report(Destination::TinkoffProd, path, None)
+                .await
+        );
+        assert!(matches!(
+            gateway.send(&operations(), None).await,
+            Err(GatewayError::BrokerHostPaused { .. })
+        ));
+        let directory = gateway.egress_directory.as_ref().expect("egress").clone();
+        drop(gateway);
+        let reopened = Gateway::with_parts_in_directory(
+            Scripted::answering(&time, 200),
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            directory.tally_path().parent().expect("directory"),
+        )
+        .expect("gateway");
+        assert!(
+            !reopened
+                .wait_diagnostic_report(Destination::TinkoffProd, path, None)
+                .await
+        );
+        assert!(reopened.transport.sent_at().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pending_broker_report_does_not_close_host() {
         let time = FakeTime::new();
-        let pending = HttpResponse {
-            body: br#"{"code":30058}"#.to_vec(),
-            ..status(400)
-        };
-        let gateway = gateway(
-            &time,
-            Scripted::answering(&time, 200)
-                .then(Ok(pending.clone()))
-                .then(Ok(pending.clone()))
-                .then(Ok(pending)),
-        );
+        let mut transport = Scripted::answering(&time, 200);
+        for body in [
+            br#"{"code":30058}"#.as_slice(),
+            br#"{"error_code":3,"description":"Task not completed yet, please try again later"}"#,
+            br#"{"code":"3","message":"30058"}"#,
+            br#"{"code":3,"description":"Task not completed yet, please try again later."}"#,
+        ] {
+            transport = transport.then(Ok(HttpResponse {
+                body: body.to_vec(),
+                ..status(400)
+            }));
+        }
+        let gateway = gateway(&time, transport);
         let request = HttpRequest::post(
             Destination::TinkoffProd,
             "/tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport",
@@ -4048,7 +4346,7 @@ mod tests {
         )
         .with_request_allowance(RequestAllowance::new(10))
         .idempotent();
-        for _ in 0..3 {
+        for _ in 0..4 {
             assert!(matches!(
                 gateway.send(&request, None).await,
                 Err(GatewayError::Rejected { status: 400, .. })

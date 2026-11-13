@@ -95,6 +95,7 @@ pub struct TinkoffChannel {
     instruments: Arc<dyn InstrumentDirectory>,
     descriptions: tokio::sync::Mutex<HashMap<String, CachedDescription>>,
     diagnostic_operations: tokio::sync::Mutex<Vec<diagnostics::ReceivedOperation>>,
+    question_reports_enabled: bool,
 }
 
 impl TinkoffChannel {
@@ -114,6 +115,8 @@ impl TinkoffChannel {
             instruments,
             descriptions: tokio::sync::Mutex::new(HashMap::new()),
             diagnostic_operations: tokio::sync::Mutex::new(Vec::new()),
+            question_reports_enabled: std::env::var("IAAM_TINVEST_QUESTION_REPORTS")
+                .is_ok_and(|value| value == "1"),
         }
     }
     // FindInstrument results are diagnostic only; typed lookups resolve identity.
@@ -528,6 +531,55 @@ fn trace_instrument_miss(
     );
 }
 
+fn fill_source_id(operation_id: &str, trade_id: &str) -> String {
+    format!(
+        "{}#{}",
+        escape_component(operation_id),
+        escape_component(trade_id)
+    )
+}
+
+/// Test the same stable source keys that the sync will use, before any report
+/// or instrument lookup. A partially recorded order still needs enrichment.
+fn recorded_operation(
+    operation: &ChannelOperation,
+    account: AccountId,
+    source: SourceId,
+    known: &[iaam_ingest::dedup::KnownRecord],
+) -> Option<Vec<iaam_core::ids::EventId>> {
+    use iaam_ingest::dedup::{self, DedupDecision, DedupKey, DocumentContext};
+    let context = DocumentContext {
+        account,
+        broker_api_source: Some(source),
+        document: None,
+        sheet: None,
+        row: None,
+        identity_scope: IdentityScope::Account,
+    };
+    if operation.trades.is_empty() || operation.operation_id.is_empty() {
+        return None;
+    }
+    let keys = operation
+        .trades
+        .iter()
+        .map(|trade| fill_source_id(&operation.operation_id, &trade.num));
+    // Only a stable-key Duplicate suppresses enrichment. Fingerprint hints do not.
+    let fingerprint = iaam_core::event::provenance::RawHash::parse(&"0".repeat(64))
+        .expect("valid placeholder fingerprint");
+    keys.map(|key| {
+        match dedup::assess(
+            Some(&DedupKey::SourceOperationId(key)),
+            &fingerprint,
+            &context,
+            known,
+        ) {
+            DedupDecision::Duplicate { existing, .. } => Some(existing),
+            _ => None,
+        }
+    })
+    .collect()
+}
+
 fn received_by_type(operations: &[ChannelOperation]) -> std::collections::BTreeMap<&str, usize> {
     let mut counts = std::collections::BTreeMap::new();
     for operation in operations {
@@ -580,6 +632,7 @@ impl BrokerChannel for TinkoffChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            known: _,
         } = context;
         // The accounts listing has no deadline parameter on the client — its
         // frozen signature predates the sync's deadline — so the bound is
@@ -599,6 +652,7 @@ impl BrokerChannel for TinkoffChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            known: _,
         } = context;
         // The broker is asked for its own account number; the returned rows
         // are stamped with the owner's account in this system.
@@ -618,12 +672,63 @@ impl BrokerChannel for TinkoffChannel {
             "received T-Invest operation types"
         );
         questions_timestamps::trace_timestamps(&operations, from, to);
+        questions_commission::trace_commission(&operations, &[]);
+        questions_zone::trace_trading_zone(&operations, &[]);
+        let received = operations.len();
+        let mut duplicates = Vec::new();
+        let mut has_out_of_interval_trade = false;
+        operations.retain(|operation| {
+            let securities_trade = matches!(
+                self.dictionary.kind_of(&operation.source_kind),
+                ChannelOperationKind::Buy | ChannelOperationKind::Sell
+            ) && !operation.trades.is_empty()
+                && operation
+                    .raw
+                    .get("instrumentKind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("INSTRUMENT_TYPE_CURRENCY")
+                && operation
+                    .raw
+                    .get("instrumentType")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("currency");
+            if let Some(existing) = securities_trade
+                .then(|| recorded_operation(operation, account, self.source, context.known))
+                .flatten()
+            {
+                for (row_index, trade) in operation.trades.iter().enumerate() {
+                    tracing::debug!(
+                        phase = "map",
+                        row_index,
+                        source = %self.source.inner(),
+                        source_operation_id = fill_source_id(&operation.operation_id, &trade.num),
+                        rule = "key_match",
+                        verdict = "duplicate",
+                        "broker sync dedup assessment"
+                    );
+                }
+                duplicates.extend(existing);
+                has_out_of_interval_trade |= operation.trades.iter().any(|trade| {
+                    let date = trade.at.to_offset(time::UtcOffset::UTC).date();
+                    date < from || date > to
+                });
+                false
+            } else {
+                true
+            }
+        });
+        tracing::debug!(
+            received,
+            fresh_operations = operations.len(),
+            recorded_facts = duplicates.len(),
+            question_reports_enabled = self.question_reports_enabled,
+            "T-Invest report enrichment admission"
+        );
         let mut diagnostic_operations = diagnostics::capture(&operations);
         let settlement_rows = self
             .resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;
         let question_operations = operations.clone();
-        let received = operations.len();
         tracing::info!(
             phase = "resolve_instruments",
             status = "start",
@@ -773,6 +878,8 @@ impl BrokerChannel for TinkoffChannel {
         }
         let (mut parsed, accounting) =
             adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
+        parsed.duplicates = duplicates;
+        parsed.has_out_of_interval_trade = has_out_of_interval_trade;
         for pending in &mut parsed.pending_redemptions {
             pending.blocked_tca_flag = pending
                 .withdrawal_operation_id
@@ -802,8 +909,10 @@ impl BrokerChannel for TinkoffChannel {
                 parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
             "T-Invest operations accounted"
         );
-        questions_commission::trace_commission(&question_operations, &report_rows);
-        questions_zone::trace_trading_zone(&question_operations, &report_rows);
+        if self.question_reports_enabled {
+            questions_commission::trace_commission(&question_operations, &report_rows);
+            questions_zone::trace_trading_zone(&question_operations, &report_rows);
+        }
         Ok(parsed)
     }
 
@@ -817,6 +926,7 @@ impl BrokerChannel for TinkoffChannel {
         let BrokerRequestContext {
             deadline,
             allowance,
+            known: _,
         } = context;
         let _ = account;
         let (body, observed_at) = self
@@ -1526,6 +1636,8 @@ fn adapt_operations_with_currencies(
         - accounting.quarantined_trade;
     Ok((
         ParsedOperations {
+            duplicates: Vec::new(),
+            has_out_of_interval_trade: false,
             accepted,
             journal,
             pending_redemptions,
@@ -2211,11 +2323,7 @@ fn trade_operations(
                     &operation.operation_id,
                     &trade.num,
                 )),
-                source_operation_id: Some(format!(
-                    "{}#{}",
-                    escape_component(&operation.operation_id),
-                    escape_component(&trade.num)
-                )),
+                source_operation_id: Some(fill_source_id(&operation.operation_id, &trade.num)),
                 // Verbatim: `trade_row_reason` has already refused every
                 // trade whose order carries no `positionUid`, so this is
                 // always present here.
@@ -2964,6 +3072,7 @@ mod tests {
         crate::ports::BrokerRequestContext {
             deadline,
             allowance: &ALLOWANCE,
+            known: &[],
         }
     }
 
@@ -3392,7 +3501,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn report_generation_polls_pending_then_reads_every_page() {
         let report_row = serde_json::json!({"tradeId":"trade-1", "figi":"FIGI1", "quantity":"92",
             "tradeDatetime":"2026-08-20T10:00:00Z", "clearValueDate":"2026-08-21T00:00:00Z",
@@ -3600,6 +3709,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn report_admission_uses_every_fill_key_and_keeps_partial_orders_fresh() {
+        use iaam_core::{event::provenance::RawHash, ids::EventId};
+        use iaam_ingest::dedup::KnownRecord;
+        let account = AccountId::new_random();
+        let source = SourceId::new_random();
+        let mut operation = report_operation();
+        operation.operation_id = "order/#%".to_owned();
+        operation.trades[0].num = "fill/#%".to_owned();
+        let mut second = operation.trades[0].clone();
+        second.num = "second".to_owned();
+        operation.trades.push(second);
+        let records: Vec<_> = operation
+            .trades
+            .iter()
+            .map(|trade| KnownRecord {
+                event: EventId::new_random(),
+                source: SourceId::new_random(),
+                account,
+                source_operation_id: Some(super::fill_source_id(
+                    &operation.operation_id,
+                    &trade.num,
+                )),
+                idempotency_key: Some("different weaker key".to_owned()),
+                fingerprint: RawHash::parse(&"a".repeat(64)).unwrap(),
+                document: None,
+                sheet: None,
+                row: None,
+            })
+            .collect();
+        assert!(super::recorded_operation(&operation, account, source, &records[..1]).is_none());
+        assert_eq!(
+            super::recorded_operation(&operation, account, source, &records).unwrap(),
+            records
+                .iter()
+                .map(|record| record.event)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            super::recorded_operation(&operation, AccountId::new_random(), source, &records)
+                .is_none()
+        );
+        operation.trades.clear();
+        assert!(super::recorded_operation(&operation, account, source, &records).is_none());
+    }
+
+    #[tokio::test]
+    async fn question_report_windows_require_explicit_opt_in() {
+        let mut operation = report_operation();
+        operation.rejection = None;
+        operation.commission = None;
+        operation.trades[0].at = time::macros::datetime!(2026-08-20 22:00 UTC);
+        operation.raw["tradesInfo"]["trades"][0]["date"] =
+            serde_json::json!("2026-08-20T22:00:00Z");
+        for enabled in [false, true] {
+            let mut answers = if enabled {
+                vec![
+                    Answer::status(
+                        200,
+                        r#"{"generateBrokerReportResponse":{"taskId":"question"}}"#,
+                    ),
+                    Answer::status(
+                        200,
+                        r#"{"getBrokerReportResponse":{"brokerReport":[],"itemsCount":0,"pagesCount":0,"page":0}}"#,
+                    ),
+                ]
+            } else {
+                vec![]
+            };
+            answers.insert(0, Answer::status(200, "{}"));
+            let (gateway, requests, _) = fake::gateway(answers, None);
+            let mut channel = channel(gateway);
+            channel.question_reports_enabled = enabled;
+            channel
+                .client
+                .get_accounts(broker_context(None).allowance)
+                .await
+                .unwrap();
+            requests.lock().unwrap().clear();
+            channel
+                .read_question_reports(
+                    &[operation.clone()],
+                    "invented",
+                    (
+                        time::macros::date!(2026 - 08 - 01),
+                        time::macros::date!(2026 - 08 - 31),
+                    ),
+                    broker_context(None),
+                    &[],
+                )
+                .await;
+            assert_eq!(requests.lock().unwrap().len(), if enabled { 2 } else { 0 });
+        }
+    }
+
     #[tokio::test]
     async fn commissions_reuse_settlement_rows_without_another_report() {
         let operation = report_operation();
@@ -3750,6 +3954,7 @@ mod tests {
                     BrokerRequestContext {
                         deadline: expired.then(|| tokio::time::Instant::now().into_std()),
                         allowance: &allowance,
+                        known: &[],
                     },
                 )
                 .await;
@@ -4068,6 +4273,7 @@ mod tests {
         let context = crate::ports::BrokerRequestContext {
             deadline: None,
             allowance: &allowance,
+            known: &[],
         };
         let result = channel
             .resolve_instrument(
@@ -6366,6 +6572,7 @@ mod tests {
                 BrokerRequestContext {
                     deadline: None,
                     allowance: &allowance,
+                    known: &[],
                 },
             )
             .await
@@ -6384,11 +6591,9 @@ mod tests {
         assert!(message.contains("narrow"), "{message}");
     }
 
-    /// T-Invest limits a caller with 429 and names a reset shorter than the
-    /// mandatory pause. Once the first-send safety wait has elapsed, the fetch
-    /// stops on the response and exposes the full minute before another call.
+    /// A native method reset does not impose the host-wide minimum pause.
     #[tokio::test]
-    async fn a_multi_page_fetch_stops_at_a_limit_and_exposes_the_host_pause() {
+    async fn a_multi_page_fetch_stops_at_a_limit_and_exposes_the_method_reset() {
         let (gateway, log, time) = fake::gateway(
             vec![
                 Answer {
@@ -6404,7 +6609,7 @@ mod tests {
 
         let error = fetch(&channel(gateway))
             .await
-            .expect_err("the broker host is paused");
+            .expect_err("the broker method is paused");
 
         assert!(
             matches!(
@@ -6413,8 +6618,8 @@ mod tests {
                     detail,
                     retry_after: Some(retry_after),
                     ..
-                } if detail.contains("paused after status 429")
-                    && *retry_after == Duration::from_secs(60)
+                } if detail.contains("last status Some(429)")
+                    && *retry_after == Duration::from_secs(7)
             ),
             "{error:?}"
         );
@@ -6489,7 +6694,7 @@ mod tests {
     }
 
     /// A 429 stops a multi-page fetch without waiting in the request and says
-    /// how many pages had arrived before the persisted host pause.
+    /// how many pages had arrived before the native method pause.
     #[tokio::test]
     async fn a_fetch_limited_after_two_pages_is_unreachable_and_names_the_pages_fetched() {
         let (gateway, log, time) = fake::gateway(
@@ -6540,7 +6745,7 @@ mod tests {
                     detail,
                     retry_after: Some(retry_after),
                     ..
-                } if detail.contains("reopens at")
+                } if detail.contains("last status Some(429)")
                     && detail.ends_with("operation pages fetched before it: 2")
                     && *retry_after == Duration::from_secs(60)
             ),

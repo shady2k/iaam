@@ -1245,12 +1245,28 @@ to distinguish a source observation from a defensive control.
   history-depth limit was observed. This does not promise an unlimited
   history for every account or future broker response.
 
+Report-backed question diagnostics (`iaam-gawg`, `iaam-jsvd`, `iaam-m7hy`)
+are off by default. Set `IAAM_TINVEST_QUESTION_REPORTS=1` before starting the
+service to enable them explicitly. Local timestamp, commission and calendar
+counts do not need this flag. Enrichment and optional report comparisons only
+consider operations not already recorded according to the sync's deduplication
+keys. An already-recorded full-history re-sync requests no broker reports.
+Fresh operations can still fetch reports for authoritative fill commissions or
+sub-kopeck settlement; the flag does not disable those accounting rules.
+
 For T-Invest commission enrichment, `GetBrokerReport` windows cover at most
 31 days inclusive. They spend the method's small native allowance as well
 as the existing sync request allowance; do not raise either to make a history
 fit. The diagnostic report reserve is zero. When the broker reports zero
 remaining method allowance, wait for its reset before reserving another request,
-within the same bounded sync deadline. Report retrieval is opportunistic:
+within the same bounded sync deadline. A pending task (`30058`, including its
+gRPC code-3 pending-message form) waits before polling the same page again:
+1, 2, 4, 8, 16, then 30 seconds, at most eight retries, additionally paced by
+the native method reset and the original sync deadline and request allowance.
+Each wait is logged as `broker report pending poll waits`. A native method-bucket
+429 pauses only that method (`outbound broker pause`, `scope="method"`);
+unscoped 429 and host-wide signals retain `scope="host"` pauses.
+Report retrieval is opportunistic:
 missing or unavailable report data leaves the turnover fallback available,
 not a requirement to block sync. The report supplies **trades only**, not a
 depository history; do not use the absence of a report row to prove the

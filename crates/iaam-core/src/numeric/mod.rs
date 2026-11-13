@@ -10,6 +10,7 @@
 //! the identity checks amounts, not rates.
 
 pub mod approx;
+pub mod commission_evidence;
 pub mod decimal;
 pub mod exact;
 pub mod xirr;

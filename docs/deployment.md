@@ -1206,6 +1206,72 @@ Verdict diagnostics include a fixed `rule`: `key_match`,
 Enable the relevant application's `debug` logging to inspect individual rows;
 aggregate operation counts are available at `info`.
 
+### 6.10 Read the broker evidence without overstating it
+
+The following are owner-supplied evidence shapes, not a transcript of a new
+live run. They contain no live amounts, account identifiers or trade values.
+Use the existing `info` counters and row-level `debug` diagnostics from §6.9
+to distinguish a source observation from a defensive control.
+
+- **Order and fill dates (`iaam-gawg`).** Full histories of the most active
+  accounts did not expose an order with execution fills on another day.
+  The case is **not observable in that evidence**, not proved impossible.
+  The timestamp used to filter operations therefore remains unverified for
+  that cross-day shape. Keep the defensive control assertions and suppression,
+  and emit their counters on every sync; an unobserved shape does not justify deleting them or recording a synthetic
+  assertion as broker evidence.
+- **Commission (`iaam-jsvd`).** The observed live shape is a turnover tariff
+  rounded to kopecks per fill, rather than once for the order aggregate.
+  A matched report trade's `broker_commission` is authoritative and used
+  unchanged in posted units. It must be exact minor units: refuse a sub-minor
+  value rather than round it into a new amount. Where report commissions are
+  missing, allocate only the
+  residual posted order commission after known report commissions across the
+  missing fills, weighted by exact `quantity × price`. Use largest remainder
+  in whole minor units with trade-id ties. A negative residual or a fully
+  reported total that disagrees with the order is refused, not repaired by
+  inventing fees. With no report commissions, the whole order amount uses
+  this fallback. Other channels, generic lot allocation and accrued-interest
+  quantity weights are unchanged. The rule is specified in
+  `.internal/specs/2026-08-31-t3-trade-money-design.md` §3.
+- **Calendar boundary (`iaam-m7hy`).** Trade dates deliberately use UTC.
+  The inspected full histories contain no fills in the 00:00–03:00 Moscow interval
+  that would distinguish the Moscow date from the UTC date. This is not
+  evidence of calendar equivalence. Keep the boundary diagnostics and emit
+  counters on every sync; a zero observed count does not establish that such fills cannot
+  occur.
+- **Finam history.** The inspected history reached account opening; no
+  history-depth limit was observed. This does not promise an unlimited
+  history for every account or future broker response.
+
+For T-Invest commission enrichment, `GetBrokerReport` windows cover at most
+31 days inclusive. They spend the method's small native allowance as well
+as the existing sync request allowance; do not raise either to make a history
+fit. The diagnostic report reserve is zero. When the broker reports zero
+remaining method allowance, wait for its reset before reserving another request,
+within the same bounded sync deadline. Report retrieval is opportunistic:
+missing or unavailable report data leaves the turnover fallback available,
+not a requirement to block sync. The report supplies **trades only**, not a
+depository history; do not use the absence of a report row to prove the
+absence of a custody movement. Sandbox cannot supply this production-only
+report (§10).
+
+A fund withdrawal to a registrar paired with full redemption is not, by
+itself, an ordinary sale with a known cost and profit. Preserve the paired
+withdrawal/redemption evidence and the `blocked_tca_flag` justification.
+The pairing must prove the exact withdrawn quantity. For a blocked instrument
+with no recorded arrival, the paired withdrawal can justify an estimated,
+unpriced arrival of those units. Its date is bounded by that withdrawal;
+it is not a claim about the true acquisition date. Its acquisition date,
+cost basis and resulting profit remain unknown, with that explanation retained.
+The catalogue flag for the ISIN is the logical OR of broker-handle observations
+(any handle reporting true makes it true),
+not the last handle's answer: an unblocked handle must not erase another
+handle's blocked observation. A derived interpretation must retain why the
+blocked catalogue state applies even if the withdrawal's own handle was
+unblocked. Where that evidence leaves basis or result unknown, keep it
+unknown; do not turn missing basis into zero and report a false profit.
+
 ---
 
 ## 7. Tokens

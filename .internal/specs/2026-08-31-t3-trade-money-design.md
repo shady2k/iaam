@@ -95,29 +95,39 @@ A mismatch quarantines the row with both amounts.
 
 ## 3. Commission allocation across fills
 
-The commission is one amount for the whole order and must reach the
-basis of each fill's lot.
+For T-Invest, use the broker-report commission matched to an individual
+execution trade's `broker_commission` when it is available. It must already
+be an exact number of posted minor units (kopecks for RUB). Use it unchanged;
+refuse a sub-minor value rather than rounding it into a new source amount.
+That fill's amount is authoritative and is not replaced by a proportion of
+the order commission.
 
-**The weight is quantity.** Not because a per-unit fee is proven — it is
-not — but because this repository already allocates an actual payment to
-lots in proportion to quantity (`iaam-core/src/projection/lots.rs:381`
-and its doc comment), and with no evidence either way, matching the
-convention already in the code beats introducing a second one.
+**The fallback weight is exact turnover, `quantity × price`.** Where the report
+has no commission for a fill, allocate only the residual of the posted order
+commission after subtracting the known report commissions, across the missing
+fills. If none are reported, this is the whole posted order commission across
+all fills. Do not redistribute an authoritative reported fill commission.
+A negative residual, or a fully reported set whose sum disagrees with the
+posted order commission, is refused rather than made to reconcile by inventing
+fill fees.
 
-The alternative reading is real and unresolved: a brokerage commission is
-conventionally a percentage of turnover, which would weight by
-`quantity × price`. The two agree whenever every fill of an order shares
-one price, and every fill in the recorded response does, so nothing here
-distinguishes them. Filed as `iaam-jsvd`; until it is answered, quantity
-is the weight and this paragraph is why.
+This resolves the quantity-versus-turnover question in `iaam-jsvd` for
+T-Invest only. It does not change the generic lot payment allocator, the
+quantity weights for accrued interest in §4.2, or other broker channels.
+The owner-supplied live evidence has the shape of a turnover tariff rounded
+to kopecks per fill, not once for the aggregate; no live monetary values
+are reproduced here.
 
 ### 3.1 Allocation is done in minor units, and what that trades away
 
-Allocate the order's **posted** commission — `commission` converted once
-with `CalcMoney::rounded_minor` — across fills in minor units, by
-quantity, using the largest-remainder method: give each fill the floor of
-its share, then hand the remaining units one each to the fills with the
-largest fractional remainders, ties broken by `trade.num` as bytes.
+Convert the order's **posted** commission once with
+`CalcMoney::rounded_minor`. For fills missing report commissions, allocate
+the residual in minor units by exact `quantity × price`, using the
+largest-remainder method: give each fill the floor of its share, then
+hand the remaining units one each to fills with the largest fractional
+remainders, ties broken by trade id (`trade.num` as bytes). Report retrieval
+is opportunistic within the existing request allowance and bounded deadline;
+an absent or unavailable report does not block sync and uses the fallback.
 
 Each fill's `basis_fee` is its allocated whole minor units, and its
 `basis_fee_exact` is that same amount as an exact decimal.
@@ -134,14 +144,16 @@ An earlier revision of this document claimed those two invariants were
 mutually impossible. That was wrong, and the correction is the point of
 this section: what is impossible is holding both **while also** keeping
 each fill's exact share at its mathematically exact proportional value.
-Something has to give, and the proportional sub-minor share is the right
-thing to give up, because it is not a source fact: the broker reported
-one commission for the order, not a fraction of a kopeck per fill.
+Something has to give for the fallback allocation, and the proportional
+sub-minor share is the right thing to give up: it is not a source fact.
+A report's per-trade commission, when present, takes precedence as above.
 
 What is given up, stated: the sub-minor part of the order's commission —
 strictly less than one minor unit — does not reach any lot's basis,
-because the allocation starts from the rounded aggregate. The exact
-commission stays on the row's raw JSON, which is retained.
+because fallback allocation starts from the rounded aggregate. Reported
+fill commissions already contain the broker's per-fill rounding and are
+used unchanged in posted units, not rounded again by iaam. The exact source
+commissions stay in the retained raw JSON.
 
 ### 3.2 A share of zero is not a fee
 
@@ -154,8 +166,8 @@ therefore cannot give every fill a positive share.
 A fill allocated zero units records `basis_fee: None` and
 `basis_fee_exact: None`. It is not an error and does not quarantine the
 row: a fee below the smallest recordable unit is not a fee, and the
-largest-remainder method already concentrates the available units on the
-largest fills, which is where the basis effect belongs.
+largest-remainder method assigns only the available whole units to
+fallback fills. A reported zero likewise records no fee.
 
 The order's whole posted commission still reaches the basis in total —
 the zero shares are zero, not discarded remainders.
@@ -231,8 +243,9 @@ Policy:
   normally. A share order that filled across two days is an ordinary
   event and must not be refused.
 - **a non-zero accrued interest, all fills on one date:** allocate it
-  across the fills in minor units by quantity, by the same
-  largest-remainder rule as §3.1, so the posted parts sum to the posted
+  across the fills in minor units by quantity, using the
+  largest-remainder rounding and trade-id tie break of §3.1 (not its
+  commission turnover weights), so the posted parts sum to the posted
   aggregate;
 - **a non-zero accrued interest, fills on more than one date:** the row
   is **quarantined**, with the dates named. A fact cannot be built

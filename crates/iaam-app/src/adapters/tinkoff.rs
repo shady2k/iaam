@@ -50,6 +50,18 @@ mod diagnostics;
 #[path = "tinkoff_fund_redemption.rs"]
 mod fund_redemption;
 
+#[path = "tinkoff_questions_timestamps.rs"]
+mod questions_timestamps;
+
+#[path = "tinkoff_questions_commission.rs"]
+mod questions_commission;
+
+#[path = "tinkoff_questions_zone.rs"]
+mod questions_zone;
+
+#[path = "tinkoff_questions_reports.rs"]
+mod questions_reports;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
@@ -605,9 +617,12 @@ impl BrokerChannel for TinkoffChannel {
             received_by_type = ?received_by_type(&operations),
             "received T-Invest operation types"
         );
+        questions_timestamps::trace_timestamps(&operations, from, to);
         let mut diagnostic_operations = diagnostics::capture(&operations);
-        self.resolve_report_payments(&mut operations, broker_account, from, to, context)
+        let settlement_rows = self
+            .resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;
+        let question_operations = operations.clone();
         let received = operations.len();
         tracing::info!(
             phase = "resolve_instruments",
@@ -741,6 +756,21 @@ impl BrokerChannel for TinkoffChannel {
             "broker sync phase complete"
         );
         *self.diagnostic_operations.lock().await = diagnostic_operations;
+        let report_rows = self
+            .read_question_reports(
+                &question_operations,
+                broker_account,
+                (from, to),
+                context,
+                &settlement_rows,
+            )
+            .await;
+        for operation in &mut checked {
+            match iaam_broker::tinkoff::resolve_report_commissions(operation, &report_rows) {
+                Ok(resolved) => *operation = resolved,
+                Err(error) => operation.rejection = Some(error),
+            }
+        }
         let (mut parsed, accounting) =
             adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
         for pending in &mut parsed.pending_redemptions {
@@ -772,6 +802,8 @@ impl BrokerChannel for TinkoffChannel {
                 parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
             "T-Invest operations accounted"
         );
+        questions_commission::trace_commission(&question_operations, &report_rows);
+        questions_zone::trace_trading_zone(&question_operations, &report_rows);
         Ok(parsed)
     }
 
@@ -2064,7 +2096,7 @@ fn trade_operations(
     }
     let commission_minor = posted_commission(operation.commission, currency)?;
     let commission_allocations = commission_minor
-        .map(|total| allocate_minor(total, &trades))
+        .map(|total| allocate_trade_commission(total, &trades, &operation.operation_id))
         .transpose()?
         .unwrap_or_else(|| vec![0; trades.len()]);
     let accrued_known = operation.accrued_interest.is_some();
@@ -2195,6 +2227,59 @@ fn posted_commission(
         .checked_abs()
         .map(Some)
         .ok_or_else(|| row_unparsable("commission magnitude is not representable"))
+}
+
+fn allocate_trade_commission(
+    total: i64,
+    trades: &[iaam_broker::tinkoff::ChannelTrade],
+    operation_id: &str,
+) -> Result<Vec<i64>, RowRefusal> {
+    let mut order: Vec<_> = (0..trades.len()).collect();
+    order.sort_by(|left, right| {
+        trades[*left]
+            .num
+            .as_bytes()
+            .cmp(trades[*right].num.as_bytes())
+    });
+    let grosses = order
+        .iter()
+        .map(|index| {
+            iaam_core::money::gross_for_fill(trades[*index].price, trades[*index].quantity)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| row_unparsable(error.to_string()))?;
+    let reported = order
+        .iter()
+        .map(|index| {
+            trades[*index]
+                .broker_commission
+                .map(|amount| amount.rounded_minor())
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| row_unparsable(error.to_string()))?;
+    let allocated = iaam_core::rules::trade_allocation::allocate_commission_minor(
+        PostedMinor::new(total),
+        &grosses,
+        &reported,
+    )
+    .map_err(|error| row_unparsable(format!("fill commission: {error}")))?;
+    let mut result = vec![0; trades.len()];
+    for (position, index) in order.into_iter().enumerate() {
+        result[index] = allocated[position].raw();
+        tracing::debug!(
+            operation_id,
+            trade_id = trades[index].num,
+            source = if reported[position].is_some() {
+                "report"
+            } else {
+                "value_allocation"
+            },
+            commission_minor = result[index],
+            "T-Invest fill commission source"
+        );
+    }
+    Ok(result)
 }
 
 fn allocate_minor(
@@ -2976,7 +3061,7 @@ mod tests {
                 status: 200,
                 body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
                 reset: Some(Duration::from_secs(30)),
-                remaining: Some(5),
+                remaining: Some(0),
             }],
             None,
         );
@@ -3120,7 +3205,7 @@ mod tests {
                 status: 200,
                 body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
                 reset: Some(Duration::from_secs(30)),
-                remaining: Some(5),
+                remaining: Some(0),
             }],
             None,
         );
@@ -3457,6 +3542,173 @@ mod tests {
                     "currency must not use FindInstrument"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn commissions_reuse_settlement_rows_without_another_report() {
+        let operation = report_operation();
+        let rows: Vec<_> = operation.trades.iter().map(|trade| serde_json::json!({
+            "tradeId":trade.num, "figi":operation.figi, "brokerCommission":{"units":"0","nano":0,"currency":"rub"}
+        })).collect();
+        let (gateway, requests, _) = fake::gateway(vec![], None);
+        let channel = channel(gateway);
+        let actual = channel
+            .read_question_reports(
+                &[operation],
+                "invented-account",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+                &rows,
+            )
+            .await;
+        assert_eq!(actual, rows);
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commission_candidates_in_one_window_share_one_report() {
+        use tracing::instrument::WithSubscriber;
+        let money = |units: &str| serde_json::json!({"units":units,"nano":0,"currency":"rub"});
+        let orders: Vec<_> = ["order-a", "order-b"].into_iter().map(|id| {
+            serde_json::json!({
+                "cursor":id, "brokerAccountId":"account", "id":id, "figi":"FIGI1",
+                "date":"2026-08-20T10:00:00Z", "type":"OPERATION_TYPE_BUY",
+                "state":"OPERATION_STATE_EXECUTED", "quantity":"2", "quantityDone":"2",
+                "payment":money("-30"), "commission":money("6"),
+                "tradesInfo":{"trades":[
+                    {"num":format!("{id}-1"),"date":"2026-08-20T10:00:00Z","quantity":"1","price":money("10")},
+                    {"num":format!("{id}-2"),"date":"2026-08-20T10:01:00Z","quantity":"1","price":money("20")}
+                ]}
+            })
+        }).collect();
+        let body = serde_json::json!({"hasNext":false,"items":orders});
+        let operations = parse_operations(&body.to_string()).unwrap();
+        assert_eq!(operations.len(), 2);
+        let rows: Vec<_> = ["order-a-1", "order-a-2", "order-b-1", "order-b-2"]
+            .into_iter()
+            .map(
+                |id| serde_json::json!({"tradeId":id,"figi":"FIGI1","brokerCommission":money("3")}),
+            )
+            .collect();
+        let page = serde_json::json!({"getBrokerReportResponse":{"brokerReport":rows,"itemsCount":4,"pagesCount":1,"page":0}}).to_string();
+        let (gateway, requests, _) = fake::gateway(
+            vec![
+                Answer::status(200, "{}"),
+                Answer::status(
+                    200,
+                    r#"{"generateBrokerReportResponse":{"taskId":"shared-task"}}"#,
+                ),
+                Answer::status(200, &page),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        // Required sync reads establish the tally before optional diagnostics.
+        channel
+            .client
+            .get_accounts(broker_context(None).allowance)
+            .await
+            .unwrap();
+        requests.lock().unwrap().clear();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        channel
+            .trace_question_reports(
+                &operations,
+                "account",
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                broker_context(None),
+            )
+            .with_subscriber(subscriber)
+            .await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "{}",
+            String::from_utf8_lossy(&captured.0.lock().unwrap())
+        );
+        let generate: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let get: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        assert!(generate.get("generateBrokerReportRequest").is_some());
+        assert_eq!(get["getBrokerReportRequest"]["taskId"], "shared-task");
+        assert_eq!(get["getBrokerReportRequest"]["page"], 0);
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("question=\"commission_allocation\""),
+            "{logs}"
+        );
+        assert!(logs.contains("orders=2"), "{logs}");
+        assert!(logs.contains("matched=2"), "{logs}");
+        assert_eq!(
+            logs.matches("commission allocation fill evidence").count(),
+            4,
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn question_reports_yield_to_low_shared_allowance_and_elapsed_deadline() {
+        for expired in [false, true] {
+            let (gateway, requests, _) = fake::gateway(vec![], None);
+            let channel = channel(gateway);
+            let body = serde_json::json!({"hasNext":false,"items":[{
+                "id":"invented-zone-fill", "date":"2026-08-01T21:30:00Z",
+                "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+                "commission":{"units":"1","nano":0,"currency":"rub"},
+                "tradesInfo":{"trades":[{"num":"invented-fill","quantity":"1",
+                    "date":"2026-08-01T21:30:00Z", "price":{"units":"1","nano":0,"currency":"rub"}},
+                    {"num":"invented-fill-2","quantity":"1", "date":"2026-08-01T21:31:00Z",
+                    "price":{"units":"2","nano":0,"currency":"rub"}}]}
+            }]})
+            .to_string();
+            let operations = iaam_broker::tinkoff::parse_operations(&body)
+                .unwrap()
+                .operations;
+            let allowance = iaam_http::RequestAllowance::new(if expired { 50 } else { 5 });
+            let writer = InstrumentLog::default();
+            let captured = writer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _subscriber = tracing::subscriber::set_default(subscriber);
+            channel
+                .trace_question_reports(
+                    &operations,
+                    "invented-account",
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 02),
+                    BrokerRequestContext {
+                        deadline: expired.then(|| tokio::time::Instant::now().into_std()),
+                        allowance: &allowance,
+                    },
+                )
+                .await;
+            assert!(requests.lock().unwrap().is_empty());
+            let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(log.contains("T-Invest question report skipped"), "{log}");
+            assert!(
+                log.contains(if expired {
+                    "sync_deadline_near_or_elapsed"
+                } else {
+                    "low_rate_capacity_or_host_pause"
+                }),
+                "{log}"
+            );
         }
     }
 
@@ -5524,7 +5776,53 @@ mod tests {
     }
 
     #[test]
-    fn commission_is_allocated_in_minor_units_by_quantity_and_trade_num() {
+    fn fill_commission_uses_report_then_value_weighted_residual() {
+        let body = trading_operation_with_fields(TradingOperationFields {
+            operation_type: "OPERATION_TYPE_BUY",
+            state: "OPERATION_STATE_EXECUTED",
+            operation_id: "invented-commission-sources",
+            quantity_done: "3",
+            payment: r#"{"units":"-60","nano":0,"currency":"rub"}"#,
+            fields: r#","commission":{"units":"0","nano":60000000,"currency":"rub"}"#,
+            trades: &format!(
+                "{},{},{}",
+                trade("c", "2026-08-21T10:00:00Z", "1", "30", 0),
+                trade("a", "2026-08-21T10:00:00Z", "1", "10", 0),
+                trade("b", "2026-08-21T10:00:00Z", "1", "20", 0)
+            ),
+        });
+        let mut operation = parse_operations(&body).unwrap().remove(0);
+        let currency = operation.trades[0].price.currency();
+        let fallback =
+            super::allocate_trade_commission(6, &operation.trades, &operation.operation_id)
+                .unwrap();
+        assert_eq!(fallback, vec![3, 1, 2]);
+        operation.trades[1].broker_commission =
+            Some(super::calc_money_from_minor(2, currency).unwrap());
+        let reported =
+            super::allocate_trade_commission(6, &operation.trades, &operation.operation_id)
+                .unwrap();
+        assert_eq!(reported, vec![2, 2, 2]);
+        let converted = trade_operations(
+            AccountId::new_random(),
+            operation,
+            super::ChannelOperationKind::Buy,
+        )
+        .unwrap();
+        let fees: Vec<_> = converted
+            .iter()
+            .map(|fill| match &fill.kind {
+                OperationKind::Buy { basis_fee, .. } => {
+                    basis_fee.unwrap().rounded_minor().unwrap().raw()
+                }
+                _ => panic!("expected buy"),
+            })
+            .collect();
+        assert_eq!(fees, vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn commission_is_allocated_in_minor_units_by_value_and_trade_num() {
         let fields = r#","commission":{"units":"1","nano":0,"currency":"rub"}"#;
         let first = trading_operation_with_fields(TradingOperationFields {
             operation_type: "OPERATION_TYPE_BUY",

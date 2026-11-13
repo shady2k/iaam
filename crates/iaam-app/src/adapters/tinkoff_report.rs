@@ -70,7 +70,7 @@ impl TinkoffChannel {
         from: Date,
         to: Date,
         context: BrokerRequestContext<'_>,
-    ) -> Result<(), BrokerError> {
+    ) -> Result<Vec<serde_json::Value>, BrokerError> {
         let dates: Vec<_> = operations
             .iter()
             .filter(|operation| needs_report_payment(operation))
@@ -94,7 +94,7 @@ impl TinkoffChannel {
                         phase = "resolve_report_payment",
                         "broker report unavailable; subminor payments remain refused"
                     );
-                    return Ok(());
+                    return Ok(rows);
                 }
                 Err(error) => return Err(error),
             }
@@ -113,7 +113,7 @@ impl TinkoffChannel {
                 ),
             }
         }
-        Ok(())
+        Ok(rows)
     }
 
     pub(super) async fn read_settlement_report(
@@ -158,7 +158,10 @@ impl TinkoffChannel {
         diagnostic: bool,
     ) -> Result<Vec<serde_json::Value>, BrokerError> {
         let (from, to) = period;
-        if diagnostic && !self.client.diagnostic_report_allowed().await {
+        if diagnostic
+            && (context.allowance.remaining() <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
+                || !self.client.wait_diagnostic_report(context.deadline).await)
+        {
             tracing::debug!(
                 phase = "broker_report", account, from = %from, to = %to,
                 status = "skipped", reason = "low_rate_capacity_or_host_pause",
@@ -201,7 +204,11 @@ impl TinkoffChannel {
             // The shared allowance and deadline apply to every poll, too.
             let mut polls = 0;
             let body = loop {
-                if diagnostic && !self.client.diagnostic_report_allowed().await {
+                if diagnostic
+                    && (context.allowance.remaining()
+                        <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
+                        || !self.client.wait_diagnostic_report(context.deadline).await)
+                {
                     tracing::debug!(
                         phase = "broker_report", account, from = %from, to = %to,
                         page = page_number, status = "skipped", reason = "low_rate_capacity_or_host_pause",

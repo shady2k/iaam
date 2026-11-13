@@ -133,6 +133,12 @@ impl RequestAllowance {
         self.state.ceiling
     }
 
+    /// Attempts still available to the original caller, including optional reads.
+    #[must_use]
+    pub fn remaining(&self) -> u32 {
+        self.state.remaining.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn take(&self) -> bool {
         let mut remaining = self.state.remaining.load(Ordering::SeqCst);
         while let Some(next) = remaining.checked_sub(1) {
@@ -708,6 +714,20 @@ mod tests {
         );
         assert!(Destination::TinkoffSandbox.base_url().contains("sandbox"));
         assert!(!Destination::TinkoffProd.base_url().contains("sandbox"));
+    }
+
+    #[test]
+    fn allowance_remaining_tracks_the_shared_original_budget() {
+        let allowance = RequestAllowance::new(2);
+        let shared = allowance.clone();
+        assert_eq!(allowance.remaining(), 2);
+        assert!(shared.take());
+        assert_eq!(allowance.remaining(), 1);
+        assert!(allowance.take());
+        assert!(!shared.take());
+        assert_eq!(shared.remaining(), 0);
+        shared.give_back();
+        assert_eq!(allowance.remaining(), 1);
     }
 
     #[test]

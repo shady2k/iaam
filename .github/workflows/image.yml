@@ -1,0 +1,168 @@
+name: Publish image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Revision to build (must belong to main history)
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/shady2k/iaam
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+      short: ${{ steps.revision.outputs.short }}
+      created: ${{ steps.revision.outputs.created }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: Resolve and validate revision
+        id: revision
+        shell: bash
+        run: |
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          sha=$(git rev-parse --verify 'HEAD^{commit}')
+          git merge-base --is-ancestor "$sha" origin/main || {
+            echo 'Only revisions reachable from origin/main may be published.' >&2
+            exit 1
+          }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+            optional: false
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+            optional: true
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push native image by digest
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/shady2k/iaam,push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/shady2k/iaam
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.created=${{ needs.resolve.outputs.created }}
+            org.opencontainers.image.title=iaam
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [resolve, build]
+    # A failed optional build must not suppress publication of amd64.
+    if: ${{ always() && !cancelled() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assemble manifest list
+        id: manifest
+        env:
+          REVISION: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          amd64=("$RUNNER_TEMP"/digests/digest-amd64/*)
+          if [ "${#amd64[@]}" -ne 1 ]; then
+            echo 'The amd64 digest is required.' >&2
+            exit 1
+          fi
+          sources=()
+          for file in "$RUNNER_TEMP"/digests/digest-*/*; do
+            digest=${file##*/}
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            sources+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create \
+            --tag "$IMAGE:sha-$REVISION" \
+            --tag "$IMAGE:$SHORT" "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:sha-$REVISION" --format '{{.Manifest.Digest}}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Verify published image
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+          REVISION: ${{ needs.resolve.outputs.sha }}
+        shell: bash
+        run: |
+          image="$IMAGE@$DIGEST"
+          docker buildx imagetools inspect "$image"
+          docker buildx imagetools inspect "$image" --raw > "$RUNNER_TEMP/manifest.json"
+          jq -e 'any(.manifests[]; .platform.os == "linux" and .platform.architecture == "amd64")' "$RUNNER_TEMP/manifest.json"
+          docker pull --platform linux/amd64 "$image"
+          docker image inspect "$image" > "$RUNNER_TEMP/image.json"
+          jq -e '.[0].Config | .User == "10001:10001" and (.Env | length == 1 and (.[0] | startswith("PATH=")))' "$RUNNER_TEMP/image.json"
+          platforms=$(jq -r '[.manifests[].platform | select(.os == "linux") | .os + "/" + .architecture] | unique | join(", ")' "$RUNNER_TEMP/manifest.json")
+          {
+            echo "Image: \`$image\`"
+            echo "Platforms: $platforms"
+            echo "Source revision: $REVISION"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest published manifest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ghcr.io/shady2k/iaam
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true

@@ -646,6 +646,29 @@ and no `--detach`. The service does not need to be stopped for any of them,
 except a change to the key the running server reads, which needs a restart
 (§6.1).
 
+### 3.8 Pull the published image
+
+The public package `ghcr.io/shady2k/iaam` needs no pull secret. Publish it by
+manually dispatching **Publish image** (`.github/workflows/image.yml`) in GitHub
+Actions, with `ref` set to `main` (the default) or a revision in main's history.
+There is no automatic publication and no `latest` tag. The workflow summary
+records the source revision, available platforms and manifest digest. Native
+amd64 is required; arm64 is included when its build succeeds.
+
+Tags name immutable revisions: `sha-<revision>` uses the full commit SHA, and
+`<short-sha>` is its first 12 characters. For an exact artifact, use the digest
+from the workflow summary rather than rebuilding the revision:
+
+```sh
+docker pull ghcr.io/shady2k/iaam:sha-<revision>
+# Or pin the exact published manifest:
+docker pull ghcr.io/shady2k/iaam@sha256:<digest>
+```
+
+Replace the placeholders with the published values. A successful pull prints
+`Digest: sha256:…`. Use that image reference instead of `iaam:0.1.0` in the
+commands above; all mounts, run-time variables and access controls still apply.
+
 ---
 
 ## 4. Route B — binary on the host

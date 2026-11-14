@@ -827,6 +827,7 @@ mod tests {
     use super::*;
     use crate::destination::Destination;
     use crate::gateway::BootTime;
+    use crate::test_log::Log;
 
     /// A clock the test moves by hand in wall time, which is what the
     /// entries are stamped with.
@@ -1169,6 +1170,20 @@ mod tests {
         std::fs::read(place.join(key.hex())).expect("the entry reads")
     }
 
+    /// A current-format entry whose integrity header is computed over
+    /// `answer`, so a test can write metadata or a body no store would make
+    /// and still reach the parser's own checks.
+    fn entry_with(answer: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "{ENTRY_VERSION}\nlength {}\nchecksum {}\n",
+            answer.len(),
+            hex(&Sha256::digest(answer))
+        )
+        .into_bytes();
+        bytes.extend_from_slice(answer);
+        bytes
+    }
+
     fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack
             .windows(needle.len())
@@ -1261,6 +1276,119 @@ mod tests {
             rewritten.starts_with(ENTRY_VERSION.as_bytes()),
             "the rewritten entry is the current format"
         );
+    }
+
+    #[test]
+    fn an_entry_in_the_earlier_format_is_stamped_for_the_read_that_discards_it() {
+        let time = Shifted::new();
+        let (cache, place) = cache("old-format-stamped", &time);
+        let key = CacheKey::of(&moex_read()).expect("a GET is cached");
+        let earlier = place.join(key.hex());
+        let stored = cache.stored_now();
+        std::fs::write(
+            &earlier,
+            format!(
+                "{ENTRY_LEGACY_VERSION}\nstored {stored}\nstatus 200\nretry-after-ms -\nlocation -\ncontent-type -\nrequest-id -\npage"
+            ),
+        )
+        .expect("the earlier-format entry is written");
+
+        // The sweep measures an entry of the earlier format by its own stamp,
+        // so a fresh one is kept for the read that wants it instead of being
+        // deleted unseen.
+        assert_eq!(stamp_of(&earlier), Some(stored));
+
+        let log = Log::capture();
+        assert_eq!(
+            cache.lookup(&key),
+            None,
+            "an entry in the earlier format is never served"
+        );
+        assert!(
+            !earlier.exists(),
+            "the discarded entry is removed from the store"
+        );
+        log.assert_line(
+            "WARN",
+            "a cached answer was discarded",
+            &["the file is not an entry format this build serves"],
+        );
+    }
+
+    /// The entries this build cannot serve, each with the reason the
+    /// operator's log must give for discarding it.
+    fn unusable_entries(
+        cache: &ResponseCache,
+        place: &Path,
+    ) -> Vec<(CacheKey, Vec<u8>, &'static str)> {
+        let page = |number: u32| CacheKey::of(&moex_read().with_query("page", &number.to_string()));
+        let store = |number: u32| {
+            let key = page(number).expect("a read is cached");
+            cache.store(&key, &answered(200, b"page"), None, None);
+            let bytes = entry_bytes(place, &key);
+            (key, bytes)
+        };
+
+        let (truncated, whole) = store(1);
+        let (flipped_metadata, mut flipped_body) = store(2);
+        let body = position(&flipped_body, b"page").expect("the body is in the entry");
+        flipped_body[body] ^= 1;
+        // A whole entry, integrity header and all, whose status line is not
+        // a status.
+        let unreadable_status =
+            entry_with(format!("stored {}\nstatus two hundred\n", cache.stored_now()).as_bytes());
+
+        vec![
+            (
+                truncated,
+                whole[..whole.len() - 2].to_vec(),
+                "the entry is shorter or longer than its recorded length",
+            ),
+            (
+                flipped_metadata,
+                flipped_body,
+                "the entry does not match its recorded checksum",
+            ),
+            (
+                page(3).expect("a read is cached"),
+                unreadable_status,
+                "the entry's metadata lines are not a stored answer",
+            ),
+        ]
+    }
+
+    /// The integrity header's own refusals, read by the parser directly: a
+    /// file whose `stored` line cannot be read is deleted by the sweep before
+    /// any read parses it, so the file the store would never keep is handed
+    /// to the parser here.
+    #[test]
+    fn an_integrity_header_that_is_not_a_number_or_stops_early_is_a_metadata_fault() {
+        for bytes in [
+            &b"iaam-response-cache-v2\nlength twelve\nchecksum 0\nstored 5\nstatus 200\n"[..],
+            b"iaam-response-cache-v2\nlength 0\nstored 5\n",
+        ] {
+            assert!(
+                matches!(Entry::parse(bytes), Err(Unusable::Metadata)),
+                "{} is not a metadata fault",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn every_unusable_entry_is_a_miss_removed_and_logged_with_its_reason() {
+        let time = Shifted::new();
+        let (cache, place) = cache("unusable", &time);
+        // Each discard is read against its own capture, so one reason cannot
+        // stand in for another.
+        for (key, bytes, reason) in unusable_entries(&cache, &place) {
+            let path = place.join(key.hex());
+            std::fs::write(&path, &bytes).expect("the unusable entry is written");
+            let log = Log::capture();
+            assert_eq!(cache.lookup(&key), None, "{reason}");
+            assert!(!path.exists(), "the unusable entry is removed: {reason}");
+            log.assert_line("WARN", "a cached answer was discarded", &[reason]);
+        }
     }
 
     #[test]

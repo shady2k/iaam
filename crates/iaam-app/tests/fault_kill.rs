@@ -201,17 +201,20 @@ async fn a_kill_before_commit_leaves_nothing_and_the_retry_records_the_batch() {
     let database = directory.file("iaam.sqlite");
     let (owner, account) = seed(&database).await;
 
+    // The batch's second write, not its first: a store that committed each
+    // event on its own would leave the first one behind and pass a threshold of
+    // one.
     let KillAt { store, child } = kill(
         &directory,
         "killed_before_commit_child",
         fault::BEFORE_COMMIT,
-        Some(1),
+        Some(2),
         &database,
         (owner, account),
     );
     assert!(
         child.marker.exists(),
-        "the child was killed at the before-commit barrier"
+        "the child was killed after the batch's second write, before COMMIT"
     );
     let store = SqliteAdapter::new(store);
     assert!(
@@ -220,7 +223,7 @@ async fn a_kill_before_commit_leaves_nothing_and_the_retry_records_the_batch() {
             .await
             .expect("the killed database reopens")
             .is_empty(),
-        "a kill inside the transaction leaves none of the three"
+        "a kill inside the transaction leaves none of the three, although two were written"
     );
 
     let retried = store

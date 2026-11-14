@@ -114,22 +114,53 @@ pub(crate) fn migration_point(point: &str) {
 }
 
 fn stop_if_armed(point: &str, writes: Option<usize>) {
-    let marker = {
+    // Decided under the lock, acted on outside it: the unreached-threshold
+    // panic must not poison the mutex on its way out.
+    let decision = {
         let armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
         match armed.as_ref() {
-            Some(armed)
-                if armed.point == point
-                    && writes.is_none_or(|writes| armed.after_write == Some(writes)) =>
-            {
-                armed.marker.clone()
-            }
-            _ => return,
+            Some(armed) if armed.point == point => match (armed.after_write, writes) {
+                (None, None) => Decision::Stop(armed.marker.clone()),
+                (Some(expected), Some(actual)) if expected == actual => {
+                    Decision::Stop(armed.marker.clone())
+                }
+                // The named point was reached with no write count — the commit
+                // — while a later write was armed: the work made fewer writes
+                // than the test asked to be killed after, and stopping here
+                // would prove nothing about a kill in the middle of a batch. A
+                // green run that never reached its condition is worse than a
+                // red one, so this fails instead.
+                (Some(expected), None) => Decision::Unreached { expected },
+                _ => Decision::Pass,
+            },
+            _ => Decision::Pass,
         }
     };
-    std::fs::write(&marker, point.as_bytes()).expect("the fault barrier marker is written");
-    loop {
-        thread::sleep(Duration::from_secs(60));
+    match decision {
+        Decision::Pass => {}
+        Decision::Unreached { expected } => panic!(
+            "the fault barrier at {point} was armed after write {expected}, but the work reached \
+             it without ever making that many writes: the transaction is shorter than the test \
+             assumes, so the kill would prove nothing"
+        ),
+        Decision::Stop(marker) => {
+            std::fs::write(&marker, point.as_bytes()).expect("the fault barrier marker is written");
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
     }
+}
+
+/// What [`stop_if_armed`] decided to do, taken outside the lock.
+enum Decision {
+    /// Not this point, or not the armed write.
+    Pass,
+    /// The armed write of the armed point: touch the marker and wait to be
+    /// killed.
+    Stop(PathBuf),
+    /// The armed point was reached with fewer writes than were armed.
+    Unreached { expected: usize },
 }
 
 /// A child that reached its barrier and was killed by [`kill_at`].
@@ -222,7 +253,8 @@ fn wait_for_marker(child: &mut Child, marker: &Path) {
         assert_eq!(
             child.try_wait().expect("child status"),
             None,
-            "the child exited before the fault barrier"
+            "the child exited before the fault barrier, or reached the commit with fewer \
+             writes than the barrier was armed after; its own message says which"
         );
         thread::sleep(Duration::from_millis(1));
     }

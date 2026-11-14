@@ -5,6 +5,13 @@
 //! `rusqlite` blocks the thread, and calling it directly from an axum handler
 //! stops the executor (§3.2).
 
+/// The kill harness (ADR 0042 point 7) is a test fixture, never a production
+/// surface: a release build that enables it is refused.
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!(
+    "iaam-store feature `test-support` requires debug assertions and cannot be enabled in release builds"
+);
+
 pub mod broker_access;
 pub mod broker_egress;
 pub mod broker_operation_kinds;
@@ -15,6 +22,12 @@ pub mod bundle;
 pub mod categories;
 pub mod decisions;
 pub mod documents;
+/// Named stop points for the child-process kill harness (ADR 0042 point 7).
+///
+/// Test-only, like the raw connection: it exists under `cfg(test)` or the
+/// `test-support` feature, and the feature is refused in release builds.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fault;
 pub mod import_session;
 pub mod journal;
 pub mod reference;
@@ -403,15 +416,25 @@ impl SqliteStore {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| convert(error.into()))?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::transaction_began();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
         match outcome {
-            Ok(Ok(value)) => match self.conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(value),
-                Err(error) => {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    Err(convert(error.into()))
+            Ok(Ok(value)) => {
+                #[cfg(any(test, feature = "test-support"))]
+                crate::fault::transaction_point(crate::fault::BEFORE_COMMIT);
+                match self.conn.execute_batch("COMMIT") {
+                    Ok(()) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        crate::fault::transaction_point(crate::fault::AFTER_COMMIT);
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        Err(convert(error.into()))
+                    }
                 }
-            },
+            }
             Ok(Err(error)) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)

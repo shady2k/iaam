@@ -171,6 +171,8 @@ fn append_in_order(
         ..event.clone()
     };
     write::insert_event_in(conn, &stamped)?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::fault::write_completed();
     Ok(Appended::Inserted { id: stamped.id })
 }
 

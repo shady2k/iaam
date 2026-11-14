@@ -151,11 +151,22 @@ pub enum StoreError {
     /// where the number already points.
     #[error("broker account is already bound to account {account}")]
     BrokerAccountBindingHeld { account: String },
-    #[error("a synchronization run is already in progress for {source_id}/{dataset}/{series_key}")]
+    /// Another run of the series holds its lease.
+    ///
+    /// Carries the lease's expiry, because the honest answer to a caller
+    /// refused this way is when the same call is worth making again: the lease
+    /// is an availability limit, not a data-safety one, and a sync killed
+    /// between taking its lease and publishing its run holds it until it
+    /// expires.
+    #[error(
+        "a synchronization run is already in progress for {source_id}/{dataset}/{series_key}, \
+         until {lease_expires_at}"
+    )]
     LeaseHeld {
         source_id: String,
         dataset: String,
         series_key: String,
+        lease_expires_at: OffsetDateTime,
     },
     #[error("synchronization run lease has expired")]
     LeaseExpired,

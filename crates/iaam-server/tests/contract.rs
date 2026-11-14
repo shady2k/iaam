@@ -36064,6 +36064,92 @@ async fn an_unreachable_market_source_answers_503_with_when_to_retry() {
     assert!(message.starts_with("cbr is unavailable"), "{message}");
 }
 
+/// A market source that stays inside its first call until the test releases it,
+/// so a second sync of the same series arrives while the first holds the lease.
+struct HeldMarket {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl OutboundHttp for HeldMarket {
+    async fn send(&self, _request: iaam_http::HttpRequest) -> Result<OutboundResponse, AppError> {
+        self.entered.add_permits(1);
+        let _permit = self
+            .release
+            .acquire()
+            .await
+            .expect("the test releases the held source");
+        Err(AppError::SourceUnreachable {
+            origin: "cbr".to_owned(),
+            detail: "released by the test".to_owned(),
+            retry_after: None,
+        })
+    }
+}
+
+/// A series another sync is running on answers 409 with its own code and
+/// `Retry-After`, never a 500 from the store: the second sync of this branch's
+/// world is ordinary, and so is a lease left by a sync a kill interrupted
+/// (iaam-mkbfh.8.2, ADR 0042 §9 of the API conventions).
+#[tokio::test]
+async fn a_second_sync_of_one_series_answers_409_naming_when_the_lease_ends() {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let harness = harness_with_http(Arc::new(HeldMarket {
+        entered: entered.clone(),
+        release: release.clone(),
+    }))
+    .await;
+    let body = json!({
+        "source": { "source": "cbr_key_rate" },
+        "from": "2026-02-01",
+        "to": "2026-02-28"
+    });
+
+    let first = {
+        let router = harness.router.clone();
+        let request = post("/v1/market/sync", &harness.owner_token, &body);
+        tokio::spawn(async move { call_raw(&router, request).await })
+    };
+    let permit = entered
+        .acquire()
+        .await
+        .expect("the first sync reaches its source with the lease already taken");
+
+    let (status, headers, bytes) = call_raw(
+        &harness.router,
+        post("/v1/market/sync", &harness.owner_token, &body),
+    )
+    .await;
+    let response: Value = serde_json::from_slice(&bytes).expect("a JSON error body");
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(response["code"], "sync_in_progress");
+    let wait: u64 = headers
+        .get("retry-after")
+        .expect("the refusal carries Retry-After")
+        .to_str()
+        .expect("Retry-After is text")
+        .parse()
+        .expect("Retry-After is whole seconds");
+    assert!(
+        (1..=600).contains(&wait),
+        "the wait is what is left of the lease: {wait}"
+    );
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.contains("already in progress"), "{message}");
+    assert!(message.contains("cbr"), "{message}");
+
+    drop(permit);
+    release.add_permits(1);
+    let (status, _headers, _bytes) = first.await.expect("the first sync finishes");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the first sync reports the source it was released from"
+    );
+}
+
 #[tokio::test]
 async fn a_market_source_that_refuses_answers_502() {
     let (status, headers, response) = market_sync_through_failing_source(AppError::SourceRefused {
@@ -36124,6 +36210,23 @@ async fn the_broker_sync_openapi_declares_its_ceiling_unreachable_and_refusing_a
         .unwrap_or_else(|| panic!("the sync route declares no 422: {responses}"));
     assert!(ceiling.contains("300"), "{ceiling}");
     assert!(ceiling.contains("narrow"), "{ceiling}");
+}
+
+#[tokio::test]
+async fn the_market_sync_openapi_declares_its_running_sync_refusal() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let responses = &spec["paths"]["/v1/market/sync"]["post"]["responses"];
+    let running = responses["409"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the market sync route declares no 409: {responses}"));
+    assert!(running.contains("sync_in_progress"), "{running}");
+    assert!(running.contains("Retry-After"), "{running}");
+    assert!(
+        responses["409"]["headers"]["Retry-After"].is_object(),
+        "{responses}"
+    );
 }
 
 #[tokio::test]

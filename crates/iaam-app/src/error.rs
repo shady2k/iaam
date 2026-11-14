@@ -176,6 +176,22 @@ pub enum AppError {
     /// answer changes.
     #[error("the answer from {origin} could not be read: {detail}")]
     SourceUnreadable { origin: String, detail: String },
+    /// A sync of this series is already running and holds its lease.
+    ///
+    /// Separate from `Conflict` («the record already exists: revoke it») and
+    /// from `Store` (our own side failed): nothing is wrong with the request
+    /// and nothing is wrong with the store — the same call is worth sending
+    /// again once the running sync has finished. `retry_after` is what is left
+    /// of the lease, which `iaam-store` knows and this layer does not: the
+    /// lease is the one market write before the network, an availability limit
+    /// rather than data safety (ADR 0042), so a sync killed between its lease
+    /// and its publication holds the series for up to ten minutes and the
+    /// caller is told when to come back.
+    #[error("a synchronisation of {series} is already in progress")]
+    SyncInProgress {
+        series: String,
+        retry_after: std::time::Duration,
+    },
 }
 
 /// A rejected request field, and everything the server can say about it.
@@ -374,6 +390,7 @@ impl AppError {
             Self::SourceUnreadable { .. } => "source_unreadable",
             Self::BrokerAccountUnseen { .. } => "broker_account_unseen",
             Self::BrokerAccountAmbiguous { .. } => "broker_account_ambiguous",
+            Self::SyncInProgress { .. } => "sync_in_progress",
         }
     }
 }

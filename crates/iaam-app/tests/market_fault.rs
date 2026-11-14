@@ -336,23 +336,26 @@ async fn a_kill_inside_publication_leaves_nothing_and_a_rerun_publishes_everythi
     let instrument = InstrumentId::new_random();
     seed(&database, instrument);
 
+    // The publication's second write, not its first: the page carries one
+    // price row and one accrued-interest row, and a store that committed each
+    // write on its own would leave the first behind.
     let KillAt { child, .. } = kill(
         &directory,
         "killed_before_commit_child",
         fault::BEFORE_COMMIT,
-        Some(1),
+        Some(2),
         &database,
         instrument,
     );
     assert!(
         child.marker.exists(),
-        "the child was killed inside the publication transaction"
+        "the child was killed inside the publication transaction, after its second write"
     );
     let interrupted = published(&database, instrument);
     assert_eq!(
         interrupted.prices,
         Vec::<String>::new(),
-        "a kill inside the transaction leaves no price"
+        "a kill inside the transaction leaves no price, although one was written"
     );
     assert_eq!(
         interrupted.accrued,
@@ -368,12 +371,30 @@ async fn a_kill_inside_publication_leaves_nothing_and_a_rerun_publishes_everythi
 
     // The interrupted run still holds the series' lease, which is the owner's
     // decision: the lease is the one write before the network. It is released
-    // by expiry, and until then the series is not synced again.
+    // by expiry, and until then the series is not synced again — and the
+    // refusal says so in terms of when, not of a store that failed.
     let refused = sync(&database, instrument).await;
-    assert!(
-        refused.is_err(),
-        "the interrupted run's lease still holds: {refused:?}"
-    );
+    match refused {
+        Err(AppError::SyncInProgress {
+            series,
+            retry_after,
+        }) => {
+            assert_eq!(
+                series,
+                format!(
+                    "moex-iss/prices/{}:TQOB",
+                    instrument.inner()
+                ),
+                "the refusal names the series whose lease is held"
+            );
+            assert!(
+                retry_after > std::time::Duration::ZERO
+                    && retry_after <= std::time::Duration::from_secs(600),
+                "the wait is what is left of the ten-minute lease: {retry_after:?}"
+            );
+        }
+        other => panic!("expected the lease refusal, got {other:?}"),
+    }
 
     // Expire the lease, as the next start of the day would.
     {

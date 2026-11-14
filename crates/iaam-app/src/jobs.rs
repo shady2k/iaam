@@ -621,6 +621,13 @@ mod tests {
         assert!(spends_the_day(&Err(unreachable)));
         assert!(spends_the_day(&Err(refused)));
         assert!(!spends_the_day(&Err(AppError::Store("locked".to_owned()))));
+        // Another sync of the series holds its lease: the day's attempt is not
+        // spent, because the next tick after the lease runs out is when this
+        // sync is worth making (ADR 0042: the lease is an availability limit).
+        assert!(!spends_the_day(&Err(AppError::SyncInProgress {
+            series: "moex-iss/prices/SU26238RMFS4:TQOB".to_owned(),
+            retry_after: std::time::Duration::from_secs(600),
+        })));
     }
 
     #[test]

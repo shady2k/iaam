@@ -478,6 +478,24 @@ fn store_error(error: iaam_store::StoreError) -> AppError {
         iaam_store::StoreError::BrokerAccountBindingHeld { account } => AppError::Conflict {
             what: format!("broker account is already bound to account {account}"),
         },
+        // A series another sync is running on is not a store failure: the
+        // store is fine, the journal holds nothing of the second attempt, and
+        // the same call is worth making again once the lease it names has run
+        // out. Answering `Store` here would send the caller to investigate the
+        // database for a limit that is only about when (ADR 0042, decision
+        // 0042's «the market sync lease is an availability limit»).
+        iaam_store::StoreError::LeaseHeld {
+            source_id,
+            dataset,
+            series_key,
+            lease_expires_at,
+        } => AppError::SyncInProgress {
+            series: format!("{source_id}/{dataset}/{series_key}"),
+            retry_after: std::time::Duration::try_from(
+                lease_expires_at - time::OffsetDateTime::now_utc(),
+            )
+            .unwrap_or_default(),
+        },
         other => AppError::Store(other.to_string()),
     }
 }

@@ -488,6 +488,30 @@ impl ApiFailure {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ApiError::simple(error.code(), error.to_string()),
             ),
+            // A series another sync is running on: 409 says the request is
+            // not the problem, and `Retry-After` says when the same call is
+            // worth making again. It is not `already_exists`, which sends the
+            // owner to revoke a record, and not a 500, which sends him to
+            // investigate the database for a wait (ADR 0042).
+            AppError::SyncInProgress {
+                ref series,
+                retry_after,
+            } => {
+                let seconds = retry_after_seconds(retry_after);
+                let mut failure = Self::new(
+                    StatusCode::CONFLICT,
+                    ApiError::simple(
+                        error.code(),
+                        format!(
+                            "a synchronisation of {series} is already in progress: the running \
+                             sync holds its lease for another {seconds} seconds, as Retry-After \
+                             says, and nothing of this attempt was written"
+                        ),
+                    ),
+                );
+                failure.retry_after = Some(seconds);
+                failure
+            }
             // The source is down, not our store: 503 says the same call is worth
             // making again, and `Retry-After` says when, where the gateway knew.
             // A wait it did not know is left out rather than guessed.
@@ -615,5 +639,26 @@ mod tests {
     fn a_wait_under_a_second_is_never_published_as_none() {
         assert_eq!(retry_after_seconds(Duration::ZERO), 1);
         assert_eq!(retry_after_seconds(Duration::from_millis(300)), 1);
+    }
+
+    /// A series another sync is running on is a conflict with a wait, not a
+    /// store failure: the caller is told when to come back, and no
+    /// `already_exists` sends it to revoke a record that does not exist.
+    #[test]
+    fn a_running_sync_is_a_conflict_with_the_lease_s_left_in_retry_after() {
+        let failure = ApiFailure::from(AppError::SyncInProgress {
+            series: "moex-iss/prices/SU26238RMFS4:TQOB".to_owned(),
+            retry_after: Duration::from_millis(2_001),
+        });
+        assert_eq!(failure.status, StatusCode::CONFLICT);
+        let response = failure.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("3"),
+            "a fraction past a whole second waits the whole next one"
+        );
     }
 }

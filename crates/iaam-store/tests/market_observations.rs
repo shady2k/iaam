@@ -576,14 +576,15 @@ fn accrued_interest_is_invisible_before_its_knowledge_coordinate() {
 }
 
 #[test]
-fn a_second_run_on_the_same_series_is_refused_while_the_lease_holds() {
+fn a_second_run_on_the_same_series_is_refused_naming_when_the_lease_ends() {
     let (mut store, _) = store_with_instrument();
+    let held = lease();
     let _first = store
         .begin_run(
             series("SBER:TQBR:1"),
             date!(2026 - 08 - 03),
             date!(2026 - 08 - 03),
-            lease(),
+            held,
         )
         .expect("first lease");
     let refused = store.begin_run(
@@ -593,7 +594,22 @@ fn a_second_run_on_the_same_series_is_refused_while_the_lease_holds() {
         lease(),
     );
 
-    assert!(matches!(refused, Err(StoreError::LeaseHeld { .. })));
+    // The expiry travels with the refusal: it is what tells a caller when the
+    // same call is worth making again, and only this store knows it.
+    match refused {
+        Err(StoreError::LeaseHeld {
+            source_id,
+            dataset,
+            series_key,
+            lease_expires_at,
+        }) => {
+            assert_eq!(source_id, "moex-iss");
+            assert_eq!(dataset, "prices");
+            assert_eq!(series_key, "SBER:TQBR:1");
+            assert_eq!(lease_expires_at, held, "the refusal names the lease's end");
+        }
+        other => panic!("expected the lease refusal, got {other:?}"),
+    }
 }
 
 #[test]

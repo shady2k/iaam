@@ -164,20 +164,28 @@ impl SqliteStore {
             [&now],
         )?;
 
-        let active: Option<(String,)> = transaction
+        let active: Option<(String, String)> = transaction
             .query_row(
-                "SELECT id FROM sync_runs
+                "SELECT id, lease_expires_at FROM sync_runs
                  WHERE source_id = ?1 AND dataset = ?2 AND series_key = ?3
                    AND status = 'running'",
                 params![&series.source_id, &series.dataset, &series.series_key],
-                |row| Ok((row.get(0)?,)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if active.is_some() {
+        if let Some((_, expires)) = active {
+            // Every running row the statement above kept has an expiry: the
+            // expired ones were closed at the top of this transaction.
             return Err(StoreError::LeaseHeld {
                 source_id: series.source_id,
                 dataset: series.dataset,
                 series_key: series.series_key,
+                lease_expires_at: OffsetDateTime::parse(&expires, &Rfc3339).map_err(|_| {
+                    StoreError::InvalidValue {
+                        field: "lease_expires_at",
+                        value: expires,
+                    }
+                })?,
             });
         }
 

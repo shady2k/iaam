@@ -1,8 +1,8 @@
 {
   "strength": "block-new",
-  "currentMilestone": "m-broker-api",
+  "currentMilestone": "m-ready-answers",
   "milestoneLabels": [
-    "m-broker-api"
+    "m-ready-answers"
   ],
   "areaLabels": [
     "area-broker",
@@ -28,7 +28,7 @@
   "findingLabels": [
     "findings"
   ],
-  "findingBudget": 27,
+  "findingBudget": 20,
   "staleDays": 14,
   "holdDays": 2,
   "bulkCluster": 20,

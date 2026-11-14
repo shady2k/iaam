@@ -19,6 +19,33 @@ use crate::client::{HttpClient, REQUEST_TIMEOUT};
 use crate::gateway::Transport;
 use crate::{HttpError, HttpRequest, HttpResponse};
 
+/// An armed stop point: the name the record write stops under, and the marker
+/// it touches to say so.
+type StopPoint = (&'static str, PathBuf);
+
+fn arm(armed: &Mutex<Option<StopPoint>>, point: &'static str, marker: &Path) {
+    *armed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((point, marker.to_owned()));
+}
+
+/// Stops at `point` when a test armed it; never returns once it stops.
+fn stop_at(armed: &Mutex<Option<StopPoint>>, point: &'static str) {
+    let marker = {
+        let armed = armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match armed.as_ref() {
+            Some((armed_point, marker)) if *armed_point == point => marker.clone(),
+            _ => return,
+        }
+    };
+    std::fs::write(&marker, point.as_bytes()).expect("the barrier marker is written");
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
 /// Where a test child stops inside the outbound tally's record writes.
 ///
 /// Named points are written by the tally itself (`tally-renamed` after the
@@ -28,32 +55,55 @@ use crate::{HttpError, HttpRequest, HttpResponse};
 /// on-disk pair is exactly what a kill between those steps leaves.
 ///
 /// Only the last armed point is honoured, and a process that never arms one
-/// passes every point. This module exists only in debug builds.
-static ARMED_TALLY_BARRIER: Mutex<Option<(&'static str, PathBuf)>> = Mutex::new(None);
+/// passes every point. This module exists in test builds and wherever the
+/// `test-support` feature is on.
+static ARMED_TALLY_BARRIER: Mutex<Option<StopPoint>> = Mutex::new(None);
 
 /// Arms the stop point `point`: reaching it touches `marker` and waits to be
 /// killed. Reaching any other point does nothing.
 pub fn arm_tally_barrier(point: &'static str, marker: &Path) {
-    *ARMED_TALLY_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((point, marker.to_owned()));
+    arm(&ARMED_TALLY_BARRIER, point, marker);
 }
 
 /// Stops at `point` when a test armed it; never returns once it stops.
 pub(crate) fn tally_barrier(point: &'static str) {
-    let marker = {
-        let armed = ARMED_TALLY_BARRIER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match armed.as_ref() {
-            Some((armed_point, marker)) if *armed_point == point => marker.clone(),
-            _ => return,
-        }
-    };
-    std::fs::write(&marker, point.as_bytes()).expect("the tally barrier marker is written");
-    loop {
-        thread::sleep(Duration::from_secs(60));
+    stop_at(&ARMED_TALLY_BARRIER, point);
+}
+
+/// Where a test makes an outbound tally write fail, standing in for a disk
+/// that answers `EIO` after the tally has taken its new name.
+///
+/// The one point, `tally-renamed`, is reached after the tally rename and its
+/// directory `fsync`; a failure there stands for the generation record's
+/// rename or the second directory `fsync` failing. The arming names the
+/// tally's directory, so a test that runs beside others fails only its own
+/// writes.
+static ARMED_TALLY_FAILURE: Mutex<Option<StopPoint>> = Mutex::new(None);
+
+/// Makes the next write of the tally in `directory` fail with `EIO` at
+/// `point`.
+pub fn arm_tally_failure(point: &'static str, directory: &Path) {
+    arm(&ARMED_TALLY_FAILURE, point, directory);
+}
+
+/// The `EIO` a test armed for `point` in `directory`, if any. An armed
+/// failure is spent when it fires, so the next write behaves as usual.
+pub(crate) fn tally_failure(directory: &Path, point: &'static str) -> Option<std::io::Error> {
+    let mut armed = ARMED_TALLY_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let armed_here = armed
+        .as_ref()
+        .is_some_and(|(armed_point, armed_directory)| {
+            *armed_point == point && armed_directory == directory
+        });
+    if !armed_here {
+        return None;
     }
+    armed.take();
+    Some(std::io::Error::from_raw_os_error(
+        rustix::io::Errno::IO.raw_os_error(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -366,13 +366,17 @@ any older header is corruption, not a migration source. The two records carry
 the same generation, except for the one interrupted write the next read
 completes: a tally exactly one generation ahead of its record, or the first
 write's tally beside a record that is still empty, is completed under the tally
-lock, with the same identity checks, before any update. A tally behind its
-record stays a refused rollback, and a tally more than one generation ahead of
-its record is refused as well, so a tally restored alone is still detected. A
-process also remembers the highest matching generation it has read and refuses
-a later matching pair below that high-water mark, even if both files were rolled
-back together. Leftover temporary files are ignored; only the last complete
-tally and matching generation are read.
+lock, with the same identity checks, before any update. The empty-record
+completion is the interrupted first write's alone: beside any later generation
+an empty record is refused, because a pair may be emptied only by the
+controlled-stop procedure below. A pair emptied while a server is running, then
+interrupted on its first write, therefore needs that documented repair. A tally
+behind its record stays a refused rollback, and a tally more than one generation
+ahead of its record is refused as well, so a tally restored alone is still
+detected. A process also remembers the highest generation it has read or renamed
+into place and refuses a later matching pair below that high-water mark, even if
+both files were rolled back together. Leftover temporary files are ignored; only
+the last complete tally and matching generation are read.
 
 Do not copy, alias, replace, delete or truncate a live egress directory or any
 record in it. The process verifies the path and held inodes before each

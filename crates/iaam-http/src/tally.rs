@@ -501,10 +501,6 @@ impl OutboundTally {
                 state.hosts.insert(host.to_owned(), HostState::default());
             }
             self.persist(&state, tally_identity, generation_identity)?;
-            self.directory
-                .0
-                .generation_high_water
-                .fetch_max(state.generation, Ordering::AcqRel);
             Ok(true)
         })();
         let unlocked = FileExt::unlock(&lock).map_err(|source| TallyError::File {
@@ -996,10 +992,6 @@ impl OutboundTally {
                     TallyError::Corrupt("the tally generation is exhausted".to_owned())
                 })?;
                 self.persist(&state, tally_identity, generation_identity)?;
-                self.directory
-                    .0
-                    .generation_high_water
-                    .fetch_max(state.generation, Ordering::AcqRel);
             } else {
                 self.directory.verify_child(TALLY_FILE, tally_identity)?;
                 self.directory
@@ -1172,9 +1164,27 @@ impl OutboundTally {
         // read completes, never a record ahead of its tally, which is a
         // rollback that spends nothing and refuses (ADR 0042 point 5).
         self.replace_child(TALLY_TEMP_FILE, TALLY_FILE, "replace the tally file")?;
+        // The renamed tally is the new generation's durable proof: its sends
+        // are under that name from here. Raising the high-water now, not when
+        // `persist` returns, means a failure in the record's rename or the
+        // second directory `fsync` still refuses a later rollback to this
+        // generation, which would lose those sends (ADR 0042 point 5).
+        self.directory
+            .0
+            .generation_high_water
+            .fetch_max(state.generation, Ordering::AcqRel);
         self.sync_directory()?;
         #[cfg(any(test, feature = "test-support"))]
         crate::test_support::tally_barrier("tally-renamed");
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(source) =
+            crate::test_support::tally_failure(&self.directory.0.path, "tally-renamed")
+        {
+            return Err(TallyError::File {
+                action: "persist the tally generation",
+                source,
+            });
+        }
         self.replace_child(
             GENERATION_TEMP_FILE,
             GENERATION_FILE,
@@ -2724,5 +2734,53 @@ mod tests {
             "2\n",
             "a refusal writes nothing"
         );
+    }
+
+    #[test]
+    fn a_write_failing_after_the_tally_rename_leaves_that_generation_refused() {
+        let (temporary, _directory, tally) = tally("high-water-after-tally-rename");
+        let host = "https://broker.invalid";
+        let sent = ready_send(&tally, host, Duration::from_secs(10_000));
+        tally
+            .record_response(host, 200, None, &sent)
+            .unwrap_or_else(|error| panic!("record the response: {error}"));
+        let committed_tally =
+            std::fs::read(temporary.0.join(TALLY_FILE)).expect("the committed tally reads");
+        let committed =
+            State::parse(&String::from_utf8(committed_tally.clone()).expect("the tally is UTF-8"))
+                .expect("the committed tally parses")
+                .generation;
+
+        // The generation record's rename fails after the tally has taken the
+        // next generation's name: the write is not committed, but the tally
+        // under that name already holds the sends this write added.
+        crate::test_support::arm_tally_failure("tally-renamed", &temporary.0);
+        let next = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(120));
+        let failed = tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &next);
+        assert!(
+            matches!(failed, Err(TallyError::File { .. })),
+            "the record rename failure was not reported"
+        );
+        let interrupted =
+            std::fs::read(temporary.0.join(TALLY_FILE)).expect("the interrupted tally reads");
+        assert_eq!(
+            State::parse(&String::from_utf8(interrupted).expect("the tally is UTF-8"))
+                .expect("the interrupted tally parses")
+                .generation,
+            committed + 1,
+            "the failed write renamed the tally before it failed"
+        );
+
+        // Restoring the tally alone to the generation before the failure is a
+        // matching pair whose sends are older than the ones the rename made
+        // durable, so the process must refuse it.
+        std::fs::write(temporary.0.join(TALLY_FILE), committed_tally)
+            .expect("the older tally is restored");
+        let refused = tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &next);
+
+        let Err(TallyError::Corrupt(reason)) = refused else {
+            panic!("a tally restored below the failed write's generation was accepted");
+        };
+        assert!(reason.contains("process generation high-water"), "{reason}");
     }
 }

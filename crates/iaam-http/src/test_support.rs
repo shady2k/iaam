@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -17,6 +18,43 @@ use std::time::Duration;
 use crate::client::{HttpClient, REQUEST_TIMEOUT};
 use crate::gateway::Transport;
 use crate::{HttpError, HttpRequest, HttpResponse};
+
+/// Where a test child stops inside the outbound tally's record writes.
+///
+/// Named points are written by the tally itself (`tally-renamed` after the
+/// tally rename and its directory `fsync`, `generation-repair-written` before
+/// a repaired generation record is renamed into place). A child arms one and
+/// the parent kills it there, which proves what a reopened process finds: the
+/// on-disk pair is exactly what a kill between those steps leaves.
+///
+/// Only the last armed point is honoured, and a process that never arms one
+/// passes every point. This module exists only in debug builds.
+static ARMED_TALLY_BARRIER: Mutex<Option<(&'static str, PathBuf)>> = Mutex::new(None);
+
+/// Arms the stop point `point`: reaching it touches `marker` and waits to be
+/// killed. Reaching any other point does nothing.
+pub fn arm_tally_barrier(point: &'static str, marker: &Path) {
+    *ARMED_TALLY_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((point, marker.to_owned()));
+}
+
+/// Stops at `point` when a test armed it; never returns once it stops.
+pub(crate) fn tally_barrier(point: &'static str) {
+    let marker = {
+        let armed = ARMED_TALLY_BARRIER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match armed.as_ref() {
+            Some((armed_point, marker)) if *armed_point == point => marker.clone(),
+            _ => return,
+        }
+    };
+    std::fs::write(&marker, point.as_bytes()).expect("the tally barrier marker is written");
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum BodyEnding {

@@ -142,13 +142,20 @@ entry in the same commit. Moved here from the tracker's memory store on
 
 ### What a worker's check must include
 
-- `cargo clippy --workspace --all-targets`, `cargo nextest run --workspace` and
-  `./scripts/check-architecture.sh`. The last runs in seconds and catches what
-  clippy and the tests pass: a crate depending on a higher layer, and checked
-  arithmetic in the shell crates, where every number comes from core. A type
-  both the store and ingest consume belongs in `iaam-core`.
-- A crate subset is not enough: `SCHEMA_VERSION` of `iaam-core` is pinned in
-  `crates/iaam-server/tests/contract.rs`.
+- The tests of **every crate the change touches, whole**
+  (`cargo nextest run -p <crate>` for each; a `--test` or name filter is never
+  the whole check), plus `cargo clippy --workspace --all-targets -- -D warnings`
+  and `./scripts/check-architecture.sh`. The last runs in seconds and catches
+  what clippy and the tests pass: a crate depending on a higher layer, and
+  checked arithmetic in the shell crates, where every number comes from core. A
+  type both the store and ingest consume belongs in `iaam-core`. The
+  whole-workspace suite, mutation testing, diff coverage and the ceiling proof
+  run **once, by the coordinator**, on the assembled branch before the pull
+  request is opened (owner's decision, 2026-09-30).
+- That is why the coordinator's workspace run before the pull request is not
+  optional: a crate subset misses what crosses crates. `SCHEMA_VERSION` of
+  `iaam-core` is pinned in `crates/iaam-server/tests/contract.rs`, so a change
+  touching it also runs `iaam-server`'s tests.
 - `cargo check -p` does not build test targets: a task touching `EventKind` runs
   the tests of every crate with integration tests on that variant.
 - A brief for a change to a public type or signature lists files by where the
@@ -220,3 +227,16 @@ entry in the same commit. Moved here from the tracker's memory store on
   was set for is merged** (`gh variable set POLICY_CHANGE_APPROVED --body 0`).
   While it is `1`, CI lets any branch change a quality-policy file; it was once
   left at `1` for two days after a merge.
+
+### Practices
+
+Practices are kept one per file under `docs/practices/` from the set's
+template; a retired one stays with its reason.
+
+- **PRA-001** (`docs/practices/PRA-001.md`): a sync-path change merges only
+  after a live full sync on its build.
+- **PRA-002** (`docs/practices/PRA-002.md`): a box worker runs commands in the
+  foreground and commits before its turn ends; the coordinator waits with
+  `box wait --strict` and answers exit 6 with "wait for it, then finish".
+- **PRA-003** (`docs/practices/PRA-003.md`): parentheses in a commit message
+  hold only the items the commit delivers; any other item is named bare.

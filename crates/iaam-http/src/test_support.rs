@@ -70,6 +70,25 @@ pub(crate) fn tally_barrier(point: &'static str) {
     stop_at(&ARMED_TALLY_BARRIER, point);
 }
 
+/// Where a test child stops inside a response-cache entry's publication.
+///
+/// Named points are written by the cache itself (`entry-written` between the
+/// entry's `fsync` and its rename, `entry-renamed` between the rename and the
+/// directory `fsync`). A child arms one and the parent kills it there, so the
+/// next lookup meets exactly what such a kill leaves.
+static ARMED_CACHE_BARRIER: Mutex<Option<StopPoint>> = Mutex::new(None);
+
+/// Arms the stop point `point`: reaching it touches `marker` and waits to be
+/// killed. Reaching any other point does nothing.
+pub fn arm_cache_barrier(point: &'static str, marker: &Path) {
+    arm(&ARMED_CACHE_BARRIER, point, marker);
+}
+
+/// Stops at `point` when a test armed it; never returns once it stops.
+pub(crate) fn cache_barrier(point: &'static str) {
+    stop_at(&ARMED_CACHE_BARRIER, point);
+}
+
 /// Where a test makes an outbound tally write fail, standing in for a disk
 /// that answers `EIO` after the tally has taken its new name.
 ///

@@ -414,7 +414,11 @@ impl ResponseCache {
             // crash leaves the previous answer or the whole new one, never a
             // half-written entry (ADR 0042 point 6).
             file.sync_all()?;
+            #[cfg(any(test, feature = "test-support"))]
+            crate::test_support::cache_barrier("entry-written");
             std::fs::rename(&temporary, self.directory.join(&name))?;
+            #[cfg(any(test, feature = "test-support"))]
+            crate::test_support::cache_barrier("entry-renamed");
             crate::egress::sync_directory(File::open(&self.directory)?)
         })();
         if let Err(source) = stored {
@@ -1448,5 +1452,126 @@ mod tests {
         let refused =
             cache_directory_for(&parent.join("iaam-second.sqlite")).expect_err("alias refused");
         assert!(refused.to_string().contains("hard links"), "{refused}");
+    }
+
+    #[test]
+    fn a_kill_between_the_entry_fsync_and_its_rename_serves_the_previous_answer() {
+        let clock = Shifted::new();
+        let (cache, place) = cache("kill-before-entry-rename", &clock);
+        let key = CacheKey::of(&moex_read()).expect("the read is cached");
+        cache.store(&key, &answered(200, b"the previous answer"), None, None);
+        assert_eq!(
+            cache
+                .lookup(&key)
+                .expect("the previous answer is served")
+                .body,
+            b"the previous answer"
+        );
+
+        let marker = place
+            .parent()
+            .expect("the cache place has a parent")
+            .join("written-reached");
+        let mut child = start_cache_store_child(&place, "entry-written", &marker);
+        wait_for_marker(&mut child, &marker);
+        child.kill().expect("cache child killed");
+        child.wait().expect("cache child reaped");
+
+        assert!(
+            std::fs::read_dir(&place)
+                .expect("the cache place reads")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".tmp"))),
+            "the kill leaves the unfinished entry beside the stored one"
+        );
+        assert_eq!(
+            cache
+                .lookup(&key)
+                .expect("the previous answer is served, not a half-written entry")
+                .body,
+            b"the previous answer"
+        );
+    }
+
+    #[test]
+    fn a_kill_after_the_entry_rename_serves_the_whole_new_answer() {
+        let clock = Shifted::new();
+        let (cache, place) = cache("kill-after-entry-rename", &clock);
+        let key = CacheKey::of(&moex_read()).expect("the read is cached");
+        cache.store(&key, &answered(200, b"the previous answer"), None, None);
+
+        let marker = place
+            .parent()
+            .expect("the cache place has a parent")
+            .join("renamed-reached");
+        let mut child = start_cache_store_child(&place, "entry-renamed", &marker);
+        wait_for_marker(&mut child, &marker);
+        child.kill().expect("cache child killed");
+        child.wait().expect("cache child reaped");
+
+        assert_eq!(
+            cache
+                .lookup(&key)
+                .expect("the renamed entry is served")
+                .body,
+            b"the new answer"
+        );
+    }
+
+    /// Starts the child that stores one answer, stopping where the parent
+    /// kills it.
+    fn start_cache_store_child(place: &Path, point: &str, marker: &Path) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "cache::tests::cache_store_child", "--nocapture"])
+            .env("IAAM_CACHE_CHILD_PLACE", place)
+            .env("IAAM_CACHE_CHILD_POINT", point)
+            .env("IAAM_CACHE_CHILD_MARKER", marker)
+            .spawn()
+            .expect("cache child started")
+    }
+
+    fn wait_for_marker(child: &mut std::process::Child, marker: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the child did not reach the cache barrier"
+            );
+            assert_eq!(
+                child.try_wait().expect("child status"),
+                None,
+                "the child exited before the cache barrier"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The child the cache kill tests start: it opens the cache at the place
+    /// it is given, arms the stop point it is given, and stores one answer.
+    #[test]
+    fn cache_store_child() {
+        let Some(place) = std::env::var_os("IAAM_CACHE_CHILD_PLACE") else {
+            return;
+        };
+        let point = match std::env::var("IAAM_CACHE_CHILD_POINT")
+            .expect("child point configured")
+            .as_str()
+        {
+            "entry-written" => "entry-written",
+            "entry-renamed" => "entry-renamed",
+            other => panic!("unknown cache stop point {other:?}"),
+        };
+        let marker = PathBuf::from(
+            std::env::var_os("IAAM_CACHE_CHILD_MARKER").expect("child marker configured"),
+        );
+        crate::test_support::arm_cache_barrier(point, &marker);
+        let clock = Shifted::new();
+        let cache = ResponseCache::open(Path::new(&place), Arc::clone(&clock) as Arc<dyn Clock>)
+            .expect("child cache opened");
+        let key = CacheKey::of(&moex_read()).expect("the child read is cached");
+        cache.store(&key, &answered(200, b"the new answer"), None, None);
     }
 }

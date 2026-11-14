@@ -103,9 +103,8 @@ pub struct Budget {
 
 /// The documented limits and the share of each this process uses.
 ///
-/// Half of every documented limit: the documented number is the point at
-/// which the destination starts refusing, and the owner's other tools (a
-/// terminal, a mobile app) spend from the same account's allowance.
+/// Half of each documented limit, except the owner's report-only allowance
+/// below: other tools (a terminal, a mobile app) share the broker's limits.
 pub const BUDGETS: &[Budget] = &[
     // T-Invest REST, OperationsService: documented 100/min, use 50/min.
     Budget {
@@ -113,6 +112,18 @@ pub const BUDGETS: &[Budget] = &[
         scope: MethodScope::Named("OperationsService"),
         documented: Some(100),
         used: 50,
+        window: MINUTE,
+    },
+    // https://developer.tbank.ru/invest/intro/intro/limits: report generation,
+    // 5/min in the gRPC table; no separate REST figure is published.
+    // Owner decision (2026-11-13): only iaam orders reports through the API;
+    // full-history syncs need dozens of windows. Use 4/min for generation and
+    // polling, leaving one request/min as margin against the rolling window.
+    Budget {
+        destination: Destination::TinkoffProd,
+        scope: MethodScope::Named("OperationsService.GetBrokerReport"),
+        documented: Some(5),
+        used: 4,
         window: MINUTE,
     },
     // T-Invest REST, UsersService: documented 50/min, use 25/min.
@@ -139,6 +150,18 @@ pub const BUDGETS: &[Budget] = &[
         scope: MethodScope::Named("OperationsService"),
         documented: Some(100),
         used: 50,
+        window: MINUTE,
+    },
+    // https://developer.tbank.ru/invest/intro/intro/limits: report generation,
+    // 5/min in the gRPC table; no separate REST figure is published.
+    // Owner decision (2026-11-13): only iaam orders reports through the API;
+    // full-history syncs need dozens of windows. Use 4/min for generation and
+    // polling, leaving one request/min as margin against the rolling window.
+    Budget {
+        destination: Destination::TinkoffSandbox,
+        scope: MethodScope::Named("OperationsService.GetBrokerReport"),
+        documented: Some(5),
+        used: 4,
         window: MINUTE,
     },
     Budget {
@@ -1111,9 +1134,11 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
                 | "OperationsService/GetPortfolio"
                 | "OperationsService/GetOperationsByCursor"
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations"
-                | "OperationsService/GetOperations"
-                | "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
-                | "OperationsService/GetBrokerReport" => Some("OperationsService"),
+                | "OperationsService/GetOperations" => Some("OperationsService"),
+                // Lookup and tally take one key per request. Prefer the stricter
+                // method budget over the broader OperationsService allowance.
+                "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport"
+                | "OperationsService/GetBrokerReport" => Some("OperationsService.GetBrokerReport"),
                 "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
                 | "InstrumentsService/GetInstrumentBy"
                 | "tinkoff.public.invest.api.contract.v1.InstrumentsService/CurrencyBy"
@@ -4329,6 +4354,58 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn pending_report_polls_spend_the_report_budget() {
+        let time = FakeTime::new();
+        let response = HttpResponse {
+            body: br#"{"code":30058}"#.to_vec(),
+            ..status(400)
+        };
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(response.clone()))
+                .then(Ok(response.clone()))
+                .then(Ok(response.clone()))
+                .then(Ok(response)),
+        );
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/OperationsService/GetBrokerReport",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(10))
+        .idempotent();
+        for _ in 0..4 {
+            assert!(
+                gateway
+                    .diagnostic_allowed(request.destination(), request.path())
+                    .await
+            );
+            assert!(matches!(
+                gateway.send(&request, None).await,
+                Err(GatewayError::Rejected { status: 400, .. })
+            ));
+            time.advance(Duration::from_secs(1));
+        }
+        assert!(
+            !gateway
+                .diagnostic_allowed(request.destination(), request.path())
+                .await
+        );
+        assert!(
+            gateway
+                .diagnostic_allowed(Destination::TinkoffProd, operations().path())
+                .await
+        );
+        time.advance(MINUTE);
+        assert!(
+            gateway
+                .diagnostic_allowed(request.destination(), request.path())
+                .await
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pending_broker_report_does_not_close_host() {
         let log = Log::capture();
         let time = FakeTime::new();
@@ -4370,7 +4447,8 @@ mod tests {
                     .diagnostic_allowed(Destination::TinkoffProd, request.path())
                     .await
             );
-            time.advance(Duration::from_secs(1));
+            // Isolate host-refusal classification from the report minute cap.
+            time.advance(MINUTE);
         }
         assert_eq!(gateway.send(&request, None).await.unwrap().status, 200);
         assert!(time.slept().is_empty());
@@ -6560,9 +6638,14 @@ mod tests {
     }
 
     #[test]
-    fn every_budget_in_the_table_is_at_most_half_its_documented_limit() {
+    fn every_budget_obeys_the_owners_documented_margin() {
         for row in BUDGETS {
             if let Some(documented) = row.documented {
+                if row.scope == MethodScope::Named("OperationsService.GetBrokerReport") {
+                    assert_eq!(documented, 5);
+                    assert_eq!(row.used, 4);
+                    continue;
+                }
                 assert!(
                     row.used * 2 <= documented,
                     "{:?} {:?} uses more than half",

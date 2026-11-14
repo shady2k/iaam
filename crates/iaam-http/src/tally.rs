@@ -557,8 +557,14 @@ impl OutboundTally {
                         .filter(|at| now.saturating_sub(**at) < budget.window.as_nanos())
                         .count()
                 });
+            // Required reads do not draw on the report-only method budget.
+            let method_reserve = if budget_key == "OperationsService.GetBrokerReport" {
+                0
+            } else {
+                DIAGNOSTIC_REQUEST_RESERVE
+            };
             Ok((
-                !stopped && used < budget.used.saturating_sub(DIAGNOSTIC_REQUEST_RESERVE) as usize,
+                !stopped && used < budget.used.saturating_sub(method_reserve) as usize,
                 changed,
             ))
         })

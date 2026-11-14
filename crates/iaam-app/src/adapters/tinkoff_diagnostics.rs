@@ -645,13 +645,12 @@ impl TinkoffChannel {
                 }
             }
         }
+        // Formation reports are evidence for the missing units, not optional
+        // enrichment. Wait for report capacity within the sync deadline and
+        // allowance, just as for a required settlement read.
         for (from, to) in formation_windows() {
-            if !self.client.diagnostic_report_allowed().await {
-                tracing::debug!(phase = "missing_fund_units", source = "report_formation", status = "skipped", from = %from, to = %to, reason = "low_rate_capacity_or_host_pause", "fund cross-check skipped to preserve broker capacity");
-                return;
-            }
             match self
-                .read_diagnostic_report(account, from, to, context)
+                .read_settlement_report(account, from, to, context)
                 .await
             {
                 Ok(rows) => {

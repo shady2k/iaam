@@ -45,8 +45,11 @@ are the repository's installation, and each person's plugin and hooks are theirs
   agent context: the hooks are composed in `.git/hooks` by
   `make backlog-connect`, and the agent docs carry the tracker's rules
   (AGENTS.md).
-- **Architecture and explorations:** `scripts/check-architecture.sh` guards the
-  dependency direction; the crate docs describe the rest.
+- **Architecture and explorations:** the target architecture is the `Solution
+  strategy` section of `docs/architecture.md`, read into every brief by
+  `node .backlog/rules/check.mjs --purpose <task> <export> --config
+  .backlog/config.json` over the adapter's export; `scripts/check-architecture.sh` guards the dependency
+  direction; the crate docs describe the rest.
 - **Glossary and decisions:** `docs/glossary-ru-en.md`; `docs/decisions/`
   (index in `docs/decisions/INDEX.md`, numbers never reused).
 - **Acceptance records:** a `Stage accepted` comment on the stage's issue:
@@ -107,7 +110,7 @@ are the repository's installation, and each person's plugin and hooks are theirs
   `check-commits.mjs`, `check-docs.mjs`, `check-present.mjs` with
   `document-format.mjs` beside it, and `check-product.mjs`, with
   `regular-file.mjs` and `argv.mjs` beside every check: byte-for-byte copies of
-  shady2k-skills 0.143.0 (setup 0.68.0),
+  shady2k-skills 0.145.0 (setup 0.70.0),
   `skills/backlog/setup-shady2k-skills/`. Their `--version` is the installation.
 - **Present documents:** `make present` (`node .backlog/rules/check-present.mjs
   --config .backlog/config.json --base <rev>`; `BASE` defaults to the merge base

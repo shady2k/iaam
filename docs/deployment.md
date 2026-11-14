@@ -649,17 +649,22 @@ except a change to the key the running server reads, which needs a restart
 ### 3.8 Pull the published image
 
 The public package `ghcr.io/shady2k/iaam` needs no pull secret. Publish it by
-manually dispatching **Publish image** (`.github/workflows/image.yml`) in GitHub
-Actions, with `ref` set to `main` (the default) or a revision in main's history.
-There is no automatic publication and no `latest` tag. The workflow summary
-records the source revision, available platforms and manifest digest. Native
-amd64 is required; arm64 is included when its build succeeds.
+pushing a `v*` release tag (for example, `v0.1.0`) on a commit in main's history.
+**Publish image** (`.github/workflows/image.yml`) runs on that tag push and
+refuses tagged commits not reachable from `origin/main`. Manual dispatch is
+only for rebuilding an existing `v*` tag: supply its name in the `tag` input.
+There is no `latest` tag. The workflow summary records the source revision,
+available platforms and manifest digest. Native amd64 is required; arm64 is
+included when its build succeeds.
 
-Tags name immutable revisions: `sha-<revision>` uses the full commit SHA, and
-`<short-sha>` is its first 12 characters. For an exact artifact, use the digest
+Tags name immutable revisions: the release tag itself (for example, `v0.1.0`),
+`sha-<revision>` using the full commit SHA, and `<short-sha>` using its first
+12 characters. Do not move release tags. For an exact artifact, use the digest
 from the workflow summary rather than rebuilding the revision:
 
 ```sh
+docker pull ghcr.io/shady2k/iaam:v0.1.0
+# Or use the full source revision:
 docker pull ghcr.io/shady2k/iaam:sha-<revision>
 # Or pin the exact published manifest:
 docker pull ghcr.io/shady2k/iaam@sha256:<digest>

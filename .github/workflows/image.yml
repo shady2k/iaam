@@ -1,12 +1,13 @@
 name: Publish image
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
-      ref:
-        description: Revision to build (must belong to main history)
+      tag:
+        description: Existing v* release tag to rebuild
         required: true
-        default: main
         type: string
 
 permissions:
@@ -19,24 +20,34 @@ jobs:
   resolve:
     runs-on: ubuntu-24.04
     outputs:
+      tag: ${{ steps.revision.outputs.tag }}
       sha: ${{ steps.revision.outputs.sha }}
       short: ${{ steps.revision.outputs.short }}
       created: ${{ steps.revision.outputs.created }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.ref }}
+          ref: main
           fetch-depth: 0
-      - name: Resolve and validate revision
+      - name: Resolve and validate release tag
         id: revision
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         shell: bash
         run: |
-          git fetch origin +refs/heads/main:refs/remotes/origin/main
-          sha=$(git rev-parse --verify 'HEAD^{commit}')
+          if [[ "$TAG" != v* ]] || ! git check-ref-format "refs/tags/$TAG"; then
+            echo 'An existing v* release tag is required.' >&2
+            exit 1
+          fi
+          git fetch --force --prune --prune-tags origin \
+            +refs/heads/main:refs/remotes/origin/main '+refs/tags/*:refs/tags/*'
+          git show-ref --verify "refs/tags/$TAG"
+          sha=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
           git merge-base --is-ancestor "$sha" origin/main || {
             echo 'Only revisions reachable from origin/main may be published.' >&2
             exit 1
           }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
           echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
@@ -122,6 +133,7 @@ jobs:
         env:
           REVISION: ${{ needs.resolve.outputs.sha }}
           SHORT: ${{ needs.resolve.outputs.short }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         shell: bash
         run: |
           shopt -s nullglob
@@ -137,6 +149,7 @@ jobs:
             sources+=("$IMAGE@sha256:$digest")
           done
           docker buildx imagetools create \
+            --tag "$IMAGE:$TAG" \
             --tag "$IMAGE:sha-$REVISION" \
             --tag "$IMAGE:$SHORT" "${sources[@]}"
           digest=$(docker buildx imagetools inspect "$IMAGE:sha-$REVISION" --format '{{.Manifest.Digest}}')

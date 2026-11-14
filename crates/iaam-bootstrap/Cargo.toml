@@ -35,5 +35,8 @@ rustix = { version = "1", features = ["termios", "stdio"] }
 rusqlite = { version = "0.42", features = ["bundled"] }
 time = { version = "0.3", default-features = false, features = ["macros"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["signal"] }
+
 [lints]
 workspace = true

@@ -752,6 +752,64 @@ mod tests {
     use crate::token::TokenScopeArg;
     use clap::Parser;
 
+    #[cfg(unix)]
+    async fn assert_shutdown_signal(signal: nix::sys::signal::Signal, expected: &str) {
+        use std::future::{Future, poll_fn};
+        use std::sync::{Arc, Mutex};
+        use std::task::Poll;
+        use std::time::Duration;
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = tracing_subscriber::fmt::writer::MutexGuardWriter<'a, Vec<u8>>;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.0.make_writer()
+            }
+        }
+
+        let capture = Capture(Arc::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let mut shutdown = Box::pin(super::shutdown().with_subscriber(subscriber));
+        // Polling to Pending installs both handlers before a signal can be raised.
+        // No other task runs on this current-thread runtime between here and spawn.
+        poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let task = tokio::spawn(shutdown);
+        nix::sys::signal::raise(signal).expect("raise the registered signal");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown responds to the signal")
+            .expect("shutdown task completes without panicking");
+
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("shutdown signal received"), "{log}");
+        assert!(log.contains(&format!("signal=\"{expected}\"")), "{log}");
+    }
+
+    // Separate tests give each signal its own process under nextest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_receives_sigterm_in_process() {
+        assert_shutdown_signal(nix::sys::signal::Signal::SIGTERM, "SIGTERM").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_receives_sigint_in_process() {
+        assert_shutdown_signal(nix::sys::signal::Signal::SIGINT, "SIGINT").await;
+    }
+
     #[test]
     fn missing_broker_key_explains_generation_command() {
         let path = std::env::temp_dir().join(format!(

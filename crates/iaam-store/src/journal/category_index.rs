@@ -22,7 +22,7 @@
 //! when they differ (Task 11 wires the read side; this module only builds
 //! the mechanism).
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, params};
 
 use iaam_core::category::{
     self, CategoryAssignment, CategoryBasis, CategoryInterval, CategoryRule, CategorySubject,
@@ -36,7 +36,7 @@ use crate::categories::{matcher_from_columns, parse_uuid, text_to_date};
 
 /// Every active (`retired_at IS NULL`) category rule the owner has, as the
 /// domain type `iaam_core::category::assign` reads.
-fn active_rules(tx: &Transaction<'_>, owner: OwnerId) -> Result<Vec<CategoryRule>, StoreError> {
+fn active_rules(tx: &Connection, owner: OwnerId) -> Result<Vec<CategoryRule>, StoreError> {
     let mut statement = tx.prepare(
         "SELECT id, version, matcher_kind, value, text, description_mode,
                 category, valid_from, valid_to
@@ -93,7 +93,7 @@ fn active_rules(tx: &Transaction<'_>, owner: OwnerId) -> Result<Vec<CategoryRule
 /// Every event id the owner's journal holds, in no particular order: a
 /// rebuild recomputes the whole projection and does not depend on the order
 /// it visits events in.
-fn owner_event_ids(tx: &Transaction<'_>, owner: OwnerId) -> Result<Vec<EventId>, StoreError> {
+fn owner_event_ids(tx: &Connection, owner: OwnerId) -> Result<Vec<EventId>, StoreError> {
     let mut statement = tx.prepare("SELECT id FROM events WHERE owner = ?1")?;
     let rows = statement.query_map(params![owner.inner().to_string()], |row| {
         row.get::<_, String>(0)
@@ -122,7 +122,7 @@ fn highest_version(rules: &[CategoryRule]) -> i64 {
 /// Returns whether a row was written, so [`rebuild`] can report how many of
 /// the owner's events came out decomposed.
 fn store_assignment(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     owner: OwnerId,
     event: &Event,
     rules: &[CategoryRule],
@@ -191,7 +191,7 @@ fn store_assignment(
 /// Old rows are deleted before the projection is repopulated: an event that
 /// matched under the old rules and matches nothing under the new ones must
 /// end up with no row at all, not a row nobody wrote deliberately.
-pub(crate) fn rebuild(tx: &Transaction<'_>, owner: OwnerId) -> Result<u32, StoreError> {
+pub(crate) fn rebuild(tx: &Connection, owner: OwnerId) -> Result<u32, StoreError> {
     let rules = active_rules(tx, owner)?;
     let rules_revision = highest_version(&rules);
     let event_ids = owner_event_ids(tx, owner)?;
@@ -219,7 +219,7 @@ pub(crate) fn rebuild(tx: &Transaction<'_>, owner: OwnerId) -> Result<u32, Store
 /// bundle importer alike — gets this for free rather than each remembering
 /// to call it.
 pub(crate) fn assign_for(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     owner: OwnerId,
     events: &[Event],
 ) -> Result<(), StoreError> {

@@ -54,6 +54,47 @@ pub enum Recorded {
     Duplicate { existing: iaam_core::ids::EventId },
 }
 
+/// What transactional work returns, type-erased because [`Store`] is
+/// object-safe: `AppServices` holds `Arc<dyn Store>` (ADR 0042 point 1).
+pub type TxResult = Box<dyn std::any::Any + Send>;
+
+/// One request's reads-for-validation and writes, run inside one store
+/// transaction by [`Store::transact`].
+///
+/// Boxed and `'static` because the work crosses to the store's blocking
+/// thread, and `Send` for the same reason. The work is synchronous on purpose:
+/// an `await` inside it is impossible, so no network call can hold the write
+/// lock. It does not stop a blocking call, so a closure is still read for one.
+pub type TransactionalWork =
+    Box<dyn FnOnce(&mut dyn StoreTx) -> Result<TxResult, AppError> + Send + 'static>;
+
+/// The store as seen inside the caller's transaction.
+///
+/// One method per operation that must take part in [`Store::transact`].
+/// Adding a document, category, import-session or account operation is one
+/// more method here and one more implementation in the adapter, not another
+/// transaction mechanism (ADR 0042 point 2). Every method is synchronous and
+/// runs on the store's blocking thread.
+pub trait StoreTx {
+    /// Append a batch in order inside the caller's transaction.
+    ///
+    /// The same outcomes, order within the day and assigned sequences as
+    /// [`Store::append_events`]; only the transaction boundary differs.
+    fn append_events_in_order(
+        &mut self,
+        events: Vec<Event>,
+        identity_scope: IdentityScope,
+    ) -> Result<Vec<Recorded>, AppError>;
+
+    /// The owner's journal through `through`, read inside the caller's
+    /// transaction and therefore seeing what the same work already wrote.
+    fn load_events_through(
+        &mut self,
+        owner: OwnerId,
+        through: Date,
+    ) -> Result<Vec<Event>, AppError>;
+}
+
 /// Token permissions at the application level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -867,6 +908,21 @@ pub struct DeclinedAccountNameView {
 /// Store for facts and reference data.
 #[async_trait]
 pub trait Store: Send + Sync {
+    /// Run `work` inside one `BEGIN IMMEDIATE … COMMIT` transaction on the
+    /// store's blocking thread.
+    ///
+    /// The work performs a request's reads-for-validation and writes together,
+    /// so the request is whole or leaves nothing (ADR 0042 point 1). A returned
+    /// error and a panic inside the work both roll the transaction back. The
+    /// work is synchronous, which is what keeps a network call out of the
+    /// transaction by construction; reads inside it see what it already wrote,
+    /// because they run on the same connection inside the same transaction.
+    ///
+    /// Type-erased because `AppServices` holds `Arc<dyn Store>`: the closure
+    /// and its result are boxed, so nothing here knows the transaction's
+    /// concrete type.
+    async fn transact(&self, work: TransactionalWork) -> Result<TxResult, AppError>;
+
     /// Write events, assigning their order within the day.
     ///
     /// The store assigns the order in the same transaction as the insertion:

@@ -26,7 +26,7 @@
 //! the one place that can guarantee no appended event is ever missing from
 //! the projection.
 
-use rusqlite::{Transaction, params};
+use rusqlite::{Connection, params};
 
 use iaam_core::event::Event;
 use iaam_core::ids::OwnerId;
@@ -88,7 +88,7 @@ pub const CUSTODY_REFERENCE_COLUMNS: &[(&str, &str)] = &[
 /// Does not commit `tx`: that is the caller's decision, since the bundle
 /// importer holds one transaction across many events and must not have this
 /// primitive commit or open one of its own.
-pub(crate) fn insert_event_in(tx: &Transaction<'_>, event: &Event) -> Result<(), StoreError> {
+pub(crate) fn insert_event_in(tx: &Connection, event: &Event) -> Result<(), StoreError> {
     ensure_accounts_and_custodies_are_owned(tx, event)?;
 
     let (mut header, legs, detail) = to_rows(event)?;
@@ -144,7 +144,7 @@ pub(crate) fn insert_event_in(tx: &Transaction<'_>, event: &Event) -> Result<(),
 /// stranger's record exists (the same choice `event_chain` makes for a
 /// correction target belonging to another owner, in `events.rs`).
 fn ensure_accounts_and_custodies_are_owned(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     event: &Event,
 ) -> Result<(), StoreError> {
     for leg in &event.legs {
@@ -163,7 +163,7 @@ fn ensure_accounts_and_custodies_are_owned(
 }
 
 fn ensure_owned(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     table: &'static str,
     what: &'static str,
     owner: OwnerId,
@@ -185,7 +185,7 @@ fn ensure_owned(
     }
 }
 
-fn insert_header(tx: &Transaction<'_>, header: &EventRow) -> Result<(), StoreError> {
+fn insert_header(tx: &Connection, header: &EventRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO events (
@@ -262,7 +262,7 @@ fn insert_header(tx: &Transaction<'_>, header: &EventRow) -> Result<(), StoreErr
     Ok(())
 }
 
-fn insert_leg(tx: &Transaction<'_>, leg: &LegRow) -> Result<(), StoreError> {
+fn insert_leg(tx: &Connection, leg: &LegRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_legs
@@ -291,7 +291,7 @@ fn insert_leg(tx: &Transaction<'_>, leg: &LegRow) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreError> {
+fn insert_detail(tx: &Connection, detail: &DetailRows) -> Result<(), StoreError> {
     match detail {
         DetailRows::None => Ok(()),
         DetailRows::Trade(row) => insert_trade(tx, row),
@@ -313,7 +313,7 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
 }
 
 fn insert_securities_transfer_out(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     row: &SecuritiesTransferOutRow,
 ) -> Result<(), StoreError> {
     write_result!(
@@ -328,7 +328,7 @@ fn insert_securities_transfer_out(
     Ok(())
 }
 
-fn insert_trade(tx: &Transaction<'_>, row: &TradeRow) -> Result<(), StoreError> {
+fn insert_trade(tx: &Connection, row: &TradeRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_trade (
@@ -362,10 +362,7 @@ fn insert_trade(tx: &Transaction<'_>, row: &TradeRow) -> Result<(), StoreError> 
     Ok(())
 }
 
-fn insert_currency_exchange(
-    tx: &Transaction<'_>,
-    row: &CurrencyExchangeRow,
-) -> Result<(), StoreError> {
+fn insert_currency_exchange(tx: &Connection, row: &CurrencyExchangeRow) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO event_currency_exchange (event, sold_amount, sold_currency, bought_amount, bought_currency) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![row.event, row.sold_amount, row.sold_currency, row.bought_amount, row.bought_currency],
@@ -373,7 +370,7 @@ fn insert_currency_exchange(
     Ok(())
 }
 
-fn insert_cash_transfer(tx: &Transaction<'_>, row: &CashTransferRow) -> Result<(), StoreError> {
+fn insert_cash_transfer(tx: &Connection, row: &CashTransferRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_cash_transfer (event, transfer_id, from_account, to_account)
@@ -391,7 +388,7 @@ fn insert_cash_transfer(tx: &Transaction<'_>, row: &CashTransferRow) -> Result<(
 }
 
 fn insert_unresolved_movement(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     row: &UnresolvedMovementRow,
 ) -> Result<(), StoreError> {
     write_result!(
@@ -406,7 +403,7 @@ fn insert_unresolved_movement(
     Ok(())
 }
 
-fn insert_income(tx: &Transaction<'_>, row: &IncomeRow) -> Result<(), StoreError> {
+fn insert_income(tx: &Connection, row: &IncomeRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_income (event, instrument, income_kind) VALUES (?1,?2,?3)",
@@ -420,7 +417,7 @@ fn insert_income(tx: &Transaction<'_>, row: &IncomeRow) -> Result<(), StoreError
     Ok(())
 }
 
-fn insert_fee(tx: &Transaction<'_>, row: &FeeRow) -> Result<(), StoreError> {
+fn insert_fee(tx: &Connection, row: &FeeRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_fee (event, origin) VALUES (?1,?2)",
@@ -433,7 +430,7 @@ fn insert_fee(tx: &Transaction<'_>, row: &FeeRow) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn insert_tax(tx: &Transaction<'_>, row: &TaxRow) -> Result<(), StoreError> {
+fn insert_tax(tx: &Connection, row: &TaxRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_tax (event, origin, instrument) VALUES (?1,?2,?3)",
@@ -446,10 +443,7 @@ fn insert_tax(tx: &Transaction<'_>, row: &TaxRow) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn insert_opening_position(
-    tx: &Transaction<'_>,
-    row: &OpeningPositionRow,
-) -> Result<(), StoreError> {
+fn insert_opening_position(tx: &Connection, row: &OpeningPositionRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_opening_position (
@@ -484,7 +478,7 @@ fn insert_opening_position(
 }
 
 fn insert_stated_securities_value(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     row: &StatedSecuritiesValueRow,
 ) -> Result<(), StoreError> {
     write_result!(
@@ -500,7 +494,7 @@ fn insert_stated_securities_value(
     Ok(())
 }
 
-fn insert_valuation(tx: &Transaction<'_>, row: &ValuationRow) -> Result<(), StoreError> {
+fn insert_valuation(tx: &Connection, row: &ValuationRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_valuation (event, instrument, price, currency, quality)
@@ -521,10 +515,7 @@ fn insert_valuation(tx: &Transaction<'_>, row: &ValuationRow) -> Result<(), Stor
     Ok(())
 }
 
-fn insert_control_assertion(
-    tx: &Transaction<'_>,
-    row: &ControlAssertionRow,
-) -> Result<(), StoreError> {
+fn insert_control_assertion(tx: &Connection, row: &ControlAssertionRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_control_assertion (
@@ -553,7 +544,7 @@ fn insert_control_assertion(
     Ok(())
 }
 
-fn insert_coverage_gap(tx: &Transaction<'_>, detail: &CoverageGapDetail) -> Result<(), StoreError> {
+fn insert_coverage_gap(tx: &Connection, detail: &CoverageGapDetail) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_coverage_gap (event, period_from, period_to) VALUES (?1,?2,?3)",
@@ -604,10 +595,7 @@ fn insert_coverage_gap(tx: &Transaction<'_>, detail: &CoverageGapDetail) -> Resu
     Ok(())
 }
 
-fn insert_corporate_action(
-    tx: &Transaction<'_>,
-    row: &CorporateActionRow,
-) -> Result<(), StoreError> {
+fn insert_corporate_action(tx: &Connection, row: &CorporateActionRow) -> Result<(), StoreError> {
     write_result!(tx.execute(
         "INSERT INTO event_corporate_action (
             event, action_kind, instrument, predecessor, successor, custody,
@@ -649,7 +637,7 @@ fn insert_corporate_action(
     Ok(())
 }
 
-fn insert_offer_exercise(tx: &Transaction<'_>, row: &OfferExerciseRow) -> Result<(), StoreError> {
+fn insert_offer_exercise(tx: &Connection, row: &OfferExerciseRow) -> Result<(), StoreError> {
     write_result!(
         tx.execute(
             "INSERT INTO event_offer_exercise (

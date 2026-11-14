@@ -19,9 +19,9 @@ use crate::ports::{
     DeclinedAccountNameView, DocumentToKeep, ImportObservationView, ImportQuestionView,
     ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
     InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery,
-    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store,
-    SyncRefusalFilter, SyncRefusalRecord, TokenAdmin, TokenView, UnresolvedAccountSourceView,
-    UnresolvedAccountView,
+    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store, StoreTx,
+    SyncRefusalFilter, SyncRefusalRecord, TokenAdmin, TokenView, TransactionalWork, TxResult,
+    UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -198,6 +198,54 @@ impl SqliteAdapter {
         })
         .await
         .map_err(|error| AppError::Store(format!("blocking task failed: {error}")))?
+    }
+}
+
+/// The store inside a caller's transaction, handed to [`Store::transact`]
+/// work.
+///
+/// A thin holder rather than a second store: every method delegates to a
+/// [`SqliteStore`] call that neither opens nor commits a transaction of its
+/// own, so the transaction stays the caller's and adding an operation is one
+/// more method on [`StoreTx`] and one more delegation here.
+struct TransactionHandle<'a> {
+    store: &'a mut SqliteStore,
+}
+
+impl StoreTx for TransactionHandle<'_> {
+    fn append_events_in_order(
+        &mut self,
+        events: Vec<Event>,
+        identity_scope: IdentityScope,
+    ) -> Result<Vec<Recorded>, AppError> {
+        let mut recorded = Vec::with_capacity(events.len());
+        for (row_index, event) in events.iter().enumerate() {
+            let span = tracing::info_span!("journal_append", row_index,
+                event_id = %event.id.inner(), account_id = %event.account.inner());
+            let _entered = span.enter();
+            let outcome = self
+                .store
+                .append_event_in_order_within(event, identity_scope)
+                .map_err(|error| {
+                    tracing::error!(error = %error, "journal append failed");
+                    store_error(error)
+                })?;
+            recorded.push(match outcome {
+                Appended::Inserted { id } => Recorded::Inserted { id },
+                Appended::Duplicate { existing } => Recorded::Duplicate { existing },
+            });
+        }
+        Ok(recorded)
+    }
+
+    fn load_events_through(
+        &mut self,
+        owner: OwnerId,
+        through: Date,
+    ) -> Result<Vec<Event>, AppError> {
+        self.store
+            .load_events_through(owner, through)
+            .map_err(store_error)
     }
 }
 
@@ -468,32 +516,31 @@ const fn scope_to_store(scope: Scope) -> TokenScope {
 
 #[async_trait]
 impl Store for SqliteAdapter {
+    async fn transact(&self, work: TransactionalWork) -> Result<TxResult, AppError> {
+        self.blocking(move |store| {
+            store.with_immediate_transaction(store_error, |store| {
+                let mut handle = TransactionHandle { store };
+                work(&mut handle)
+            })
+        })
+        .await
+    }
+
     async fn append_events(
         &self,
         events: Vec<Event>,
         identity_scope: IdentityScope,
     ) -> Result<Vec<Recorded>, AppError> {
-        self.blocking(move |store| {
-            let mut recorded = Vec::with_capacity(events.len());
-            for (row_index, event) in events.iter().enumerate() {
-                let span = tracing::info_span!("journal_append", row_index,
-                    event_id = %event.id.inner(), account_id = %event.account.inner());
-                let _entered = span.enter();
-                let outcome =
-                    store
-                        .append_event_in_order(event, identity_scope)
-                        .map_err(|error| {
-                            tracing::error!(error = %error, "journal append failed");
-                            store_error(error)
-                        })?;
-                recorded.push(match outcome {
-                    Appended::Inserted { id } => Recorded::Inserted { id },
-                    Appended::Duplicate { existing } => Recorded::Duplicate { existing },
-                });
-            }
-            Ok(recorded)
-        })
-        .await
+        let result = self
+            .transact(Box::new(move |tx: &mut dyn StoreTx| {
+                let recorded = tx.append_events_in_order(events, identity_scope)?;
+                Ok(Box::new(recorded) as TxResult)
+            }))
+            .await?;
+        result
+            .downcast::<Vec<Recorded>>()
+            .map(|recorded| *recorded)
+            .map_err(|_| AppError::Store("journal append returned an unexpected result".to_owned()))
     }
 
     async fn load_events_through(

@@ -389,6 +389,12 @@ impl SqliteStore {
     /// committing) into the caller's error type: this crate does not know
     /// `iaam-app`'s `AppError`, or any other caller's error type, so it
     /// cannot implement `From<StoreError>` for it.
+    ///
+    /// An unwind out of `work` is a rollback too (ADR 0042 point 3): the panic
+    /// is caught only long enough to `ROLLBACK` and is then resumed, so a
+    /// caller's panic still reaches it while the database returns to what it
+    /// held before the transaction opened. The connection is left out of a
+    /// transaction either way, so the store stays usable.
     pub fn with_immediate_transaction<T, E>(
         &mut self,
         convert: impl Fn(StoreError) -> E,
@@ -397,17 +403,22 @@ impl SqliteStore {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| convert(error.into()))?;
-        match work(self) {
-            Ok(value) => match self.conn.execute_batch("COMMIT") {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
+        match outcome {
+            Ok(Ok(value)) => match self.conn.execute_batch("COMMIT") {
                 Ok(()) => Ok(value),
                 Err(error) => {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     Err(convert(error.into()))
                 }
             },
-            Err(error) => {
+            Ok(Err(error)) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
+            }
+            Err(payload) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                std::panic::resume_unwind(payload)
             }
         }
     }

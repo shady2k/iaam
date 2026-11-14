@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{Principal, Recorded};
+use crate::ports::{Principal, Recorded, StoreTx, TxResult};
 
 /// Parser version stamped on every correction fact.
 ///
@@ -363,7 +363,32 @@ pub async fn correct_events(
         });
     }
 
-    let events = load_journal(services, principal).await?;
+    // One deliberate act is one transaction (ADR 0042 point 1). The journal the
+    // request is judged against is read inside that transaction (point 2), so
+    // another writer's fact is part of the judgement, and a plan that no longer
+    // holds is refused rather than written over a stale reading.
+    let principal = principal.clone();
+    let corrections = corrections.to_vec();
+    let result = services
+        .store
+        .transact(Box::new(move |tx: &mut dyn StoreTx| {
+            let outcomes = correct_events_inside(tx, &principal, &corrections)?;
+            Ok(Box::new(outcomes) as TxResult)
+        }))
+        .await?;
+    result
+        .downcast::<Vec<CorrectionOutcome>>()
+        .map(|outcomes| *outcomes)
+        .map_err(|_| AppError::Store("correction returned an unexpected result".to_owned()))
+}
+
+/// The body of [`correct_events`], inside the store's transaction.
+fn correct_events_inside(
+    tx: &mut dyn StoreTx,
+    principal: &Principal,
+    corrections: &[CorrectionRequest],
+) -> Result<Vec<CorrectionOutcome>, AppError> {
+    let events = tx.load_events_through(principal.owner, time::Date::MAX)?;
 
     let mut candidate_sets = Vec::with_capacity(corrections.len());
     {
@@ -373,42 +398,171 @@ pub async fn correct_events(
             candidate_sets.push(candidate_for(principal, &by_id, index, correction)?);
         }
     }
-    let candidates: Vec<Event> = candidate_sets.iter().flatten().cloned().collect();
 
     // Read off the journal as it stands, before the candidates join it: the
     // question is what the owner's rules have already decided, and a reversal
     // this request is about to write is not part of that.
     let standing = standing_rules(&events, corrections)?;
 
-    let candidates = checked_against_resolve(events, candidates)?;
-    let recorded =
-        crate::scenarios::ingest::append_checked(services, candidates, IdentityScope::Source)
-            .await?;
-    let mut offset = 0;
+    // A retry is recognised before `resolve` can refuse the state the first
+    // call left behind (ADR 0042 point 4). Its key is the correction's own,
+    // derived from the target, and the payload must be the same command.
+    let already = recorded_corrections(&events, &candidate_sets)?;
+
+    let mut to_write = Vec::new();
+    for (candidates, already) in candidate_sets.iter().zip(&already) {
+        for (candidate, existing) in candidates.iter().zip(already) {
+            if existing.is_none() {
+                to_write.push(candidate.clone());
+            }
+        }
+    }
+    // Nothing new is no reason to judge a journal the request did not touch: a
+    // retry of an accepted correction is answered from what it finds.
+    let recorded = if to_write.is_empty() {
+        Vec::new()
+    } else {
+        let to_write = checked_against_resolve(events, to_write)?;
+        // The journal is append-only: a structurally malformed fact must not
+        // reach it, because nothing could then remove it.
+        for (index, event) in to_write.iter().enumerate() {
+            if let Some(rejection) = crate::scenarios::ingest::structural_rejection(event, "event")
+            {
+                return Err(AppError::Invalid {
+                    field: format!("event[{index}]"),
+                    expected: rejection.expected,
+                    actual: rejection.actual,
+                });
+            }
+        }
+        tx.append_events_in_order(to_write, IdentityScope::Source)?
+    };
+
+    let mut recorded = recorded.into_iter();
     Ok(standing
         .into_iter()
-        .zip(candidate_sets)
-        .map(|(standing_rule, candidate_set)| {
-            let count = candidate_set.len();
-            let outcomes = &recorded[offset..offset + count];
-            offset += count;
-            let outcome = outcomes
-                .last()
-                .expect("every correction request produces at least one candidate");
+        .zip(already)
+        .map(|(standing_rule, already)| {
+            let mut verdict = None;
+            for existing in already {
+                verdict = Some(match existing {
+                    // The first call wrote this fact, and its answer is rebuilt
+                    // rather than replaced by `Duplicate`.
+                    Some(existing) => Verdict::Provisional { event: existing },
+                    None => match recorded
+                        .next()
+                        .expect("one store outcome for every candidate written")
+                    {
+                        Recorded::Inserted { id } => Verdict::Provisional { event: id },
+                        // A duplicate this pre-check did not see: a source
+                        // operation identifier, or the same key twice in one
+                        // batch. The store's answer stands.
+                        Recorded::Duplicate { existing } => Verdict::Duplicate { existing },
+                    },
+                });
+            }
             CorrectionOutcome {
                 // Reclassification writes a reversal plus a replacement. The
                 // replacement is the fact that now stands, so it is the
                 // acknowledgement's representative event.
-                verdict: match outcome {
-                    Recorded::Inserted { id } => Verdict::Provisional { event: *id },
-                    Recorded::Duplicate { existing } => Verdict::Duplicate {
-                        existing: *existing,
-                    },
-                },
+                verdict: verdict.expect("every correction request produces at least one candidate"),
                 standing_rule,
             }
         })
         .collect())
+}
+
+/// Which candidates the journal already records, under the same command.
+///
+/// `None` where a candidate has no natural key or no event holds it. `Some(id)`
+/// where an event already holds the candidate's key **and** records the same
+/// command, so the request is a retry and the answer is the first call's. A key
+/// held by a different command is refused here, before `resolve` can refuse the
+/// retry for the state the first call created, and before anything is written.
+fn recorded_corrections(
+    journal: &[Event],
+    candidates: &[Vec<Event>],
+) -> Result<Vec<Vec<Option<EventId>>>, AppError> {
+    let by_key: BTreeMap<&str, &Event> = journal
+        .iter()
+        .filter_map(|event| Some((event.idempotency_key.as_deref()?, event)))
+        .collect();
+    candidates
+        .iter()
+        .map(|correction| {
+            correction
+                .iter()
+                .map(|candidate| {
+                    let Some(key) = candidate.idempotency_key.as_deref() else {
+                        return Ok(None);
+                    };
+                    let Some(existing) = by_key.get(key) else {
+                        return Ok(None);
+                    };
+                    // A key held by an ordinary fact or by a different
+                    // correction is left to `refuse_occupied_keys`, whose
+                    // refusal names the conflict the caller must resolve.
+                    if !same_correction_identity(candidate, existing) {
+                        return Ok(None);
+                    }
+                    if same_command(candidate, existing) {
+                        Ok(Some(existing.id))
+                    } else {
+                        Err(AppError::Conflict {
+                            what: format!(
+                                "correction idempotency key {key} is held by event {:?}, which \
+                                 records a different correction",
+                                existing.id
+                            ),
+                        })
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Is `existing` the same correction of the same target as `candidate`?
+///
+/// A key names one target's correction; an event with the same key but another
+/// relation or target is not this command, and the occupied-key refusal is the
+/// one that should answer it.
+fn same_correction_identity(candidate: &Event, existing: &Event) -> bool {
+    candidate.relation == existing.relation
+}
+
+/// Does `existing` record the same command as `candidate`?
+///
+/// The identifier, the store-assigned sequence and the generated transfer link
+/// differ on a replay by construction; every other field is what the command
+/// stated, so a difference in any of them is a different command under one
+/// key.
+fn same_command(candidate: &Event, existing: &Event) -> bool {
+    let mut normalized = candidate.clone();
+    normalized.id = existing.id;
+    normalized.order = existing.order.source_time().map_or_else(
+        || EffectiveOrder::new(existing.order.date(), existing.order.sequence()),
+        |source_time| {
+            EffectiveOrder::with_source_time(
+                existing.order.date(),
+                source_time,
+                existing.order.sequence(),
+            )
+        },
+    );
+    // A transfer's link identifier is generated per attempt, not stated by the
+    // command: two corrections of the same row name the same transfer.
+    if let (
+        EventKind::CashTransfer { transfer_id, .. },
+        EventKind::CashTransfer {
+            transfer_id: existing_transfer,
+            ..
+        },
+    ) = (&mut normalized.kind, &existing.kind)
+    {
+        *transfer_id = *existing_transfer;
+    }
+    normalized == *existing
 }
 
 /// The standing rule behind each corrected row, in the order they were asked for.

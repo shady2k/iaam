@@ -4,6 +4,7 @@
 //! Each child test is the work the parent runs in another process and kills at
 //! a named store barrier.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,8 +12,8 @@ use std::sync::Arc;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
-use iaam_app::ports::{AccountView, Clock, Principal, Store};
-use iaam_app::scenarios::correction::{CorrectionRequest, correct_events};
+use iaam_app::ports::{AccountView, Clock, Principal};
+use iaam_app::scenarios::correction::{CorrectionOutcome, CorrectionRequest, correct_events};
 use iaam_app::storage::SqliteStore;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::correction::resolve;
@@ -23,6 +24,7 @@ use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::projection::balances::Balances;
+use iaam_ingest::Verdict;
 use iaam_ingest::classification::Classification;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_store::fault::{self, KillAt};
@@ -163,6 +165,89 @@ fn correction_rows(events: &[Event]) -> usize {
         .count()
 }
 
+/// What a fact means, without the identifiers a fresh attempt generates — the
+/// event's own, the one its relation points at, and a transfer's link.
+fn meaning(event: &Event, by_id: &BTreeMap<EventId, &Event>) -> String {
+    let named = |target: EventId| {
+        by_id.get(&target).map_or_else(
+            || format!("{target:?}"),
+            |target| {
+                target
+                    .idempotency_key
+                    .clone()
+                    .unwrap_or_else(|| format!("{target:?}"))
+            },
+        )
+    };
+    let (relation, target) = match event.relation {
+        Relation::None => ("fact".to_owned(), None),
+        Relation::Reversal { target } => (format!("reversal of {}", named(target)), Some(target)),
+        Relation::Replacement { target } => {
+            (format!("replacement of {}", named(target)), Some(target))
+        }
+    };
+    // A transfer's link identifier is generated per attempt; what the kind
+    // states is the two accounts and the amount.
+    let kind = match &event.kind {
+        EventKind::CashTransfer {
+            from, to, amount, ..
+        } => format!("transfer {from:?} to {to:?} {amount:?}"),
+        other => format!("{other:?}"),
+    };
+    // A correction's own key names the event it corrects, so it carries that
+    // event's identifier; the identifier is what a fresh run of the same
+    // correction generates again, and the key in its place is what the two runs
+    // hold in common.
+    let mut key = event.idempotency_key.clone().unwrap_or_default();
+    if let Some(target) = target {
+        key = key.replace(&target.inner().to_string(), &named(target));
+    }
+    // The reversal's raw hash is the digest of its own key, which is compared
+    // above after the corrected event's identifier has been named; the
+    // replacement's is the digest of the operation, whose every stated value
+    // `kind` and `dates` carry.
+    format!(
+        "{relation} | {kind} | {key} | {:?} | {:?} | {:?}",
+        event.dates,
+        event.order.date(),
+        event.order.source_time(),
+    )
+}
+
+fn meanings(events: &[Event]) -> Vec<String> {
+    let by_id: BTreeMap<EventId, &Event> = events.iter().map(|event| (event.id, event)).collect();
+    let mut meanings: Vec<String> = events
+        .iter()
+        .map(|event| meaning(event, &by_id))
+        .collect();
+    meanings.sort();
+    meanings
+}
+
+/// What the request answered, by the meaning of the fact it names.
+fn answers(outcomes: &[CorrectionOutcome], events: &[Event]) -> Vec<String> {
+    let by_id: BTreeMap<EventId, &Event> = events.iter().map(|event| (event.id, event)).collect();
+    outcomes
+        .iter()
+        .map(|outcome| {
+            let (verdict, event) = match &outcome.verdict {
+                Verdict::Provisional { event } => ("provisional".to_owned(), Some(*event)),
+                Verdict::Duplicate { existing } => ("duplicate".to_owned(), Some(*existing)),
+                other => (format!("{other:?}"), None),
+            };
+            let fact = event.map_or_else(String::new, |event| {
+                by_id
+                    .get(&event)
+                    .map_or_else(|| format!("{event:?}"), |fact| meaning(fact, &by_id))
+            });
+            format!(
+                "{verdict} {fact} | standing rule {:?}",
+                outcome.standing_rule.map(|standing| (standing.version, standing.still_filed))
+            )
+        })
+        .collect()
+}
+
 struct ChildParts {
     database: PathBuf,
     owner: OwnerId,
@@ -202,8 +287,12 @@ fn run_child_reclassification(parts: ChildParts) {
     });
 }
 
+/// The child is killed after the batch's second write — the reversal and the
+/// replacement of a reclassification are both written, and neither is
+/// committed. A threshold of one would pass just as well against a store that
+/// committed each fact on its own.
 #[test]
-fn killed_after_reversal_child() {
+fn killed_mid_batch_child() {
     if !fault::arm_child_barrier() {
         return;
     }
@@ -250,8 +339,8 @@ fn kill(
 }
 
 #[tokio::test]
-async fn a_kill_after_the_reversal_leaves_neither_correction_fact() {
-    let directory = TempDirectory::new("after-reversal");
+async fn a_kill_mid_batch_leaves_neither_correction_fact_and_the_retry_matches_a_clean_run() {
+    let directory = TempDirectory::new("mid-batch");
     let database = directory.file("iaam.sqlite");
     let services = services_at(&database, true);
     let owner = OwnerId::new_random();
@@ -262,11 +351,14 @@ async fn a_kill_after_the_reversal_leaves_neither_correction_fact() {
         .await
         .id;
 
+    // The second write of the batch, not the first: a store that committed each
+    // fact on its own would leave the reversal behind and pass a threshold of
+    // one.
     let KillAt { store, child } = kill(
         &directory,
-        "killed_after_reversal_child",
+        "killed_mid_batch_child",
         fault::BEFORE_COMMIT,
-        Some(1),
+        Some(2),
         &database,
         &CorrectionIds {
             owner,
@@ -277,22 +369,47 @@ async fn a_kill_after_the_reversal_leaves_neither_correction_fact() {
     );
     assert!(
         child.marker.exists(),
-        "the child was killed after the reversal's write"
+        "the child was killed after the batch's second write, before COMMIT"
     );
-    let store = SqliteAdapter::new(store);
-    let journal = store
+    let adapter = Arc::new(SqliteAdapter::new(store));
+    let reopened = AppServices::new(
+        adapter.clone(),
+        adapter.clone(),
+        adapter.clone(),
+        adapter.clone(),
+        Arc::new(FixedClock),
+    );
+    let journal = reopened
+        .store
         .load_events_through(owner, time::Date::MAX)
         .await
         .expect("the killed database reopens");
     assert_eq!(
         correction_rows(&journal),
         0,
-        "a kill before COMMIT leaves neither the reversal nor the replacement"
+        "a kill before COMMIT leaves neither the reversal nor the replacement, \
+         although both were written"
     );
     assert_eq!(journal.len(), 1, "the corrected fact alone remains");
 
-    // A clean, uninterrupted correction of the same kind: the target account's
-    // balance is the comparison, and it must not depend on the killed attempt.
+    // The identical request, repeated after reopening, and a clean run of it on
+    // a database of its own: the two must leave the same facts and answer the
+    // same thing. The balance alone would not do — a reclassification to a
+    // transfer leaves the corrected account's balance as it was either way.
+    let retried = correct_events(
+        &reopened,
+        &principal(owner, token_id),
+        true,
+        &[reclassify(target, sender)],
+    )
+    .await
+    .expect("the retry records the correction");
+    let retried_journal = reopened
+        .store
+        .load_events_through(owner, time::Date::MAX)
+        .await
+        .expect("read the retried journal");
+
     let clean_database = directory.file("clean.sqlite");
     let clean_services = services_at(&clean_database, true);
     let clean_target = seed(
@@ -304,10 +421,9 @@ async fn a_kill_after_the_reversal_leaves_neither_correction_fact() {
     )
     .await
     .id;
-    let clean_principal = principal(owner, Uuid::new_v4());
-    correct_events(
+    let clean = correct_events(
         &clean_services,
-        &clean_principal,
+        &principal(owner, token_id),
         true,
         &[reclassify(clean_target, sender)],
     )
@@ -320,12 +436,22 @@ async fn a_kill_after_the_reversal_leaves_neither_correction_fact() {
         .expect("read the clean journal");
 
     assert_eq!(
-        balance(&journal, account),
+        meanings(&retried_journal),
+        meanings(&clean_journal),
+        "the retry records what a clean run records, by meaning"
+    );
+    assert_eq!(
+        answers(&retried, &retried_journal),
+        answers(&clean, &clean_journal),
+        "the retry answers what a clean run answers, by meaning"
+    );
+    assert_eq!(
+        balance(&retried_journal, account),
         balance(&clean_journal, account),
         "the account balance equals a clean run's"
     );
     assert!(
-        balance(&journal, account).is_some(),
+        balance(&retried_journal, account).is_some(),
         "the comparison is not two absent balances"
     );
 }

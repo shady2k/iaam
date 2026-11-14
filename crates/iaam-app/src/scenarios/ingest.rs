@@ -275,12 +275,14 @@ pub fn structural_rejection(event: &Event, field: &'static str) -> Option<Reject
     })
 }
 
-/// Validate every event before making one append-only journal write.
-pub async fn append_checked(
-    services: &AppServices,
-    events: Vec<Event>,
-    scope: IdentityScope,
-) -> Result<Vec<Recorded>, AppError> {
+/// Refuse a batch that holds a structurally malformed fact, naming its place.
+///
+/// The journal is append-only: a malformed event cannot be removed from it once
+/// written, so every path that writes several facts at once calls this before
+/// the store sees any of them (§4.8). One function rather than a loop per write
+/// path, because a second copy of the loop is a second place to forget to run
+/// it.
+pub fn refuse_malformed(events: &[Event]) -> Result<(), AppError> {
     for (index, event) in events.iter().enumerate() {
         if let Some(rejection) = structural_rejection(event, "event") {
             return Err(AppError::Invalid {
@@ -290,6 +292,16 @@ pub async fn append_checked(
             });
         }
     }
+    Ok(())
+}
+
+/// Validate every event before making one append-only journal write.
+pub async fn append_checked(
+    services: &AppServices,
+    events: Vec<Event>,
+    scope: IdentityScope,
+) -> Result<Vec<Recorded>, AppError> {
+    refuse_malformed(&events)?;
     services.store.append_events(events, scope).await
 }
 

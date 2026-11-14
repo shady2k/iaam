@@ -1,8 +1,6 @@
 use fs2::FileExt;
 use rustix::fd::OwnedFd;
-use rustix::fs::{
-    AtFlags, CWD, FileType, Mode, OFlags, fstat, fsync, open, openat, renameat, statat,
-};
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, fstat, open, openat, renameat, statat};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1247,8 +1245,12 @@ impl OutboundTally {
     }
 
     fn sync_directory(&self) -> Result<(), TallyError> {
-        fsync(&self.directory.0.descriptor)
-            .map_err(|source| file_error("persist the tally directory", source))
+        crate::egress::sync_directory(&self.directory.0.descriptor).map_err(|source| {
+            TallyError::File {
+                action: "persist the tally directory",
+                source,
+            }
+        })
     }
 }
 

@@ -27,9 +27,17 @@
 //! dated by the moment it was observed, not by the moment the store wrote
 //! it: a response whose headers arrived just before midnight and whose
 //! body finished just after is observed on one day when served, whatever
-//! day the store was written on. The moment line is optional — an entry
-//! written before it existed still parses, and the served answer is then
-//! dated by its storage stamp as it always was.
+//! day the store was written on. The moment line is optional in the
+//! format; an entry that carries none is dated by its storage stamp.
+//!
+//! **One entry is whole or it is nothing.** An entry starts with its format
+//! version, the byte length of everything after its integrity header and a
+//! SHA-256 checksum of those same bytes, so a truncated file or one whose
+//! metadata or body changed is a miss — removed and logged — and never a
+//! short or altered answer. The file is `fsync`ed before its rename and the
+//! directory after it, so a host crash leaves the previous answer or the
+//! whole new one. An entry in an earlier format is discarded the same way,
+//! and the next fetch stores the answer again.
 //!
 //! **The key.** The SHA-256 of the destination, the method, the wire URL
 //! (path and full query), the request body and a SHA-256 fingerprint of
@@ -82,8 +90,14 @@ const MAX_ENTRIES: usize = 1024;
 const MAX_STORED_BODY: usize = 8 * 1024 * 1024;
 
 /// The first line of every entry file; a file that does not start with it
-/// is not an answer and is removed.
-const ENTRY_VERSION: &str = "iaam-response-cache-v1";
+/// is not an answer and is removed. The version covers the integrity header
+/// (length and checksum) that v2 introduced together with them.
+const ENTRY_VERSION: &str = "iaam-response-cache-v2";
+
+/// The format of the entries the earlier build wrote, before the length and
+/// checksum. Such an entry is discarded when a read wants it — never served —
+/// and the next store writes it again in the current format.
+const ENTRY_LEGACY_VERSION: &str = "iaam-response-cache-v1";
 
 /// The response cache could not be placed or created beside the database.
 #[derive(Debug, Error)]
@@ -152,13 +166,19 @@ impl CacheKey {
     /// The entry file name: the key in hexadecimal. The name carries
     /// nothing else, and a digest carries no credential.
     fn hex(&self) -> String {
-        self.0
-            .iter()
-            .fold(String::with_capacity(64), |mut text, byte| {
-                let _ = write!(text, "{byte:02x}");
-                text
-            })
+        hex(&self.0)
     }
+}
+
+/// The lowercase hexadecimal spelling of `bytes`, used for the entry name and
+/// for the entry's checksum line.
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
 }
 
 /// Whether the request only reads, by what it itself declares: an HTTP
@@ -329,18 +349,24 @@ impl ResponseCache {
                     Some(response)
                 }
             }
-            Err(()) => {
+            Err(unusable) => {
                 // The file is not an answer anybody stored whole: it is
-                // removed so the store keeps nothing unreadable.
+                // removed so the store keeps nothing it would not serve, and
+                // the read that wanted it says why.
                 let _ = std::fs::remove_file(&path);
+                tracing::warn!(
+                    path = %path.display(),
+                    reason = unusable.description(),
+                    "a cached answer was discarded"
+                );
                 None
             }
         }
     }
 
     /// Stores the answer under `key`, best effort: a store that cannot be
-    /// made leaves the cache as it was, and the next call for the same read
-    /// is sent again.
+    /// made is left out, or left without a durable name, and the next call for
+    /// the same read is sent again.
     ///
     /// `bearer` and `identity` are the presented credential and the cache
     /// identity the read was keyed on: before anything is persisted, both
@@ -384,8 +410,12 @@ impl ResponseCache {
                 Err(source) => return Err(source),
             };
             file.write_all(&entry)?;
-            file.flush()?;
-            std::fs::rename(&temporary, self.directory.join(&name))
+            // The bytes are durable before the name points at them, so a host
+            // crash leaves the previous answer or the whole new one, never a
+            // half-written entry (ADR 0042 point 6).
+            file.sync_all()?;
+            std::fs::rename(&temporary, self.directory.join(&name))?;
+            crate::egress::sync_directory(File::open(&self.directory)?)
         })();
         if let Err(source) = stored {
             let _ = std::fs::remove_file(&temporary);
@@ -464,23 +494,70 @@ fn is_entry_name(name: &str) -> bool {
 
 /// The `stored` stamp from a file's first lines, or `None` when the file
 /// does not start like an entry at all.
+///
+/// This is the cheap path the sweep and the entry cap use: it reads the stamp
+/// and nothing else, so an entry whose bytes are wrong is still swept by its
+/// stamp and then discarded, with the reason logged, by the read that wants
+/// it. An entry in the earlier format is stamped here too, so it reaches its
+/// read and is discarded there rather than deleted unseen.
 fn stamp_of(path: &Path) -> Option<u64> {
     let mut file = File::open(path).ok()?;
-    let mut prefix = [0_u8; 128];
+    // The version, length, checksum and storage stamp lines are under 160
+    // bytes together; one read covers them.
+    let mut prefix = [0_u8; 256];
     let read = file.read(&mut prefix).ok()?;
     let mut lines = prefix[..read].split(|byte| *byte == b'\n');
     let version = lines.next()?;
-    if version != ENTRY_VERSION.as_bytes() {
+    if version == ENTRY_VERSION.as_bytes() {
+        lines.next()?.strip_prefix(b"length ")?;
+        lines.next()?.strip_prefix(b"checksum ")?;
+    } else if version != ENTRY_LEGACY_VERSION.as_bytes() {
         return None;
     }
     let stored = core::str::from_utf8(lines.next()?).ok()?;
     stored.strip_prefix("stored ")?.parse().ok()
 }
 
-/// One stored answer: the header lines, then the body bytes as they were
-/// received. `stored` is the stamp the hour of validity is measured from;
-/// `observed_at` is the answer's own observation moment, when the stored
-/// answer carried one.
+/// Why the bytes under an entry name are not an answer this build serves.
+#[derive(Debug, Clone, Copy)]
+enum Unusable {
+    /// Another entry format, or not an entry file at all.
+    Format,
+    /// The bytes after the integrity header are not the recorded length: the
+    /// file was cut short or extended.
+    Length,
+    /// The bytes after the integrity header are not the recorded checksum:
+    /// something in the metadata or the body changed.
+    Checksum,
+    /// The metadata lines are not a complete stored answer.
+    Metadata,
+}
+
+impl Unusable {
+    /// The reason an operator reads in the log.
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Format => "the file is not an entry format this build serves",
+            Self::Length => "the entry is shorter or longer than its recorded length",
+            Self::Checksum => "the entry does not match its recorded checksum",
+            Self::Metadata => "the entry's metadata lines are not a stored answer",
+        }
+    }
+}
+
+/// The parser's internal refusal — a short line, a carriage return, an
+/// unparsable number — is a metadata fault: the integrity header is checked
+/// by [`Unusable::Format`] itself.
+impl From<()> for Unusable {
+    fn from((): ()) -> Self {
+        Self::Metadata
+    }
+}
+
+/// One stored answer: the integrity header, the answer's header lines, then
+/// the body bytes as they were received. `stored` is the stamp the hour of
+/// validity is measured from; `observed_at` is the answer's own observation
+/// moment, when the stored answer carried one.
 struct Entry {
     stored: u64,
     observed_at: Option<SystemTime>,
@@ -494,14 +571,13 @@ impl Entry {
         bearer: Option<&Secret>,
         identity: Option<&Secret>,
     ) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(192 + response.body.len());
-        line(&mut bytes, ENTRY_VERSION);
-        line(&mut bytes, &format!("stored {stored}"));
+        let mut answer = Vec::with_capacity(160 + response.body.len());
+        line(&mut answer, &format!("stored {stored}"));
         // The answer's own observation moment, kept beside the storage
         // stamp when the answer carried one: a served answer dates the day
         // it was observed, not the day the store wrote it.
         if let Some(at) = response.observed_at {
-            line(&mut bytes, &format!("observed-at {}", unix_nanos(at)));
+            line(&mut answer, &format!("observed-at {}", unix_nanos(at)));
         }
         for (name, value) in [
             ("rate-limit", response.rate_limit),
@@ -509,12 +585,12 @@ impl Entry {
             ("rate-reset", response.rate_reset),
         ] {
             if let Some(value) = value {
-                line(&mut bytes, &format!("{name} {value}"));
+                line(&mut answer, &format!("{name} {value}"));
             }
         }
-        line(&mut bytes, &format!("status {}", response.status));
+        line(&mut answer, &format!("status {}", response.status));
         line(
-            &mut bytes,
+            &mut answer,
             &match response.retry_after {
                 Some(delay) => format!("retry-after-ms {}", delay.as_millis()),
                 None => "retry-after-ms -".to_owned(),
@@ -522,19 +598,19 @@ impl Entry {
         );
         if let Some(delay) = response.retry_after_header {
             line(
-                &mut bytes,
+                &mut answer,
                 &format!("retry-after-header-ms {}", delay.as_millis()),
             );
         }
         line(
-            &mut bytes,
+            &mut answer,
             &named(
                 "location",
                 without_the_credentials(response.location.as_deref(), bearer, identity).as_deref(),
             ),
         );
         line(
-            &mut bytes,
+            &mut answer,
             &named(
                 "content-type",
                 without_the_credentials(response.content_type.as_deref(), bearer, identity)
@@ -542,7 +618,7 @@ impl Entry {
             ),
         );
         line(
-            &mut bytes,
+            &mut answer,
             &named(
                 "request-id",
                 without_the_credentials(response.request_id.as_deref(), bearer, identity)
@@ -551,26 +627,52 @@ impl Entry {
         );
         // The body too: a destination that echoes the presented token into
         // its answer must not hand it to the next reader of the cache file.
-        bytes.extend_from_slice(&redacted_bytes(
+        answer.extend_from_slice(&redacted_bytes(
             &redacted_bytes(&response.body, bearer),
             identity,
         ));
+        // The integrity header names the answer's length and its SHA-256, so a
+        // file cut short or changed anywhere after the header cannot be served
+        // as a whole answer.
+        let mut bytes = Vec::with_capacity(answer.len() + 128);
+        line(&mut bytes, ENTRY_VERSION);
+        line(&mut bytes, &format!("length {}", answer.len()));
+        line(
+            &mut bytes,
+            &format!("checksum {}", hex(&Sha256::digest(&answer))),
+        );
+        bytes.extend_from_slice(&answer);
         bytes
     }
 
-    /// The strict inverse of [`Self::of`]: the version line, the storage
-    /// stamp, an optional `observed-at` line when the stored answer
-    /// carried its own observation moment, optional numeric rate-limit
-    /// lines, then the five answer header lines and the body. Anything else — another version, a short or
-    /// repeated line, a carriage return in a header — is not an answer.
-    /// An entry written before the `observed-at` line existed (an earlier
-    /// build's entry) has none and still parses: the storage stamp is then
-    /// followed straight by the status line, and `lookup` dates the served
-    /// answer by the storage stamp as it always did.
-    fn parse(bytes: &[u8]) -> Result<Self, ()> {
+    /// The strict inverse of [`Self::of`]: the version line, the length and
+    /// checksum of everything after them, then the storage stamp, an optional
+    /// `observed-at` line when the stored answer carried its own observation
+    /// moment, optional numeric rate-limit lines, the five answer header lines
+    /// and the body.
+    ///
+    /// The length and the checksum are checked before a single metadata line
+    /// is read, so a file cut short or changed anywhere after them is refused
+    /// as a whole. Anything else — another version, a repeated line, a
+    /// carriage return in a header — is not an answer.
+    fn parse(bytes: &[u8]) -> Result<Self, Unusable> {
         let mut rest = bytes;
-        if line_of(&mut rest)? != ENTRY_VERSION.as_bytes() {
-            return Err(());
+        if line_of(&mut rest).map_err(|()| Unusable::Format)? != ENTRY_VERSION.as_bytes() {
+            return Err(Unusable::Format);
+        }
+        let length: usize =
+            header_field(line_of(&mut rest).map_err(|()| Unusable::Format)?, "length")?
+                .parse()
+                .map_err(|_| ())?;
+        let checksum = header_field(
+            line_of(&mut rest).map_err(|()| Unusable::Format)?,
+            "checksum",
+        )?;
+        if rest.len() != length {
+            return Err(Unusable::Length);
+        }
+        if hex(&Sha256::digest(rest)) != checksum {
+            return Err(Unusable::Checksum);
         }
         let stored = header_field(line_of(&mut rest)?, "stored")?
             .parse()
@@ -1058,23 +1160,103 @@ mod tests {
         assert_eq!(parsed.response, response);
     }
 
+    /// The bytes the store left under `key`, as the file holds them.
+    fn entry_bytes(place: &Path, key: &CacheKey) -> Vec<u8> {
+        std::fs::read(place.join(key.hex())).expect("the entry reads")
+    }
+
+    fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     #[test]
-    fn an_entry_written_without_the_observed_at_line_still_parses() {
-        // The exact layout an entry written before the observed-at line
-        // existed has: the storage stamp followed straight by the status.
-        let old = b"iaam-response-cache-v1\nstored 1000\nstatus 200\nretry-after-ms -\nlocation -\ncontent-type -\nrequest-id moex-req-7\npage";
-        let parsed =
-            Entry::parse(old).expect("an entry written without the observed-at line parses");
-        assert_eq!(parsed.stored, 1000);
-        assert_eq!(parsed.observed_at, None, "an old entry has no own moment");
-        assert_eq!(parsed.response.status, 200);
-        assert_eq!(parsed.response.retry_after, None);
-        assert_eq!(parsed.response.rate_limit, None);
-        assert_eq!(parsed.response.rate_remaining, None);
-        assert_eq!(parsed.response.rate_reset, None);
-        assert_eq!(parsed.response.location, None);
-        assert_eq!(parsed.response.request_id.as_deref(), Some("moex-req-7"));
-        assert_eq!(parsed.response.body, b"page");
+    fn a_truncated_entry_is_discarded_not_served() {
+        let time = Shifted::new();
+        let (cache, place) = cache("truncated", &time);
+        let key = CacheKey::of(&moex_read()).expect("a GET is cached");
+        let body = b"<history>pages</history>";
+        cache.store(&key, &answered(200, body), None, None);
+        let bytes = entry_bytes(&place, &key);
+        std::fs::write(place.join(key.hex()), &bytes[..bytes.len() - 4])
+            .expect("the entry is truncated");
+
+        assert_eq!(
+            cache.lookup(&key),
+            None,
+            "a truncated entry is a miss, never a shorter answer"
+        );
+        assert!(
+            !place.join(key.hex()).exists(),
+            "the truncated entry is removed from the store"
+        );
+    }
+
+    #[test]
+    fn a_flipped_metadata_or_body_byte_is_discarded() {
+        // The last character of the status line, and the first byte of the
+        // body: each still parses as the old format, and each must be
+        // refused by the entry's own integrity check.
+        for (needle, offset) in [(&b"status 200"[..], 9), (&b"page"[..], 0)] {
+            let time = Shifted::new();
+            let (cache, place) = cache("flipped", &time);
+            let key = CacheKey::of(&moex_read()).expect("a GET is cached");
+            cache.store(&key, &answered(200, b"page"), None, None);
+            let mut bytes = entry_bytes(&place, &key);
+            let at = position(&bytes, needle).expect("the fixture bytes are in the entry") + offset;
+            bytes[at] ^= 1;
+            std::fs::write(place.join(key.hex()), &bytes).expect("the flipped entry is written");
+
+            assert_eq!(
+                cache.lookup(&key),
+                None,
+                "a flipped byte in {:?} is a miss",
+                String::from_utf8_lossy(needle)
+            );
+            assert!(
+                !place.join(key.hex()).exists(),
+                "the altered entry is removed from the store"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_in_the_old_format_is_discarded_and_the_next_store_rewrites_it() {
+        let time = Shifted::new();
+        let (cache, place) = cache("old-format", &time);
+        let key = CacheKey::of(&moex_read()).expect("a GET is cached");
+        // The exact layout the earlier build wrote: no length, no checksum.
+        std::fs::write(
+            place.join(key.hex()),
+            format!(
+                "iaam-response-cache-v1\nstored {}\nstatus 200\nretry-after-ms -\nlocation -\ncontent-type -\nrequest-id -\npage",
+                cache.stored_now()
+            ),
+        )
+        .expect("the old-format entry is written");
+
+        assert_eq!(
+            cache.lookup(&key),
+            None,
+            "an entry in the old format is a miss, never served"
+        );
+        assert!(
+            !place.join(key.hex()).exists(),
+            "the old-format entry is removed from the store"
+        );
+
+        cache.store(&key, &answered(200, b"page"), None, None);
+        assert_eq!(
+            cache.lookup(&key).map(|response| response.body),
+            Some(b"page".to_vec()),
+            "the next fetch's store rewrites the answer"
+        );
+        let rewritten = entry_bytes(&place, &key);
+        assert!(
+            rewritten.starts_with(ENTRY_VERSION.as_bytes()),
+            "the rewritten entry is the current format"
+        );
     }
 
     #[test]

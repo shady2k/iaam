@@ -176,11 +176,15 @@ SHA-256 fingerprint of the access token — one access's answer never serves
 another, and no file of the cache ever holds the token itself. A cached
 answer sends nothing on the wire, spends nothing from a sync's attempt
 allowance and touches no ceiling, and is logged at `info` like any other
-answer (§3.6). The directory is created 0700 and its files 0600; every access
-removes the entries older than the hour and the store holds at most 1024
-entries, so it never grows without bound. The cache **survives a restart** —
-it is ordinary files — and is cleared by deleting the directory; the next
-answer starts it again.
+answer (§3.6). An entry is whole or it is nothing: each carries its format
+version, its length and a SHA-256 checksum of its metadata and body, is
+`fsync`ed before its rename and its directory after it, and a truncated,
+altered or earlier-format entry is a miss — removed and logged — never a
+short or changed answer. The directory is created 0700 and its files 0600;
+every access removes the entries older than the hour and the store holds at
+most 1024 entries, so it never grows without bound. The cache **survives a
+restart** — it is ordinary files — and is cleared by deleting the directory;
+the next answer starts it again.
 
 Run the executable ceiling proof before enabling broker egress:
 

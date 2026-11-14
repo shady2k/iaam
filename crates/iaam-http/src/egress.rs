@@ -77,6 +77,17 @@ impl BrokerEgress {
     }
 }
 
+/// `fsync`s the directory that holds a name a caller has just created or
+/// replaced, so the rename survives a host crash.
+///
+/// The caller passes a descriptor it already holds and verified (the tally's
+/// egress directory) or one it opened for this step (the response cache): a
+/// path reopened here would not be the directory the rename happened in.
+pub(crate) fn sync_directory(descriptor: impl std::os::fd::AsFd) -> std::io::Result<()> {
+    rustix::fs::fsync(descriptor)
+        .map_err(|source| std::io::Error::from_raw_os_error(source.raw_os_error()))
+}
+
 /// The instance's database could not be resolved to place its egress directory.
 #[derive(Debug, Error)]
 pub enum EgressDirectoryError {

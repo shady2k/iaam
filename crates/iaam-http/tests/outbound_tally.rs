@@ -369,6 +369,70 @@ fn empty_tally(directory: &TempDir) -> PathBuf {
     tally
 }
 
+fn tally_generation(text: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix("generation\t"))
+        .expect("the tally carries its generation")
+        .parse()
+        .expect("the tally generation is a number")
+}
+
+fn recorded_generation(directory: &TempDir) -> String {
+    std::fs::read_to_string(directory.file("outbound-tally-generation"))
+        .expect("the generation record reads")
+}
+
+fn daily_sends(text: &str, host: &str) -> Vec<u64> {
+    let line = text
+        .lines()
+        .find(|line| {
+            let mut fields = line.split('\t');
+            fields.next() == Some("host") && fields.next() == Some(host)
+        })
+        .expect("the tally carries the host");
+    line.split('\t')
+        .nth(3)
+        .expect("the daily sends field")
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse().expect("a daily send timestamp"))
+        .collect()
+}
+
+/// A pair whose tally is one generation ahead of its record: exactly what a
+/// kill between the two renames leaves. The host carries one recorded send,
+/// so a recovery that reset the allowance would show it.
+fn interrupted_pair(directory: &TempDir) -> PathBuf {
+    let tally = directory.file("outbound-tally");
+    let host = Destination::TinkoffProd.base_url();
+    std::fs::write(
+        &tally,
+        format!(
+            "iaam-outbound-tally-v4\ngeneration\t1\nboot\tboot-a\nhigh-water\t1800000000000000000\nhost\t{host}\t1799999999400000000\t1799999999400000000\t-\t-\t-\t-\t\t\t-\t-\t-\n"
+        ),
+    )
+    .expect("the interrupted tally is written");
+    std::fs::write(directory.file("outbound-tally-generation"), "0\n")
+        .expect("the lagging generation record is written");
+    tally
+}
+
+fn wait_for_marker(child: &mut std::process::Child, marker: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the child did not reach the tally barrier"
+        );
+        assert_eq!(
+            child.try_wait().expect("child status"),
+            None,
+            "the child exited before the tally barrier"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn operations() -> HttpRequest {
     HttpRequest::post(
         Destination::TinkoffProd,
@@ -1506,6 +1570,219 @@ async fn rolling_back_only_the_tally_is_refused_without_transport() {
         .expect_err("a tally-generation mismatch is refused");
     assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
     assert_eq!(transport.sent().len(), 2);
+}
+
+#[tokio::test]
+async fn a_kill_between_the_tally_renames_reopens_without_manual_repair() {
+    let directory = TempDir::create("kill-between-renames");
+    let tally = empty_tally(&directory);
+    let marker = directory.file("between-renames-reached");
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "tally_rename_child", "--nocapture"])
+        .env("IAAM_TALLY_RENAME_CHILD_DIRECTORY", &directory.path)
+        .env("IAAM_TALLY_RENAME_CHILD_MARKER", &marker)
+        .spawn()
+        .expect("rename child started");
+    wait_for_marker(&mut child, &marker);
+    child.kill().expect("rename child killed");
+    child.wait().expect("rename child reaped");
+
+    let interrupted = std::fs::read_to_string(&tally).expect("the tally reads");
+    assert_eq!(
+        tally_generation(&interrupted),
+        recorded_generation(&directory)
+            .trim()
+            .parse::<u64>()
+            .expect("the record is a generation")
+            + 1,
+        "the kill must land between the two renames"
+    );
+    assert_eq!(
+        daily_sends(&interrupted, Destination::TinkoffProd.base_url()).len(),
+        2,
+        "both completed sends are in the interrupted tally"
+    );
+
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("a kill between the renames reopens without manual repair");
+
+    let recovered = std::fs::read_to_string(&tally).expect("the recovered tally reads");
+    assert_eq!(
+        tally_generation(&recovered).to_string() + "\n",
+        recorded_generation(&directory),
+        "the generation record is completed to the tally it lagged"
+    );
+    assert_eq!(
+        daily_sends(&recovered, Destination::TinkoffProd.base_url()).len(),
+        3,
+        "the recovered allowance is neither lost nor reset"
+    );
+    assert_eq!(transport.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn a_kill_during_the_record_repair_reopens_and_completes_it_however_often_it_is_killed() {
+    let directory = TempDir::create("kill-during-repair");
+    let tally = interrupted_pair(&directory);
+    for attempt in 1..=2 {
+        let marker = directory.file(&format!("repair-reached-{attempt}"));
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "tally_repair_child", "--nocapture"])
+            .env("IAAM_TALLY_REPAIR_CHILD_DIRECTORY", &directory.path)
+            .env("IAAM_TALLY_REPAIR_CHILD_MARKER", &marker)
+            .spawn()
+            .expect("repair child started");
+        wait_for_marker(&mut child, &marker);
+        child.kill().expect("repair child killed");
+        child.wait().expect("repair child reaped");
+        assert_eq!(
+            recorded_generation(&directory),
+            "0\n",
+            "a kill at the repair point leaves the record incomplete"
+        );
+        assert_eq!(
+            tally_generation(&std::fs::read_to_string(&tally).expect("the tally reads")),
+            1,
+            "the repair never rewrites the tally"
+        );
+    }
+
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("the interrupted repair is completed on the next read");
+
+    let recovered = std::fs::read_to_string(&tally).expect("the recovered tally reads");
+    assert_eq!(
+        tally_generation(&recovered).to_string() + "\n",
+        recorded_generation(&directory)
+    );
+    assert_eq!(
+        daily_sends(&recovered, Destination::TinkoffProd.base_url()).len(),
+        2,
+        "the recorded send survived every kill during the repair"
+    );
+    assert_eq!(transport.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn a_first_write_killed_with_an_empty_record_is_completed_on_the_next_read() {
+    let directory = TempDir::create("first-write-interrupted");
+    let tally = directory.file("outbound-tally");
+    std::fs::write(
+        &tally,
+        "iaam-outbound-tally-v4\ngeneration\t1\nboot\tboot-a\nhigh-water\t1800000000000000000\n",
+    )
+    .expect("the interrupted first tally is written");
+    std::fs::write(directory.file("outbound-tally-generation"), "")
+        .expect("the empty generation record is written");
+
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("an interrupted first write is completed on the next read");
+
+    let recovered = std::fs::read_to_string(&tally).expect("the recovered tally reads");
+    assert_eq!(
+        tally_generation(&recovered).to_string() + "\n",
+        recorded_generation(&directory),
+        "the empty record is completed to the tally it lagged"
+    );
+    assert_eq!(transport.sent().len(), 1);
+}
+
+/// A child that completes one send, then arms the between-renames stop point
+/// inside its second send's response write and waits to be killed there.
+#[test]
+fn tally_rename_child() {
+    let Some(directory) = std::env::var_os("IAAM_TALLY_RENAME_CHILD_DIRECTORY") else {
+        return;
+    };
+    let marker = PathBuf::from(
+        std::env::var_os("IAAM_TALLY_RENAME_CHILD_MARKER").expect("child marker configured"),
+    );
+    let tally = PathBuf::from(directory).join("outbound-tally");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime");
+    runtime.block_on(async {
+        let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        let transport = ArmingTallyTransport {
+            marker,
+            landings: Arc::new(AtomicUsize::new(0)),
+        };
+        let gateway = gateway(transport, &time, &tally);
+        gateway
+            .send(&operations(), None)
+            .await
+            .expect("the first send completes");
+        gateway
+            .send(&operations(), None)
+            .await
+            .expect("the second send is killed between the two renames");
+    });
+}
+
+struct ArmingTallyTransport {
+    marker: PathBuf,
+    landings: Arc<AtomicUsize>,
+}
+
+impl Transport for ArmingTallyTransport {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        panic!("send_observed is the required path");
+    }
+
+    async fn send_observed<'a>(
+        &'a self,
+        _request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
+    ) -> Result<HttpResponse, HttpError> {
+        handoff()?;
+        if self.landings.fetch_add(1, Ordering::SeqCst) > 0 {
+            iaam_http::test_support::arm_tally_barrier("tally-renamed", &self.marker);
+        }
+        let answer = status(200);
+        observe(answer.clone());
+        Ok(answer)
+    }
+}
+
+/// A child that arms the record-repair stop point before its first read, so a
+/// kill lands while the interrupted record is being completed.
+#[test]
+fn tally_repair_child() {
+    let Some(directory) = std::env::var_os("IAAM_TALLY_REPAIR_CHILD_DIRECTORY") else {
+        return;
+    };
+    let marker = PathBuf::from(
+        std::env::var_os("IAAM_TALLY_REPAIR_CHILD_MARKER").expect("child marker configured"),
+    );
+    iaam_http::test_support::arm_tally_barrier("generation-repair-written", &marker);
+    let tally = PathBuf::from(directory).join("outbound-tally");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime");
+    runtime.block_on(async {
+        let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        let transport = RecordingTransport::answering(&time);
+        let gateway = gateway(transport, &time, &tally);
+        let _ = gateway.send(&operations(), None).await;
+    });
 }
 
 #[test]

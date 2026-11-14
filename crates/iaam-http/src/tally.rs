@@ -1,8 +1,6 @@
 use fs2::FileExt;
 use rustix::fd::OwnedFd;
-use rustix::fs::{
-    AtFlags, CWD, FileType, Mode, OFlags, fstat, fsync, open, openat, renameat, statat,
-};
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, fstat, open, openat, renameat, statat};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -503,10 +501,6 @@ impl OutboundTally {
                 state.hosts.insert(host.to_owned(), HostState::default());
             }
             self.persist(&state, tally_identity, generation_identity)?;
-            self.directory
-                .0
-                .generation_high_water
-                .fetch_max(state.generation, Ordering::AcqRel);
             Ok(true)
         })();
         let unlocked = FileExt::unlock(&lock).map_err(|source| TallyError::File {
@@ -998,10 +992,6 @@ impl OutboundTally {
                     TallyError::Corrupt("the tally generation is exhausted".to_owned())
                 })?;
                 self.persist(&state, tally_identity, generation_identity)?;
-                self.directory
-                    .0
-                    .generation_high_water
-                    .fetch_max(state.generation, Ordering::AcqRel);
             } else {
                 self.directory.verify_child(TALLY_FILE, tally_identity)?;
                 self.directory
@@ -1064,24 +1054,58 @@ impl OutboundTally {
                 ));
             }
             state.generation = process_generation;
+            return Ok((state, tally_identity, generation_identity));
+        }
+        let recorded_generation = if generation_text.is_empty() {
+            None
         } else {
-            let recorded_generation = parse_generation(&generation_text)?;
-            if recorded_generation != state.generation {
+            Some(parse_generation(&generation_text)?)
+        };
+        // A tally exactly one generation ahead of its record is a write
+        // interrupted between the two renames; a record that is still empty
+        // beside the first generation is the same interruption of the first
+        // write. Either is completed here, under the caller's exclusive lock
+        // and before any further update (ADR 0042 point 5).
+        let interrupted = match recorded_generation {
+            Some(recorded) if recorded == state.generation => false,
+            Some(recorded) if recorded.checked_add(1) == Some(state.generation) => true,
+            Some(recorded) if recorded > state.generation => {
                 return Err(TallyError::Corrupt(format!(
-                    "the outbound tally generation rolled back from {recorded_generation} to {}; restore the current tally and generation record before retrying",
+                    "the outbound tally generation rolled back from {recorded} to {}; restore the current tally and generation record before retrying",
                     state.generation
                 )));
             }
-            if state.generation < process_generation {
+            Some(recorded) => {
                 return Err(TallyError::Corrupt(format!(
-                    "the tally pair generation {} is older than this process generation high-water {process_generation}; no older tally format was deployed, so restore the current pair before retrying",
+                    "the outbound tally generation {} is more than one generation ahead of its record {recorded}; restore the current tally and generation record before retrying",
                     state.generation
                 )));
             }
-            self.directory
-                .0
-                .generation_high_water
-                .fetch_max(state.generation, Ordering::AcqRel);
+            None if state.generation == 1 => true,
+            None => {
+                return Err(TallyError::Corrupt(format!(
+                    "the outbound tally generation record is empty beside generation {}; restore the current tally and generation record before retrying",
+                    state.generation
+                )));
+            }
+        };
+        if state.generation < process_generation {
+            return Err(TallyError::Corrupt(format!(
+                "the tally pair generation {} is older than this process generation high-water {process_generation}; no older tally format was deployed, so restore the current pair before retrying",
+                state.generation
+            )));
+        }
+        self.directory
+            .0
+            .generation_high_water
+            .fetch_max(state.generation, Ordering::AcqRel);
+        if interrupted {
+            let record_identity = self.complete_generation_record(
+                state.generation,
+                tally_identity,
+                generation_identity,
+            )?;
+            return Ok((state, tally_identity, record_identity));
         }
         Ok((state, tally_identity, generation_identity))
     }
@@ -1135,22 +1159,108 @@ impl OutboundTally {
         self.directory.verify_child(TALLY_FILE, expected_tally)?;
         self.directory
             .verify_child(GENERATION_FILE, expected_generation)?;
-        renameat(
-            &self.directory.0.descriptor,
+        // The tally is renamed first: a kill between the renames then leaves a
+        // tally exactly one generation ahead of its record, which the next
+        // read completes, never a record ahead of its tally, which is a
+        // rollback that spends nothing and refuses (ADR 0042 point 5).
+        self.replace_child(TALLY_TEMP_FILE, TALLY_FILE, "replace the tally file")?;
+        // The renamed tally is the new generation's durable proof: its sends
+        // are under that name from here. Raising the high-water now, not when
+        // `persist` returns, means a failure in the record's rename or the
+        // second directory `fsync` still refuses a later rollback to this
+        // generation, which would lose those sends (ADR 0042 point 5).
+        self.directory
+            .0
+            .generation_high_water
+            .fetch_max(state.generation, Ordering::AcqRel);
+        self.sync_directory()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::tally_barrier("tally-renamed");
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(source) =
+            crate::test_support::tally_failure(&self.directory.0.path, "tally-renamed")
+        {
+            return Err(TallyError::File {
+                action: "persist the tally generation",
+                source,
+            });
+        }
+        self.replace_child(
             GENERATION_TEMP_FILE,
-            &self.directory.0.descriptor,
             GENERATION_FILE,
-        )
-        .map_err(|source| file_error("replace the tally generation", source))?;
+            "replace the tally generation",
+        )?;
+        self.sync_directory()
+    }
+
+    /// Writes `generation` as the record, durably, and answers the identity of
+    /// the record it installed.
+    ///
+    /// The caller holds the tally lock and has verified both files by their
+    /// identities; this verifies them once more before the rename, so a file
+    /// replaced while it was read is refused rather than overwritten.
+    fn complete_generation_record(
+        &self,
+        generation: u64,
+        expected_tally: FileIdentity,
+        expected_generation: FileIdentity,
+    ) -> Result<FileIdentity, TallyError> {
+        self.directory.verify_child(TALLY_FILE, expected_tally)?;
+        self.directory
+            .verify_child(GENERATION_FILE, expected_generation)?;
+        let (mut record, temporary_identity) = self.directory.open_child(
+            GENERATION_TEMP_FILE,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+            "open the temporary tally generation",
+        )?;
+        writeln!(record, "{generation}").map_err(|source| TallyError::File {
+            action: "write the temporary tally generation",
+            source,
+        })?;
+        record.sync_all().map_err(|source| TallyError::File {
+            action: "persist the temporary tally generation",
+            source,
+        })?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::tally_barrier("generation-repair-written");
+        self.directory
+            .verify_child(GENERATION_TEMP_FILE, temporary_identity)?;
+        self.directory.verify_child(TALLY_FILE, expected_tally)?;
+        self.directory
+            .verify_child(GENERATION_FILE, expected_generation)?;
+        self.replace_child(
+            GENERATION_TEMP_FILE,
+            GENERATION_FILE,
+            "complete the tally generation",
+        )?;
+        self.sync_directory()?;
+        // The renamed temporary file keeps its inode, so its identity is the
+        // installed record's identity.
+        Ok(temporary_identity)
+    }
+
+    fn replace_child(
+        &self,
+        temporary: &str,
+        name: &str,
+        action: &'static str,
+    ) -> Result<(), TallyError> {
         renameat(
             &self.directory.0.descriptor,
-            TALLY_TEMP_FILE,
+            temporary,
             &self.directory.0.descriptor,
-            TALLY_FILE,
+            name,
         )
-        .map_err(|source| file_error("replace the tally file", source))?;
-        fsync(&self.directory.0.descriptor)
-            .map_err(|source| file_error("persist the tally directory", source))
+        .map_err(|source| file_error(action, source))
+    }
+
+    fn sync_directory(&self) -> Result<(), TallyError> {
+        crate::egress::sync_directory(&self.directory.0.descriptor).map_err(|source| {
+            TallyError::File {
+                action: "persist the tally directory",
+                source,
+            }
+        })
     }
 }
 
@@ -2490,5 +2600,187 @@ mod tests {
         // The corrupt pair stands untouched: the mint never wrote.
         let record = std::fs::read_to_string(directory.tally_path()).expect("the record reads");
         assert!(record.is_empty(), "the pair was not minted: {record}");
+    }
+
+    fn write_pair(temporary: &TempDir, tally_text: &str, record: &str) {
+        std::fs::write(temporary.0.join(TALLY_FILE), tally_text).expect("the tally is written");
+        std::fs::write(temporary.0.join(GENERATION_FILE), record)
+            .expect("the generation record is written");
+    }
+
+    fn tally_text(generation: u64) -> String {
+        format!("{HEADER}\ngeneration\t{generation}\nboot\ttest-boot\nhigh-water\t100000\n")
+    }
+
+    #[test]
+    fn a_tally_one_generation_ahead_of_its_record_is_completed_on_read() {
+        let (temporary, directory, tally) = tally("repair-ahead-by-one");
+        let interrupted = tally_text(3);
+        write_pair(&temporary, &interrupted, "2\n");
+
+        let (state, tally_identity, record_identity) = tally
+            .read_state()
+            .expect("the interrupted write is completed");
+
+        assert_eq!(state.generation, 3);
+        assert_eq!(
+            std::fs::read_to_string(temporary.0.join(GENERATION_FILE)).expect("the record reads"),
+            "3\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temporary.0.join(TALLY_FILE)).expect("the tally reads"),
+            interrupted,
+            "the repair never rewrites the tally"
+        );
+        // The answered identities are the ones a following write verifies:
+        // the tally is untouched, the record is the file the repair installed.
+        directory
+            .verify_child(TALLY_FILE, tally_identity)
+            .expect("the read tally is the current one");
+        directory
+            .verify_child(GENERATION_FILE, record_identity)
+            .expect("the completed record is the answered one");
+    }
+
+    #[test]
+    fn an_empty_record_beside_the_first_generation_is_completed_on_read() {
+        let (temporary, _directory, tally) = tally("repair-first-write");
+        write_pair(&temporary, &tally_text(1), "");
+
+        let (state, _, _) = tally
+            .read_state()
+            .expect("the interrupted first write is completed");
+
+        assert_eq!(state.generation, 1);
+        assert_eq!(
+            std::fs::read_to_string(temporary.0.join(GENERATION_FILE)).expect("the record reads"),
+            "1\n"
+        );
+    }
+
+    #[test]
+    fn a_tally_behind_its_record_is_still_refused_as_a_rollback() {
+        let (temporary, _directory, tally) = tally("repair-rollback");
+        write_pair(&temporary, &tally_text(2), "3\n");
+
+        let Err(refused) = tally.read_state() else {
+            panic!("a tally behind its record is a rollback");
+        };
+
+        let text = refused.to_string();
+        assert!(text.contains("rolled back from 3 to 2"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(temporary.0.join(GENERATION_FILE)).expect("the record reads"),
+            "3\n",
+            "a refusal writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_tally_more_than_one_generation_ahead_of_its_record_is_refused() {
+        let (temporary, _directory, tally) = tally("repair-two-ahead");
+        write_pair(&temporary, &tally_text(4), "1\n");
+
+        let Err(refused) = tally.read_state() else {
+            panic!("only one interrupted write is completed");
+        };
+
+        let text = refused.to_string();
+        assert!(text.contains("more than one generation ahead"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(temporary.0.join(GENERATION_FILE)).expect("the record reads"),
+            "1\n",
+            "a refusal writes nothing"
+        );
+    }
+
+    #[test]
+    fn an_empty_record_beside_a_later_generation_is_refused() {
+        let (temporary, _directory, tally) = tally("repair-empty-later-record");
+        write_pair(&temporary, &tally_text(2), "");
+
+        let Err(refused) = tally.read_state() else {
+            panic!("only the first write may leave the record empty");
+        };
+
+        let text = refused.to_string();
+        assert!(
+            text.contains("record is empty beside generation 2"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_repair_below_the_process_generation_high_water_is_refused() {
+        let (temporary, _directory, tally) = tally("repair-below-high-water");
+        write_pair(&temporary, &tally_text(3), "2\n");
+        tally
+            .directory
+            .0
+            .generation_high_water
+            .store(4, Ordering::Release);
+
+        let Err(refused) = tally.read_state() else {
+            panic!("a repair below the process high-water is a rollback");
+        };
+
+        let text = refused.to_string();
+        assert!(
+            text.contains("older than this process generation high-water"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temporary.0.join(GENERATION_FILE)).expect("the record reads"),
+            "2\n",
+            "a refusal writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_write_failing_after_the_tally_rename_leaves_that_generation_refused() {
+        let (temporary, _directory, tally) = tally("high-water-after-tally-rename");
+        let host = "https://broker.invalid";
+        let sent = ready_send(&tally, host, Duration::from_secs(10_000));
+        tally
+            .record_response(host, 200, None, &sent)
+            .unwrap_or_else(|error| panic!("record the response: {error}"));
+        let committed_tally =
+            std::fs::read(temporary.0.join(TALLY_FILE)).expect("the committed tally reads");
+        let committed =
+            State::parse(&String::from_utf8(committed_tally.clone()).expect("the tally is UTF-8"))
+                .expect("the committed tally parses")
+                .generation;
+
+        // The generation record's rename fails after the tally has taken the
+        // next generation's name: the write is not committed, but the tally
+        // under that name already holds the sends this write added.
+        crate::test_support::arm_tally_failure("tally-renamed", &temporary.0);
+        let next = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(120));
+        let failed = tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &next);
+        assert!(
+            matches!(failed, Err(TallyError::File { .. })),
+            "the record rename failure was not reported"
+        );
+        let interrupted =
+            std::fs::read(temporary.0.join(TALLY_FILE)).expect("the interrupted tally reads");
+        assert_eq!(
+            State::parse(&String::from_utf8(interrupted).expect("the tally is UTF-8"))
+                .expect("the interrupted tally parses")
+                .generation,
+            committed + 1,
+            "the failed write renamed the tally before it failed"
+        );
+
+        // Restoring the tally alone to the generation before the failure is a
+        // matching pair whose sends are older than the ones the rename made
+        // durable, so the process must refuse it.
+        std::fs::write(temporary.0.join(TALLY_FILE), committed_tally)
+            .expect("the older tally is restored");
+        let refused = tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &next);
+
+        let Err(TallyError::Corrupt(reason)) = refused else {
+            panic!("a tally restored below the failed write's generation was accepted");
+        };
+        assert!(reason.contains("process generation high-water"), "{reason}");
     }
 }

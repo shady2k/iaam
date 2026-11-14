@@ -61,6 +61,8 @@ pub mod request;
 pub mod resilience;
 pub mod response;
 mod tally;
+#[cfg(test)]
+mod test_log;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod trust;

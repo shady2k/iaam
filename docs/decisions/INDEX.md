@@ -44,3 +44,4 @@
 | [0039](0039-the-queue-says-which-reports-it-leaves-unobstructed.md) | The queue says which reports it leaves unobstructed, and names what stands in the way of the rest | 2026-09-05 | proposed | `iaam-i3nx` |
 | [0040](0040-the-agents-authority-is-bounded-by-what-cannot-be-undone.md) | The agent's authority is bounded by what cannot be undone | 2026-09-06 | proposed | `iaam-lzwb`, `iaam-45gc` |
 | [0041](0041-mutation-testing-leaves-ci.md) | Mutation testing leaves CI | 2026-09-25 | accepted | `iaam-osrj` |
+| [0042](0042-a-write-is-one-transaction-after-the-network-and-a-retry-is-recognised.md) | A write is one transaction after the network, and a retry is recognised | 2026-11-14 | accepted | `iaam-mkbfh` |

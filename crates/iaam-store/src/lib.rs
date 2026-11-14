@@ -172,6 +172,20 @@ pub enum StoreError {
     LeaseExpired,
     #[error("synchronization run not found or lease token is invalid")]
     RunNotFound,
+    /// The form of a write that runs inside the caller's transaction was
+    /// called with no transaction open.
+    ///
+    /// ADR 0042 point 1: one request is one transaction, opened by the scenario
+    /// once the network is done. Outside one, each of these writes would commit
+    /// statement by statement — the partial write the decision removed — so
+    /// they refuse rather than run. The name of the method travels with the
+    /// refusal: the caller is a scenario's closure that has not been given a
+    /// transaction, and the method is what it must stop calling there.
+    #[error(
+        "{method} must run inside the caller's transaction: outside one it would commit each \
+         statement of the request on its own (ADR 0042 point 1)"
+    )]
+    NoTransaction { method: &'static str },
     #[error("classification rule field {field} is not JSON: {source}")]
     RuleNotJson {
         field: &'static str,
@@ -424,6 +438,7 @@ impl SqliteStore {
         convert: impl Fn(StoreError) -> E,
         work: impl FnOnce(&mut Self) -> Result<T, E>,
     ) -> Result<T, E> {
+        self.end_abandoned_transaction().map_err(&convert)?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| convert(error.into()))?;
@@ -455,6 +470,46 @@ impl SqliteStore {
                 std::panic::resume_unwind(payload)
             }
         }
+    }
+
+    /// Return the connection to autocommit before a new transaction begins.
+    ///
+    /// SQLite refuses `BEGIN` inside a transaction, and ignoring that refusal
+    /// would leave the connection inside the abandoned one: every later `BEGIN`
+    /// fails the same way and nothing outside it can ever commit. So an open
+    /// transaction found here is rolled back first, and that is logged at error
+    /// level — no caller of [`Self::with_immediate_transaction`] should leave
+    /// one open, and a run that does has lost work the log must account for.
+    ///
+    /// A `ROLLBACK` that itself fails is returned rather than swallowed: the
+    /// connection is then in a state nothing asked for, and running the caller's
+    /// work inside somebody else's transaction is the worse answer.
+    fn end_abandoned_transaction(&mut self) -> Result<(), StoreError> {
+        if self.conn.is_autocommit() {
+            return Ok(());
+        }
+        tracing::error!(
+            "the connection was inside a transaction when another was begun: rolling it back \
+             first, because BEGIN inside a transaction is refused and the connection would \
+             otherwise stay inside the abandoned one"
+        );
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    /// Refuse a write that only makes sense inside the caller's transaction.
+    ///
+    /// The `*_within` methods exist for one caller: a scenario's closure, run
+    /// by [`Self::with_immediate_transaction`], where the whole request is one
+    /// transaction (ADR 0042 point 1). Called with no transaction open they
+    /// would run in autocommit and commit each statement on its own, which is
+    /// the second way to publish this branch closed — so the refusal is here,
+    /// where the method meets the connection, rather than in a doc comment.
+    pub(crate) fn require_transaction(&self, method: &'static str) -> Result<(), StoreError> {
+        if self.conn.is_autocommit() {
+            return Err(StoreError::NoTransaction { method });
+        }
+        Ok(())
     }
 
     /// Sets the connection's busy-wait budget.

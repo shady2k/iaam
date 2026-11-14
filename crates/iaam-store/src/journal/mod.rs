@@ -230,11 +230,15 @@ impl SqliteStore {
     /// around this and everything else the request does, so a request is
     /// whole or leaves nothing (ADR 0042). `MAX(sequence)` reads the caller's
     /// own uncommitted inserts, which is what keeps the order of a batch.
+    /// Called with no transaction open it refuses, naming itself
+    /// (`StoreError::NoTransaction`): one event per commit is the partial write
+    /// the decision removed.
     pub fn append_event_in_order_within(
         &self,
         event: &Event,
         identity_scope: IdentityScope,
     ) -> Result<Appended, StoreError> {
+        self.require_transaction("append_event_in_order_within")?;
         append_in_order(&self.conn, event, identity_scope)
     }
 

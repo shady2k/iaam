@@ -709,6 +709,29 @@ fn the_store_assigns_the_sequence_and_does_not_take_it_from_the_caller() {
         "the number must be assigned by the store, not taken from the event"
     );
 }
+/// The form that runs inside the caller's transaction refuses when it is given
+/// none: one event per commit is the partial batch ADR 0042 removed.
+#[test]
+fn an_append_inside_a_transaction_is_refused_outside_one() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    insert_account(&store, &ctx);
+
+    let refused = store.append_event_in_order_within(&ctx.deposit(1, 100_000), IdentityScope::Source);
+
+    match refused {
+        Err(iaam_store::StoreError::NoTransaction { method }) => {
+            assert_eq!(method, "append_event_in_order_within");
+        }
+        other => panic!("expected the refusal to name the method, got {other:?}"),
+    }
+    assert_eq!(
+        store.load_events(ctx.owner).unwrap().len(),
+        0,
+        "the refusal writes nothing"
+    );
+}
+
 #[test]
 fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
     let ctx = Arc::new(Ctx::new());

@@ -226,13 +226,15 @@ impl SqliteStore {
     /// process keeps a second connection to the same file for market reads, and
     /// a page method that committed there would be a second way to publish,
     /// leaving a kill between the pages with observations no reader can see and
-    /// no completed run that names them.
+    /// no completed run that names them. Called with no transaction open it
+    /// refuses, naming itself (`StoreError::NoTransaction`).
     pub fn record_prices_within(
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
         observations: &[PriceRow],
     ) -> Result<usize, StoreError> {
+        self.require_transaction("record_prices_within")?;
         ensure_run(&self.conn, run)?;
         for observation in observations {
             self.conn.execute(
@@ -272,6 +274,7 @@ impl SqliteStore {
         raw_hash: &str,
         observations: &[AccruedInterestRow],
     ) -> Result<usize, StoreError> {
+        self.require_transaction("record_accrued_interest_within")?;
         ensure_run(&self.conn, run)?;
         for observation in observations {
             self.conn.execute(
@@ -306,6 +309,7 @@ impl SqliteStore {
         raw_hash: &str,
         observations: &[FxRow],
     ) -> Result<usize, StoreError> {
+        self.require_transaction("record_fx_within")?;
         ensure_run(&self.conn, run)?;
         for observation in observations {
             self.conn.execute(
@@ -340,6 +344,7 @@ impl SqliteStore {
         raw_hash: &str,
         observations: &[KeyRateRow],
     ) -> Result<usize, StoreError> {
+        self.require_transaction("record_key_rate_within")?;
         ensure_run(&self.conn, run)?;
         for observation in observations {
             self.conn.execute(
@@ -370,6 +375,7 @@ impl SqliteStore {
         outcome: RunOutcome,
         coverage: Option<Coverage>,
     ) -> Result<(), StoreError> {
+        self.require_transaction("finish_run_within")?;
         let (requested_from, requested_to) = ensure_run(&self.conn, run)?;
         let coverage = coverage.unwrap_or(Coverage {
             from: requested_from,

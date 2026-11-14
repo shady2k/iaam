@@ -715,8 +715,30 @@ fn read_token() -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
 }
 
 async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!(signal = "SIGINT", "shutdown signal received");
+                    }
+                    _ = terminate.recv() => {
+                        tracing::info!(signal = "SIGTERM", "shutdown signal received");
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not install SIGTERM handler; waiting for SIGINT");
+            }
+        }
+    }
+
     let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    tracing::info!(signal = "SIGINT", "shutdown signal received");
 }
 
 #[cfg(test)]

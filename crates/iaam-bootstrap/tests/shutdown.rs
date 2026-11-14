@@ -29,24 +29,24 @@ fn command(home: &std::path::Path) -> Command {
     command
 }
 
-fn answers_http(address: SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) else {
-        return false;
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    if stream
-        .write_all(b"GET /v1/openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
+fn answers_http(address: SocketAddr) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250))?;
+    // Rendering the OpenAPI document can exceed 100 ms on a loaded or
+    // instrumented build. Do not discard a healthy request before it answers.
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(
+        b"GET /v1/openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )?;
     let mut response = [0; 12];
-    stream.read_exact(&mut response).is_ok() && response.starts_with(b"HTTP/1.1 ")
+    stream.read_exact(&mut response)?;
+    if !response.starts_with(b"HTTP/1.1 ") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected HTTP response: {response:?}"),
+        ));
+    }
+    Ok(())
 }
 
 #[test]
@@ -69,13 +69,18 @@ fn serve_exits_successfully_on_sigterm() {
         .spawn()
         .unwrap();
     let mut server = Server { child, home };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !answers_http(address) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while let Err(error) = answers_http(address) {
         assert!(
             server.child.try_wait().unwrap().is_none(),
-            "serve exited before readiness"
+            "serve exited before readiness at {address}; last probe: {error}; logs: {}",
+            std::fs::read_to_string(&log_path).unwrap()
         );
-        assert!(Instant::now() < deadline, "serve did not answer HTTP");
+        assert!(
+            Instant::now() < deadline,
+            "serve did not answer HTTP at {address} within 60 seconds; last probe: {error}; logs: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -91,7 +96,8 @@ fn serve_exits_successfully_on_sigterm() {
         }
         assert!(
             Instant::now() < deadline,
-            "serve did not stop within five seconds"
+            "serve did not stop within five seconds; logs: {}",
+            std::fs::read_to_string(&log_path).unwrap()
         );
         std::thread::sleep(Duration::from_millis(20));
     };

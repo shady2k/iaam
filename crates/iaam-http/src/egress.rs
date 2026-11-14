@@ -77,6 +77,17 @@ impl BrokerEgress {
     }
 }
 
+/// `fsync`s the directory that holds a name a caller has just created or
+/// replaced, so the rename survives a host crash.
+///
+/// The caller passes a descriptor it already holds and verified (the tally's
+/// egress directory) or one it opened for this step (the response cache): a
+/// path reopened here would not be the directory the rename happened in.
+pub(crate) fn sync_directory(descriptor: impl std::os::fd::AsFd) -> std::io::Result<()> {
+    rustix::fs::fsync(descriptor)
+        .map_err(|source| std::io::Error::from_raw_os_error(source.raw_os_error()))
+}
+
 /// The instance's database could not be resolved to place its egress directory.
 #[derive(Debug, Error)]
 pub enum EgressDirectoryError {
@@ -402,5 +413,23 @@ mod resolve_tests {
         let error = BrokerEgress::resolve(|_| Some(OsString::from("maybe")), true)
             .expect_err("an unknown word is refused");
         assert!(error.to_string().contains("use `on` or `off`"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod directory_sync_tests {
+    use super::*;
+
+    #[test]
+    fn a_descriptor_the_kernel_refuses_to_sync_is_reported_not_taken_as_durable() {
+        // A socket is a descriptor `fsync` refuses (EINVAL): a rename it was
+        // meant to make durable must be reported as an error, never pass for
+        // a completed step.
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let refused = sync_directory(&socket).expect_err("a socket cannot be synced");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(rustix::io::Errno::INVAL.raw_os_error())
+        );
     }
 }

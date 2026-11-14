@@ -151,11 +151,14 @@ missing, the process creates it with mode 0700 and the two fresh tally records
 in it — no step needs root. The
 `outbound-tally`, `outbound-tally-generation`, lock, owner and temporary records
 are opened relative to the descriptor without following symlinks, then checked
-again by device and inode. The tally and its separate generation record advance
-together; an emptied tally or a generation mismatch refuses operation instead
-of accepting truncation or rollback. A missing, unreadable, replaced,
-symlinked, hard-linked or corrupt record refuses broker operation; there is no
-in-memory allowance fallback.
+again by device and inode. The tally is renamed before its separate generation
+record, and the directory is `fsync`ed after each rename, so a kill between the
+two renames leaves a tally exactly one generation ahead of its record; the next
+read completes that record before anything else is written. An emptied tally, a
+tally behind its record, or a tally more than one generation ahead of it
+refuses operation instead of accepting truncation or rollback. A missing,
+unreadable, replaced, symlinked, hard-linked or corrupt record refuses broker
+operation; there is no in-memory allowance fallback.
 
 A gateway built with a database — `serve`'s is — also carries the instance's
 **response cache** in a directory beside the database
@@ -173,11 +176,15 @@ SHA-256 fingerprint of the access token — one access's answer never serves
 another, and no file of the cache ever holds the token itself. A cached
 answer sends nothing on the wire, spends nothing from a sync's attempt
 allowance and touches no ceiling, and is logged at `info` like any other
-answer (§3.6). The directory is created 0700 and its files 0600; every access
-removes the entries older than the hour and the store holds at most 1024
-entries, so it never grows without bound. The cache **survives a restart** —
-it is ordinary files — and is cleared by deleting the directory; the next
-answer starts it again.
+answer (§3.6). An entry is whole or it is nothing: each carries its format
+version, its length and a SHA-256 checksum of its metadata and body, is
+`fsync`ed before its rename and its directory after it, and a truncated,
+altered or earlier-format entry is a miss — removed and logged — never a
+short or changed answer. The directory is created 0700 and its files 0600;
+every access removes the entries older than the hour and the store holds at
+most 1024 entries, so it never grows without bound. The cache **survives a
+restart** — it is ordinary files — and is cleared by deleting the directory;
+the next answer starts it again.
 
 Run the executable ceiling proof before enabling broker egress:
 
@@ -356,10 +363,20 @@ at its rolling-day ceiling for 24 hours. This is deliberate; an empty pair
 cannot prove that an earlier tally was unused. Only the current
 `iaam-outbound-tally-v4` format is accepted; no older format was deployed, so
 any older header is corruption, not a migration source. The two records carry
-the same generation. A process also remembers the highest matching generation
-it has read and refuses a later matching pair below that high-water mark, even
-if both files were rolled back together. Leftover temporary files are ignored;
-only the last complete tally and matching generation are read.
+the same generation, except for the one interrupted write the next read
+completes: a tally exactly one generation ahead of its record, or the first
+write's tally beside a record that is still empty, is completed under the tally
+lock, with the same identity checks, before any update. The empty-record
+completion is the interrupted first write's alone: beside any later generation
+an empty record is refused, because a pair may be emptied only by the
+controlled-stop procedure below. A pair emptied while a server is running, then
+interrupted on its first write, therefore needs that documented repair. A tally
+behind its record stays a refused rollback, and a tally more than one generation
+ahead of its record is refused as well, so a tally restored alone is still
+detected. A process also remembers the highest generation it has read or renamed
+into place and refuses a later matching pair below that high-water mark, even if
+both files were rolled back together. Leftover temporary files are ignored; only
+the last complete tally and matching generation are read.
 
 Do not copy, alias, replace, delete or truncate a live egress directory or any
 record in it. The process verifies the path and held inodes before each

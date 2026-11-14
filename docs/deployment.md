@@ -588,6 +588,8 @@ command.
 
 ### 3.6 Start the service
 
+The service stops gracefully on SIGTERM (`docker stop`, Kubernetes) and SIGINT.
+
 ```console
 $ docker run --detach --name iaam --restart unless-stopped \
     --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \

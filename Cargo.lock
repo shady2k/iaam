@@ -1045,6 +1045,7 @@ dependencies = [
  "iaam-http",
  "iaam-server",
  "iaam-store",
+ "nix",
  "rusqlite",
  "rustix",
  "serde_json",

@@ -42,6 +42,7 @@
     "CLAUDE.md",
     "README.md",
     "docs/glossary-ru-en.md",
+    "docs/architecture.md",
     "docs/backlog-integration.md",
     "docs/api/conventions.md",
     "docs/import-boundary.md",

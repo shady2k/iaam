@@ -8,9 +8,10 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Config:** `.backlog/config.json`; read current values there.
 - **Scope:** personal. The files are committed, but the hooks act only in a
   clone that ran `make backlog-connect`, and CI enforces nothing of this.
-- **Vision, roadmap and charters:** none yet. `README.md` describes what the
-  system does today; the current milestone has no charter until `/to-milestone`
-  writes one. Status comes from the tracker, never from a document.
+- **Vision, roadmap and charters:** the vision, with the roadmap, is
+  `docs/vision.md`; charters are `docs/charters/<milestone label>.md`, the
+  current one `docs/charters/m-ready-answers.md`. Status still comes from the
+  tracker, never from a document.
 - **Current specifications:** `docs/api/conventions.md` and the OpenAPI document
   the server publishes (`GET /v1/openapi.json`) for the API contract;
   `docs/import-boundary.md`, `docs/irreversible-core.md`, `docs/deployment.md`.
@@ -92,8 +93,9 @@ are the repository's installation, and each person's plugin and hooks are theirs
 
 ### Checks and execution
 
-- **Charter outcomes:** none: there is no charter yet, so the export carries no
-  `outcomes` and the outcome rules report nothing.
+- **Charter outcomes:** the charter exists as a document, but the adapter does
+  not yet export its outcomes, so the export carries no `outcomes` and the
+  outcome rules still report nothing.
 - **Backlog adapter:** `node .backlog/adapter.mjs [--offline]` reads the live
   store through `tracker-sync.mjs export` (a sync with the remote first;
   `--offline` says it read this machine's store only); `--at <rev>` reads the

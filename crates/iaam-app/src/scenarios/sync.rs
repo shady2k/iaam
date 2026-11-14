@@ -7,7 +7,8 @@ use crate::AppServices;
 use crate::actions::row_name_text;
 use crate::error::AppError;
 use crate::ports::{
-    BrokerChannel, BrokerRequestContext, PortfolioAsOf, Principal, Recorded, SyncRefusalFilter,
+    BrokerChannel, BrokerRequestContext, PortfolioAsOf, Principal, Recorded, Store, StoreTx,
+    SyncRefusalFilter, TxResult,
 };
 use crate::scenarios::coverage_gap;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -29,7 +30,7 @@ use iaam_market::{
 };
 use iaam_store::documents::BrokerCode;
 use iaam_store::market::{
-    AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
+    AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, RunHandle, RunOutcome, SeriesKey,
 };
 use iaam_store::sync_refusals::SyncRefusalRecord;
 use sha2::{Digest, Sha256};
@@ -2047,8 +2048,13 @@ impl MarketSyncResult {
 /// The scenario is the only boundary between `iaam-market` and `iaam-store`:
 /// first the source's domain observations are parsed, then here they
 /// are converted into textual table rows.
+///
+/// Two writes, and no third (ADR 0042): the series' lease before the network,
+/// and then everything the fetch produced — every page and the run's
+/// completion — in one transaction, so a kill anywhere in it publishes nothing
+/// and a kill after it publishes all of it.
 pub async fn sync_market(
-    store: &mut MarketStore,
+    store: &dyn Store,
     transport: &dyn crate::ports::OutboundHttp,
     request: MarketSyncRequest,
 ) -> Result<MarketSyncResult, AppError> {
@@ -2062,13 +2068,13 @@ pub async fn sync_market(
 
     let series = series_for(&request.source);
     let handle = store
-        .begin_run(
+        .begin_market_run(
             series,
             request.from,
             request.to,
             OffsetDateTime::now_utc() + time::Duration::minutes(10),
         )
-        .map_err(store_error)?;
+        .await?;
     let observed_at = iaam_market::ObservedAt(OffsetDateTime::now_utc());
     let http_request = request_for(&request.source, request.from, request.to);
 
@@ -2078,63 +2084,92 @@ pub async fn sync_market(
         // outcome: it decides whether to wait or to fix the request. The run
         // is still closed, or the series' lease would stay held.
         Err(error @ (AppError::SourceUnreachable { .. } | AppError::SourceRefused { .. })) => {
-            partial(store, &handle, error.to_string())?;
+            partial(store, &handle, error.to_string()).await?;
             return Err(error);
         }
-        Err(error) => return partial(store, &handle, error.to_string()),
+        Err(error) => return partial(store, &handle, error.to_string()).await,
     };
     if !(200..300).contains(&response.status) {
         return partial(
             store,
             &handle,
             format!("source returned HTTP {}", response.status),
-        );
+        )
+        .await;
     }
 
     let parsed = match parse_response(&request.source, &response.body, observed_at) {
         Ok(parsed) => parsed,
-        Err(error) => return partial(store, &handle, error.to_string()),
+        Err(error) => return partial(store, &handle, error.to_string()).await,
     };
     let coverage = Coverage {
         from: request.from,
         to: request.to,
     };
-    let result = match parsed {
-        ParsedObservations::Prices { prices, accrued } => {
-            let rows = prices.iter().map(price_row).collect::<Vec<_>>();
-            let written = match store.record_prices(&handle, &response.raw_hash, &rows) {
-                Ok(count) => count,
-                Err(error) => return Err(fail_run(store, &handle, error)),
-            };
-            let accrued_rows = accrued.iter().map(accrued_interest_row).collect::<Vec<_>>();
-            match store.record_accrued_interest(&handle, &response.raw_hash, &accrued_rows) {
-                Ok(count) => written + count,
-                Err(error) => return Err(fail_run(store, &handle, error)),
-            }
-        }
+    let publication = match parsed {
+        ParsedObservations::Prices { prices, accrued } => Publication::Prices {
+            prices: prices.iter().map(price_row).collect(),
+            accrued: accrued.iter().map(accrued_interest_row).collect(),
+        },
         ParsedObservations::Fx(observations) => {
-            let rows = observations.iter().map(fx_row).collect::<Vec<_>>();
-            match store.record_fx(&handle, &response.raw_hash, &rows) {
-                Ok(count) => count,
-                Err(error) => return Err(fail_run(store, &handle, error)),
-            }
+            Publication::Fx(observations.iter().map(fx_row).collect())
         }
         ParsedObservations::KeyRates(observations) => {
-            let rows = observations.iter().map(key_rate_row).collect::<Vec<_>>();
-            match store.record_key_rate(&handle, &response.raw_hash, &rows) {
-                Ok(count) => count,
-                Err(error) => return Err(fail_run(store, &handle, error)),
-            }
+            Publication::KeyRates(observations.iter().map(key_rate_row).collect())
         }
     };
-    store
-        .finish_run(&handle, RunOutcome::Succeeded, Some(coverage))
-        .map_err(store_error)?;
+    let rows = match publish(store, &handle, response.raw_hash, publication, coverage).await {
+        Ok(rows) => rows,
+        Err(error) => return Err(fail_run(store, &handle, error).await),
+    };
     Ok(MarketSyncResult {
         outcome: RunOutcome::Succeeded,
-        rows: result,
+        rows,
         covered: Some(coverage),
     })
+}
+
+/// One response's observations, after the source's shapes have become the
+/// store's rows and before the store sees them.
+///
+/// Prices and accrued interest travel together because one MOEX row carries
+/// both; FX and key rates are whole responses of their own.
+enum Publication {
+    Prices {
+        prices: Vec<PriceRow>,
+        accrued: Vec<AccruedInterestRow>,
+    },
+    Fx(Vec<FxRow>),
+    KeyRates(Vec<KeyRateRow>),
+}
+
+/// Publish one response: its pages and the run's completion in one
+/// transaction, returning the number of rows written.
+async fn publish(
+    store: &dyn Store,
+    handle: &RunHandle,
+    raw_hash: String,
+    publication: Publication,
+    coverage: Coverage,
+) -> Result<usize, AppError> {
+    let run = handle.clone();
+    let work = move |tx: &mut dyn StoreTx| -> Result<TxResult, AppError> {
+        let written = match publication {
+            Publication::Prices { prices, accrued } => {
+                tx.record_prices(&run, &raw_hash, &prices)?
+                    + tx.record_accrued_interest(&run, &raw_hash, &accrued)?
+            }
+            Publication::Fx(rows) => tx.record_fx(&run, &raw_hash, &rows)?,
+            Publication::KeyRates(rows) => tx.record_key_rate(&run, &raw_hash, &rows)?,
+        };
+        tx.finish_run(&run, RunOutcome::Succeeded, Some(coverage))?;
+        Ok(Box::new(written) as TxResult)
+    };
+    let published = store.transact(Box::new(work)).await?;
+    published
+        .downcast::<usize>()
+        .map(|rows| *rows)
+        .map_err(|_| AppError::Store("market publication returned an unexpected result".to_owned()))
 }
 
 /// Synchronise the market through the application's assembled dependencies.
@@ -2145,8 +2180,11 @@ pub async fn sync_market_with_services(
     services: &AppServices,
     request: MarketSyncRequest,
 ) -> Result<MarketSyncResult, AppError> {
-    let mut store = services.market_store.lock().await;
-    sync_market(&mut store, services.http.as_ref(), request).await
+    // The main connection, not the market one: publication is one transaction
+    // with everything else a request writes (ADR 0042 point 1). The market
+    // handle keeps the reads that consult the series, which this scenario does
+    // not perform.
+    sync_market(services.store.as_ref(), services.http.as_ref(), request).await
 }
 
 fn request_for(source: &MarketSource, from: Date, to: Date) -> HttpRequest {
@@ -2347,40 +2385,51 @@ fn executability(value: iaam_market::Executability) -> &'static str {
     }
 }
 
-fn store_error(error: iaam_store::StoreError) -> AppError {
-    AppError::Store(error.to_string())
+/// Close the run after a failed publication and answer with the failure.
+///
+/// The publication's own transaction has already rolled back, so this is a
+/// second transaction that writes nothing but the completion: without it the
+/// series' lease would stay held until it expired.
+async fn fail_run(store: &dyn Store, handle: &RunHandle, error: AppError) -> AppError {
+    let reason = error.to_string();
+    let _ = close_run(store, handle, RunOutcome::Failed { reason }).await;
+    error
 }
 
-fn fail_run(
-    store: &mut MarketStore,
-    handle: &iaam_store::market::RunHandle,
-    error: iaam_store::StoreError,
-) -> AppError {
-    let app_error = store_error(error);
-    let reason = app_error.to_string();
-    let _ = store.finish_run(handle, RunOutcome::Failed { reason }, None);
-    app_error
-}
-
-fn partial(
-    store: &mut MarketStore,
-    handle: &iaam_store::market::RunHandle,
+async fn partial(
+    store: &dyn Store,
+    handle: &RunHandle,
     reason: String,
 ) -> Result<MarketSyncResult, AppError> {
-    store
-        .finish_run(
-            handle,
-            RunOutcome::Partial {
-                reason: reason.clone(),
-            },
-            None,
-        )
-        .map_err(store_error)?;
+    close_run(
+        store,
+        handle,
+        RunOutcome::Partial {
+            reason: reason.clone(),
+        },
+    )
+    .await?;
     Ok(MarketSyncResult {
         outcome: RunOutcome::Partial { reason },
         rows: 0,
         covered: None,
     })
+}
+
+/// Complete a run without publishing anything.
+async fn close_run(
+    store: &dyn Store,
+    handle: &RunHandle,
+    outcome: RunOutcome,
+) -> Result<(), AppError> {
+    let run = handle.clone();
+    store
+        .transact(Box::new(move |tx: &mut dyn StoreTx| {
+            tx.finish_run(&run, outcome, None)?;
+            Ok(Box::new(()) as TxResult)
+        }))
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -2390,8 +2439,63 @@ mod market_tests {
     use async_trait::async_trait;
     use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
     use iaam_core::money::CurrencyCode;
+    use iaam_store::market::MarketStore;
     use iaam_store::reference::InstrumentRecord;
     use time::macros::{date, datetime};
+
+    /// A file-backed store, the adapter the scenario publishes through, and a
+    /// second connection the assertions read with.
+    ///
+    /// Publication is one transaction on the main connection (ADR 0042 point
+    /// 1), and the adapter owns that connection; a reader of the same file is
+    /// what the server's market routes have, and what the test must read with
+    /// to see what a reader would.
+    struct Disk {
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+        adapter: crate::adapters::sqlite::SqliteAdapter,
+    }
+
+    impl Disk {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("iaam-sync-market-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).expect("temporary directory");
+            let path = directory.join("iaam.sqlite");
+            let store = MarketStore::open(&path).expect("store");
+            Self {
+                directory,
+                path,
+                adapter: crate::adapters::sqlite::SqliteAdapter::new(store),
+            }
+        }
+
+        fn seed_instrument(&self, instrument: InstrumentId) {
+            self.reader()
+                .upsert_instrument(&InstrumentRecord {
+                    id: instrument,
+                    kind: Some(InstrumentKind::Share),
+                    symbol: "SBER".to_owned(),
+                    title: "Sberbank".to_owned(),
+                    blocked_tca_flag: false,
+                    currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+                    lineage: None,
+                    metadata: None,
+                })
+                .expect("instrument");
+        }
+
+        /// The same database as a reader sees it.
+        fn reader(&self) -> MarketStore {
+            MarketStore::open_existing(&self.path).expect("read connection")
+        }
+    }
+
+    impl Drop for Disk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
 
     #[test]
     fn one_bond_response_yields_both_prices_and_accrued_interest() {
@@ -2436,27 +2540,16 @@ mod market_tests {
 
     #[tokio::test]
     async fn a_fixture_transport_publishes_market_rows_without_network() {
-        let mut store = MarketStore::open_in_memory().expect("storage");
+        let disk = Disk::new();
         let instrument = InstrumentId::new_random();
-        store
-            .upsert_instrument(&InstrumentRecord {
-                id: instrument,
-                kind: Some(InstrumentKind::Share),
-                symbol: "SBER".to_owned(),
-                title: "Sberbank".to_owned(),
-                blocked_tca_flag: false,
-                currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
-                lineage: None,
-                metadata: None,
-            })
-            .expect("instrument");
+        disk.seed_instrument(instrument);
         let body = include_bytes!("../../../../tests/fixtures/market/moex-iss-history-sber.json");
         let transport = FixtureTransport {
             body: body.to_vec(),
             status: 200,
         };
         let result = sync_market(
-            &mut store,
+            &disk.adapter,
             &transport,
             MarketSyncRequest {
                 source: MarketSource::Moex {
@@ -2473,7 +2566,8 @@ mod market_tests {
         .await
         .expect("synchronisation");
 
-        let first_observed_at: String = store
+        let first_observed_at: String = disk
+            .reader()
             .connection()
             .query_row(
                 "SELECT observed_at FROM price_observations
@@ -2483,7 +2577,8 @@ mod market_tests {
             )
             .expect("time of first observation");
 
-        let first_count: i64 = store
+        let first_count: i64 = disk
+            .reader()
             .connection()
             .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
                 row.get(0)
@@ -2491,7 +2586,7 @@ mod market_tests {
             .expect("number of first observations");
 
         let repeated = sync_market(
-            &mut store,
+            &disk.adapter,
             &transport,
             MarketSyncRequest {
                 source: MarketSource::Moex {
@@ -2508,7 +2603,8 @@ mod market_tests {
         .await
         .expect("repeat synchronisation");
 
-        let second_observed_at: String = store
+        let second_observed_at: String = disk
+            .reader()
             .connection()
             .query_row(
                 "SELECT observed_at FROM price_observations
@@ -2517,7 +2613,8 @@ mod market_tests {
                 |row| row.get(0),
             )
             .expect("time of repeat observation");
-        let second_count: i64 = store
+        let second_count: i64 = disk
+            .reader()
             .connection()
             .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
                 row.get(0)
@@ -2535,7 +2632,7 @@ mod market_tests {
         assert_eq!(result.status(), "succeeded");
         assert!(result.rows > 0);
         assert_eq!(
-            store
+            disk.reader()
                 .complete_through(&SeriesKey {
                     source_id: "moex-iss".to_owned(),
                     dataset: "prices".to_owned(),
@@ -2565,7 +2662,7 @@ mod market_tests {
     /// of the series would find its lease held.
     #[tokio::test]
     async fn an_unreachable_source_is_returned_and_its_run_is_closed() {
-        let mut store = MarketStore::open_in_memory().expect("store");
+        let disk = Disk::new();
         let request = MarketSyncRequest {
             source: MarketSource::CbrKeyRate,
             from: date!(2026 - 02 - 01),
@@ -2573,7 +2670,7 @@ mod market_tests {
         };
 
         for _ in 0..2 {
-            let error = sync_market(&mut store, &UnreachableSource, request.clone())
+            let error = sync_market(&disk.adapter, &UnreachableSource, request.clone())
                 .await
                 .expect_err("the source is unreachable");
             match error {
@@ -2589,7 +2686,7 @@ mod market_tests {
             }
         }
         assert_eq!(
-            store
+            disk.reader()
                 .complete_through(&SeriesKey {
                     source_id: "cbr".to_owned(),
                     dataset: "key_rate".to_owned(),
@@ -2602,13 +2699,13 @@ mod market_tests {
 
     #[tokio::test]
     async fn a_source_failure_is_partial_and_keeps_the_previous_boundary() {
-        let mut store = MarketStore::open_in_memory().expect("store");
+        let disk = Disk::new();
         let transport = FixtureTransport {
             body: Vec::new(),
             status: 503,
         };
         let result = sync_market(
-            &mut store,
+            &disk.adapter,
             &transport,
             MarketSyncRequest {
                 source: MarketSource::CbrKeyRate,
@@ -2622,7 +2719,7 @@ mod market_tests {
         assert_eq!(result.status(), "partial");
         assert!(result.covered.is_none());
         assert_eq!(
-            store
+            disk.reader()
                 .complete_through(&SeriesKey {
                     source_id: "cbr".to_owned(),
                     dataset: "key_rate".to_owned(),

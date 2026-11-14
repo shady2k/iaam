@@ -23,6 +23,9 @@ use crate::ports::{
     SyncRefusalFilter, SyncRefusalRecord, TokenAdmin, TokenView, TransactionalWork, TxResult,
     UnresolvedAccountSourceView, UnresolvedAccountView,
 };
+use crate::ports::{
+    AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, RunHandle, RunOutcome, SeriesKey,
+};
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
 use iaam_broker::credentials::{BrokerScope, BrokerToken, Key, SealedToken, open, seal};
@@ -245,6 +248,61 @@ impl StoreTx for TransactionHandle<'_> {
     ) -> Result<Vec<Event>, AppError> {
         self.store
             .load_events_through(owner, through)
+            .map_err(store_error)
+    }
+
+    fn record_prices(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[PriceRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_prices_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn record_accrued_interest(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[AccruedInterestRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_accrued_interest_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn record_fx(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[FxRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_fx_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn record_key_rate(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[KeyRateRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_key_rate_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn finish_run(
+        &mut self,
+        run: &RunHandle,
+        outcome: RunOutcome,
+        coverage: Option<Coverage>,
+    ) -> Result<(), AppError> {
+        self.store
+            .finish_run_within(run, outcome, coverage)
             .map_err(store_error)
     }
 }
@@ -516,6 +574,21 @@ const fn scope_to_store(scope: Scope) -> TokenScope {
 
 #[async_trait]
 impl Store for SqliteAdapter {
+    async fn begin_market_run(
+        &self,
+        series: SeriesKey,
+        from: Date,
+        to: Date,
+        lease_expires_at: time::OffsetDateTime,
+    ) -> Result<RunHandle, AppError> {
+        self.blocking(move |store| {
+            store
+                .begin_run(series, from, to, lease_expires_at)
+                .map_err(store_error)
+        })
+        .await
+    }
+
     async fn transact(&self, work: TransactionalWork) -> Result<TxResult, AppError> {
         self.blocking(move |store| {
             store.with_immediate_transaction(store_error, |store| {

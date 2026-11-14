@@ -62,7 +62,7 @@ use iaam_server::error::ApiFailure;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::broker_access::NewBrokerAccess;
-use iaam_store::market::AccruedInterestRow;
+use iaam_store::market::{AccruedInterestRow, FixturePublication};
 use iaam_store::market_source_codes::SourceCodeEntry;
 use iaam_store::schedule::{
     CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,

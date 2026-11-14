@@ -68,8 +68,17 @@ pub struct AppServices {
     pub http: Arc<dyn OutboundHttp>,
     /// Dictionary of channel operation types.
     pub broker_dictionary: Arc<dyn BrokerDictionary>,
-    /// Dedicated market connection; blocking operations are not performed
-    /// directly in the async handler.
+    /// Dedicated market connection, for the reads that consult a series:
+    /// prices, accrued interest, FX rates, key rates and payment schedules.
+    /// Blocking operations are not performed directly in the async handler.
+    ///
+    /// **Not where a fetched series is published.** Market sync takes its lease
+    /// and then publishes prices, accrued interest and the run's completion
+    /// through [`Store::transact`] on the main connection, so a kill inside the
+    /// publication leaves nothing and a reader never sees half of a response
+    /// (ADR 0042 point 1). The store's page writes open no transaction of their
+    /// own any more, which is why this handle cannot publish. The schedule sync
+    /// still writes here; moving it is work of its own.
     pub market_store: Arc<tokio::sync::Mutex<MarketStore>>,
     /// The source profiles this deployment reads institutions' exports with.
     ///

@@ -4,7 +4,7 @@
 //! rows; source observation conversion is performed at the application boundary.
 //! of the application.
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime, UtcOffset};
 use uuid::Uuid;
@@ -209,19 +209,25 @@ impl SqliteStore {
         Ok(run)
     }
 
-    /// Write a price page to an unfinished run.
-    pub fn record_prices(
+    /// Write a price page to an unfinished run, inside the caller's
+    /// transaction.
+    ///
+    /// ADR 0042 point 1: a series' publication is one transaction — prices,
+    /// accrued interest and the run's completion — opened by the caller after
+    /// the network. There is deliberately no variant that opens its own: this
+    /// process keeps a second connection to the same file for market reads, and
+    /// a page method that committed there would be a second way to publish,
+    /// leaving a kill between the pages with observations no reader can see and
+    /// no completed run that names them.
+    pub fn record_prices_within(
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
         observations: &[PriceRow],
     ) -> Result<usize, StoreError> {
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_run(&transaction, run)?;
+        ensure_run(&self.conn, run)?;
         for observation in observations {
-            transaction.execute(
+            self.conn.execute(
                 "INSERT INTO price_observations
                      (instrument_id, board, session, trade_date, kind, source_id,
                       observed_at, price, currency, quotation_basis, basis_evidence,
@@ -244,32 +250,23 @@ impl SqliteStore {
                     &run.id,
                 ],
             )?;
+            #[cfg(any(test, feature = "test-support"))]
+            crate::fault::write_completed();
         }
-        let count = i64::try_from(observations.len()).map_err(|_| StoreError::InvalidValue {
-            field: "rows",
-            value: observations.len().to_string(),
-        })?;
-        transaction.execute(
-            "UPDATE sync_runs SET pages = pages + 1, rows = rows + ?1 WHERE id = ?2",
-            params![count, &run.id],
-        )?;
-        transaction.commit()?;
-        Ok(observations.len())
+        record_page(&self.conn, run, observations.len())
     }
 
-    /// Write an accrued-interest observation page to an unfinished run.
-    pub fn record_accrued_interest(
+    /// Write an accrued-interest observation page to an unfinished run, inside
+    /// the caller's transaction.
+    pub fn record_accrued_interest_within(
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
         observations: &[AccruedInterestRow],
     ) -> Result<usize, StoreError> {
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_run(&transaction, run)?;
+        ensure_run(&self.conn, run)?;
         for observation in observations {
-            transaction.execute(
+            self.conn.execute(
                 "INSERT INTO accrued_interest_observations
                      (instrument_id, board, session, trade_date, source_id,
                       observed_at, per_unit, currency, raw_hash, sync_run_id)
@@ -287,32 +284,23 @@ impl SqliteStore {
                     &run.id,
                 ],
             )?;
+            #[cfg(any(test, feature = "test-support"))]
+            crate::fault::write_completed();
         }
-        let count = i64::try_from(observations.len()).map_err(|_| StoreError::InvalidValue {
-            field: "rows",
-            value: observations.len().to_string(),
-        })?;
-        transaction.execute(
-            "UPDATE sync_runs SET pages = pages + 1, rows = rows + ?1 WHERE id = ?2",
-            params![count, &run.id],
-        )?;
-        transaction.commit()?;
-        Ok(observations.len())
+        record_page(&self.conn, run, observations.len())
     }
 
-    /// Write an FX rate page to an unfinished run.
-    pub fn record_fx(
+    /// Write an FX rate page to an unfinished run, inside the caller's
+    /// transaction.
+    pub fn record_fx_within(
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
         observations: &[FxRow],
     ) -> Result<usize, StoreError> {
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_run(&transaction, run)?;
+        ensure_run(&self.conn, run)?;
         for observation in observations {
-            transaction.execute(
+            self.conn.execute(
                 "INSERT INTO fx_observations
                      (from_code, to_code, trade_date, source_id, observed_at,
                       nominal, value, unit_rate, raw_hash, sync_run_id)
@@ -330,32 +318,23 @@ impl SqliteStore {
                     &run.id,
                 ],
             )?;
+            #[cfg(any(test, feature = "test-support"))]
+            crate::fault::write_completed();
         }
-        let count = i64::try_from(observations.len()).map_err(|_| StoreError::InvalidValue {
-            field: "rows",
-            value: observations.len().to_string(),
-        })?;
-        transaction.execute(
-            "UPDATE sync_runs SET pages = pages + 1, rows = rows + ?1 WHERE id = ?2",
-            params![count, &run.id],
-        )?;
-        transaction.commit()?;
-        Ok(observations.len())
+        record_page(&self.conn, run, observations.len())
     }
 
-    /// Write a key rate page to an unfinished run.
-    pub fn record_key_rate(
+    /// Write a key rate page to an unfinished run, inside the caller's
+    /// transaction.
+    pub fn record_key_rate_within(
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
         observations: &[KeyRateRow],
     ) -> Result<usize, StoreError> {
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_run(&transaction, run)?;
+        ensure_run(&self.conn, run)?;
         for observation in observations {
-            transaction.execute(
+            self.conn.execute(
                 "INSERT INTO key_rate_observations
                      (trade_date, source_id, observed_at, rate, raw_hash, sync_run_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -368,30 +347,22 @@ impl SqliteStore {
                     &run.id,
                 ],
             )?;
+            #[cfg(any(test, feature = "test-support"))]
+            crate::fault::write_completed();
         }
-        let count = i64::try_from(observations.len()).map_err(|_| StoreError::InvalidValue {
-            field: "rows",
-            value: observations.len().to_string(),
-        })?;
-        transaction.execute(
-            "UPDATE sync_runs SET pages = pages + 1, rows = rows + ?1 WHERE id = ?2",
-            params![count, &run.id],
-        )?;
-        transaction.commit()?;
-        Ok(observations.len())
+        record_page(&self.conn, run, observations.len())
     }
 
-    /// Complete the run and, only on success, advance the completeness boundary.
-    pub fn finish_run(
+    /// Complete the run and, only on success, advance the completeness
+    /// boundary — inside the caller's transaction, so the observations the
+    /// boundary speaks for become visible only together with it.
+    pub fn finish_run_within(
         &mut self,
         run: &RunHandle,
         outcome: RunOutcome,
         coverage: Option<Coverage>,
     ) -> Result<(), StoreError> {
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (requested_from, requested_to) = ensure_run(&transaction, run)?;
+        let (requested_from, requested_to) = ensure_run(&self.conn, run)?;
         let coverage = coverage.unwrap_or(Coverage {
             from: requested_from,
             to: requested_to,
@@ -416,7 +387,7 @@ impl SqliteStore {
                 false,
             ),
         };
-        let changed = transaction.execute(
+        let changed = self.conn.execute(
             "UPDATE sync_runs
              SET status = ?1, covered_from = ?2, covered_to = ?3,
                  page_errors = ?4, finished_at = ?5,
@@ -436,7 +407,7 @@ impl SqliteStore {
         }
         if publish {
             let complete = format_date(coverage.to);
-            transaction.execute(
+            self.conn.execute(
                 "INSERT INTO series_completeness
                      (source_id, dataset, series_key, complete_through,
                       updated_at, last_successful_run)
@@ -460,7 +431,6 @@ impl SqliteStore {
                 ],
             )?;
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -804,8 +774,8 @@ impl SqliteStore {
     }
 }
 
-fn ensure_run(transaction: &Transaction<'_>, run: &RunHandle) -> Result<(Date, Date), StoreError> {
-    let row: Option<RunRow> = transaction
+fn ensure_run(connection: &Connection, run: &RunHandle) -> Result<(Date, Date), StoreError> {
+    let row: Option<RunRow> = connection
         .query_row(
             "SELECT source_id, dataset, series_key, status,
                     requested_from, requested_to, lease_expires_at
@@ -849,6 +819,23 @@ fn ensure_run(transaction: &Transaction<'_>, run: &RunHandle) -> Result<(Date, D
     Ok((parse_date(&requested_from)?, parse_date(&requested_to)?))
 }
 
+/// Counts one page against the run it belongs to: the rows it carried, and the
+/// page itself.
+///
+/// Shared by the four page kinds, so «a page is one page» cannot come to mean
+/// two things as the kinds drift apart.
+fn record_page(connection: &Connection, run: &RunHandle, rows: usize) -> Result<usize, StoreError> {
+    let count = i64::try_from(rows).map_err(|_| StoreError::InvalidValue {
+        field: "rows",
+        value: rows.to_string(),
+    })?;
+    connection.execute(
+        "UPDATE sync_runs SET pages = pages + 1, rows = rows + ?1 WHERE id = ?2",
+        params![count, &run.id],
+    )?;
+    Ok(rows)
+}
+
 fn format_date(date: Date) -> String {
     date.format(&Iso8601::DATE)
         .expect("ISO-8601 date formatting is infallible")
@@ -869,4 +856,107 @@ fn parse_date(value: &str) -> Result<Date, StoreError> {
         field: "date",
         value: value.to_owned(),
     })
+}
+
+/// One publication step alone, in a transaction of its own.
+///
+/// ADR 0042 point 1 made a series' publication one transaction, so the store
+/// no longer offers a page write that commits by itself — deliberately, since
+/// this process keeps a second connection to the same file for market reads.
+/// A fixture still needs to write one page and read it back, and this trait is
+/// that and nothing else: each method wraps the within-transaction form in the
+/// same `BEGIN IMMEDIATE` the adapter's `Store::transact` uses.
+///
+/// Test-only, like [`crate::fault`]: the feature that exposes it is refused in
+/// a release build by the `compile_error!` in the crate root.
+#[cfg(any(test, feature = "test-support"))]
+pub trait FixturePublication {
+    fn record_prices(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[PriceRow],
+    ) -> Result<usize, StoreError>;
+    fn record_accrued_interest(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[AccruedInterestRow],
+    ) -> Result<usize, StoreError>;
+    fn record_fx(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[FxRow],
+    ) -> Result<usize, StoreError>;
+    fn record_key_rate(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[KeyRateRow],
+    ) -> Result<usize, StoreError>;
+    fn finish_run(
+        &mut self,
+        run: &RunHandle,
+        outcome: RunOutcome,
+        coverage: Option<Coverage>,
+    ) -> Result<(), StoreError>;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FixturePublication for SqliteStore {
+    fn record_prices(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[PriceRow],
+    ) -> Result<usize, StoreError> {
+        self.with_immediate_transaction(std::convert::identity, |store| {
+            store.record_prices_within(run, raw_hash, observations)
+        })
+    }
+
+    fn record_accrued_interest(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[AccruedInterestRow],
+    ) -> Result<usize, StoreError> {
+        self.with_immediate_transaction(std::convert::identity, |store| {
+            store.record_accrued_interest_within(run, raw_hash, observations)
+        })
+    }
+
+    fn record_fx(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[FxRow],
+    ) -> Result<usize, StoreError> {
+        self.with_immediate_transaction(std::convert::identity, |store| {
+            store.record_fx_within(run, raw_hash, observations)
+        })
+    }
+
+    fn record_key_rate(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[KeyRateRow],
+    ) -> Result<usize, StoreError> {
+        self.with_immediate_transaction(std::convert::identity, |store| {
+            store.record_key_rate_within(run, raw_hash, observations)
+        })
+    }
+
+    fn finish_run(
+        &mut self,
+        run: &RunHandle,
+        outcome: RunOutcome,
+        coverage: Option<Coverage>,
+    ) -> Result<(), StoreError> {
+        self.with_immediate_transaction(std::convert::identity, |store| {
+            store.finish_run_within(run, outcome, coverage)
+        })
+    }
 }

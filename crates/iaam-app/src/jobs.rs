@@ -299,8 +299,14 @@ impl MarketSyncJob {
             from,
             to,
         };
-        let mut store = self.services.market_store.lock().await;
-        sync_market(&mut store, self.services.http.as_ref(), request).await
+        // The main connection: publication is one transaction with the run's
+        // completion (ADR 0042 point 1).
+        sync_market(
+            self.services.store.as_ref(),
+            self.services.http.as_ref(),
+            request,
+        )
+        .await
     }
 }
 

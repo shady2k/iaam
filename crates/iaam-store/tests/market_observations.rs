@@ -4,7 +4,8 @@ use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
 use iaam_store::market::{
-    AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, PriceVenue, RunOutcome, SeriesKey,
+    AccruedInterestRow, Coverage, FixturePublication, FxRow, KeyRateRow, PriceRow, PriceVenue,
+    RunOutcome, SeriesKey,
 };
 use iaam_store::reference::InstrumentRecord;
 use iaam_store::{SqliteStore, StoreError};

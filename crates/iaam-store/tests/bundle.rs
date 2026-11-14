@@ -24,7 +24,9 @@ use iaam_store::bundle::{Bundle, ContourReportDefaultSection, ImportOutcome};
 use iaam_store::categories::NewCategoryRule;
 use iaam_store::documents::{BrokerCode, NewDocument, RawRow, ReportFormat, RowStatus};
 use iaam_store::import_session::{NewQuestion, StoredControlFigures};
-use iaam_store::market::{AccruedInterestRow, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};
+use iaam_store::market::{
+    AccruedInterestRow, FixturePublication, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey,
+};
 use iaam_store::market_source_codes::SourceCodeEntry;
 use iaam_store::reference::{
     AccountAliasRecord, AccountDetailRecord, AccountRecord, AccountScopeExclusionRecord,

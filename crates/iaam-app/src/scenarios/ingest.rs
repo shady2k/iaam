@@ -305,6 +305,20 @@ pub async fn append_checked(
     services.store.append_events(events, scope).await
 }
 
+/// The same write inside the caller's transaction (ADR 0042 point 1).
+///
+/// A scenario that writes several things as one request appends through here,
+/// so the validation and the write stay one pair however many times a write
+/// path needs them.
+pub fn append_checked_within(
+    tx: &mut dyn crate::ports::StoreTx,
+    events: Vec<Event>,
+    scope: IdentityScope,
+) -> Result<Vec<Recorded>, AppError> {
+    refuse_malformed(&events)?;
+    tx.append_events_in_order(events, scope)
+}
+
 /// Write one candidate and report the outcome.
 ///
 /// Structural core validation happens before writing: the journal is append-only,

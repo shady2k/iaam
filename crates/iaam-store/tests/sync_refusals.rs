@@ -3,8 +3,8 @@
 //! it (iaam-vg8te.1.2).
 
 use iaam_core::ids::{AccountId, OwnerId};
-use iaam_store::SqliteStore;
 use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
+use iaam_store::{SqliteStore, StoreError};
 use uuid::Uuid;
 
 fn refusal(
@@ -418,5 +418,115 @@ fn a_concurrent_interval_widen_cannot_be_settled_from_a_stale_selection() {
         open.iter().map(|r| r.row_key.as_str()).collect::<Vec<_>>(),
         vec!["row-1"],
         "the widened question survives A's March-only settle"
+    );
+}
+
+/// A refusal recorded inside the caller's transaction belongs to that attempt:
+/// a transaction that fails leaves no question behind, and the method refuses
+/// to write outside one (ADR 0042 point 1).
+#[test]
+fn a_refusal_written_within_a_transaction_refuses_outside_one() {
+    let mut store = SqliteStore::open_in_memory().expect("memory store");
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let record = refusal(
+        owner,
+        account,
+        "row-1",
+        "2026-01-01",
+        "2026-01-31",
+        "no instrument carries ISIN RU000AFIXTUR",
+    );
+
+    let outside = store
+        .upsert_sync_refusal_within(&record)
+        .expect_err("no transaction is open");
+    assert!(
+        matches!(&outside, StoreError::NoTransaction { method }
+            if *method == "upsert_sync_refusal_within"),
+        "{outside}"
+    );
+
+    let failed: Result<(), StoreError> = store.with_immediate_transaction(
+        |error| error,
+        |store| {
+            store.upsert_sync_refusal_within(&record)?;
+            Err(StoreError::NotFound {
+                what: "the rest of the attempt",
+                id: "failed".to_owned(),
+            })
+        },
+    );
+    assert!(failed.is_err(), "the attempt fails after the refusal");
+    assert!(
+        store
+            .list_open_sync_refusals(owner, account, "finam", "2026-01-01", "2026-01-31")
+            .expect("list")
+            .is_empty(),
+        "a transaction that fails leaves no question of its own"
+    );
+
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.upsert_sync_refusal_within(&record),
+        )
+        .expect("the committed transaction keeps its question");
+    assert_eq!(
+        store
+            .list_open_sync_refusals(owner, account, "finam", "2026-01-01", "2026-01-31")
+            .expect("list")
+            .len(),
+        1
+    );
+}
+
+/// A settle inside the caller's transaction counts the records it closed and,
+/// like the refusal write beside it, refuses to run outside one.
+#[test]
+fn a_settle_within_a_transaction_refuses_outside_one() {
+    let mut store = SqliteStore::open_in_memory().expect("memory store");
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    store
+        .upsert_sync_refusal(&refusal(
+            owner,
+            account,
+            "row-1",
+            "2026-01-01",
+            "2026-01-31",
+            "no instrument carries ISIN RU000AFIXTUR",
+        ))
+        .expect("record the question");
+    let filter = SyncRefusalFilter {
+        owner,
+        account,
+        source: "finam".to_owned(),
+        from: "2026-01-01".to_owned(),
+        to: "2026-01-31".to_owned(),
+    };
+
+    let outside = store
+        .settle_sync_refusals_within(&filter, &[])
+        .expect_err("no transaction is open");
+    assert!(
+        matches!(&outside, StoreError::NoTransaction { method }
+            if *method == "settle_sync_refusals_within"),
+        "{outside}"
+    );
+
+    let settled = store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.settle_sync_refusals_within(&filter, &[]),
+        )
+        .expect("the committed transaction settles");
+    assert_eq!(settled, 1, "one covered record, one settle");
+    assert!(
+        store
+            .list_open_sync_refusals(owner, account, "finam", "2026-01-01", "2026-01-31")
+            .expect("list")
+            .is_empty(),
+        "the settled question is closed"
     );
 }

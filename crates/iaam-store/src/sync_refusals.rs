@@ -51,6 +51,25 @@ impl SqliteStore {
     /// again. A record that stopped recurring is settled by
     /// [`SqliteStore::settle_sync_refusals_besides`].
     pub fn upsert_sync_refusal(&self, record: &SyncRefusalRecord) -> Result<(), StoreError> {
+        self.write_sync_refusal(record)
+    }
+
+    /// Record or refresh one refused row inside the caller's transaction.
+    ///
+    /// The same work as [`Self::upsert_sync_refusal`] and no transaction of its
+    /// own: a broker sync records the rows it set aside with the facts and the
+    /// gap of the same attempt, so a kill leaves no question it cannot
+    /// answer (ADR 0042 point 1). Called with no transaction open it refuses,
+    /// naming itself (`StoreError::NoTransaction`).
+    pub fn upsert_sync_refusal_within(&self, record: &SyncRefusalRecord) -> Result<(), StoreError> {
+        self.require_transaction("upsert_sync_refusal_within")?;
+        self.write_sync_refusal(record)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::write_completed();
+        Ok(())
+    }
+
+    fn write_sync_refusal(&self, record: &SyncRefusalRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO sync_refusals
                  (id, owner, account, source, row_key, range_from, range_to,
@@ -181,6 +200,55 @@ impl SqliteStore {
         filter: &SyncRefusalFilter,
         row_keys: &[String],
     ) -> Result<(), StoreError> {
+        // The transaction here is what keeps the selection and the updates
+        // under one write lock; see [`Self::settle_covered_refusals`].
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let outcome = self.settle_covered_refusals(filter, row_keys);
+        match outcome {
+            Ok(_) => self.conn.execute_batch("COMMIT").map_err(Into::into),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Settle the refusals inside the caller's transaction (ADR 0042 point 1).
+    ///
+    /// The same work as [`Self::settle_sync_refusals_besides`] and no
+    /// transaction of its own: the questions a sync settles belong to the
+    /// attempt that re-read the rows, so they land with it or not at all.
+    /// Returns how many records were settled. Called with no transaction open
+    /// it refuses, naming itself (`StoreError::NoTransaction`).
+    pub fn settle_sync_refusals_within(
+        &self,
+        filter: &SyncRefusalFilter,
+        row_keys: &[String],
+    ) -> Result<usize, StoreError> {
+        self.require_transaction("settle_sync_refusals_within")?;
+        let settled = self.settle_covered_refusals(filter, row_keys)?;
+        #[cfg(any(test, feature = "test-support"))]
+        for _ in 0..settled {
+            crate::fault::write_completed();
+        }
+        Ok(settled)
+    }
+
+    /// The covered records are selected, their keys compared in memory,
+    /// and the absent ones settled one bounded statement each — all on
+    /// whichever transaction is open, the caller's or
+    /// [`Self::settle_sync_refusals_besides`]'s. An unbounded NOT IN list
+    /// would trip SQLite's variable limit on a refusal set of more than
+    /// ~32,761 rows, and chunking the list could settle a key present in
+    /// another chunk. Selecting BEFORE the begin would let a concurrent upsert
+    /// widen a record's interval between the selection and the settle, and
+    /// this sync does not cover the widened record — so the begin comes first
+    /// and the selection lives under the write lock with the updates.
+    fn settle_covered_refusals(
+        &self,
+        filter: &SyncRefusalFilter,
+        row_keys: &[String],
+    ) -> Result<usize, StoreError> {
         let SyncRefusalFilter {
             owner,
             account,
@@ -188,17 +256,7 @@ impl SqliteStore {
             from,
             to,
         } = filter;
-        // The covered records are selected, their keys compared in memory,
-        // and the absent ones settled one bounded statement each — all inside
-        // one immediate transaction. An unbounded NOT IN list would trip
-        // SQLite's variable limit on a refusal set of more than ~32,761 rows,
-        // and chunking the list could settle a key present in another chunk.
-        // Selecting BEFORE the begin would let a concurrent upsert widen a
-        // record's interval between the selection and the settle, and this
-        // sync does not cover the widened record — so the begin comes first
-        // and the selection lives under the write lock with the updates.
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let outcome = (|| -> Result<(), StoreError> {
+        {
             let mut statement = self.conn.prepare(
                 "SELECT row_key FROM sync_refusals
                  WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
@@ -217,11 +275,12 @@ impl SqliteStore {
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
             let kept: BTreeSet<&str> = row_keys.iter().map(String::as_str).collect();
+            let mut settled = 0;
             for key in &covered {
                 if kept.contains(key.as_str()) {
                     continue;
                 }
-                self.conn.execute(
+                let updated = self.conn.execute(
                     "UPDATE sync_refusals SET settled = 1
                      WHERE owner = ?1 AND account = ?2 AND source = ?3 AND row_key = ?4
                        AND settled = 0",
@@ -232,15 +291,9 @@ impl SqliteStore {
                         key,
                     ],
                 )?;
+                settled += updated;
             }
-            Ok(())
-        })();
-        match outcome {
-            Ok(()) => self.conn.execute_batch("COMMIT").map_err(Into::into),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
+            Ok(settled)
         }
     }
 }

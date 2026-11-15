@@ -251,6 +251,55 @@ impl StoreTx for TransactionHandle<'_> {
             .map_err(store_error)
     }
 
+    fn instrument(&mut self, id: InstrumentId) -> Result<Option<InstrumentView>, AppError> {
+        self.store
+            .instrument(id)
+            .map(|found| found.map(instrument_view))
+            .map_err(store_error)
+    }
+
+    fn blocked_instrument_handles(&mut self, id: InstrumentId) -> Result<Vec<String>, AppError> {
+        self.store
+            .blocked_instrument_handles(id)
+            .map_err(store_error)
+    }
+
+    fn list_aliases(&mut self) -> Result<Vec<AliasView>, AppError> {
+        self.store
+            .list_aliases()
+            .map(|rows| rows.into_iter().map(alias_view).collect())
+            .map_err(store_error)
+    }
+
+    fn record_broker_account_binding(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: String,
+    ) -> Result<(), AppError> {
+        self.store
+            .record_broker_account_binding_within(owner, account, broker, &broker_account)
+            .map_err(binding_error)
+    }
+
+    fn upsert_sync_refusal(&mut self, record: SyncRefusalRecord) -> Result<(), AppError> {
+        self.store
+            .upsert_sync_refusal_within(&record)
+            .map_err(store_error)
+    }
+
+    fn settle_sync_refusals_besides(
+        &mut self,
+        filter: SyncRefusalFilter,
+        row_keys: &[String],
+    ) -> Result<(), AppError> {
+        self.store
+            .settle_sync_refusals_within(&filter, row_keys)
+            .map(|_settled| ())
+            .map_err(store_error)
+    }
+
     fn record_prices(
         &mut self,
         run: &RunHandle,
@@ -497,6 +546,19 @@ fn store_error(error: iaam_store::StoreError) -> AppError {
             .unwrap_or_default(),
         },
         other => AppError::Store(other.to_string()),
+    }
+}
+
+/// The binding's one typed refusal beyond [`store_error`]'s arms: the account
+/// it names is not this owner's.
+///
+/// Unreachable behind a route that checks ownership first, but the sync
+/// resolves the account straight from the request, so the not-found refusal
+/// reaches the caller typed rather than as a fault.
+fn binding_error(error: iaam_store::StoreError) -> AppError {
+    match error {
+        iaam_store::StoreError::NotFound { what, id } => AppError::NotFound { what, id },
+        other => store_error(other),
     }
 }
 
@@ -1016,24 +1078,9 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .record_broker_account_binding(owner, account, &broker, &broker_account)
-                .map_err(|error| match error {
-                    // The binding named an account this owner does not hold.
-                    // Unreachable behind a route that checks ownership first,
-                    // but the sync resolves the account straight from the
-                    // request, so the not-found refusal reaches the caller
-                    // typed rather than as a fault.
-                    iaam_store::StoreError::NotFound { what, id } => {
-                        AppError::NotFound { what, id }
-                    }
-                    other => store_error(other),
-                })
+                .map_err(binding_error)
         })
         .await
-    }
-
-    async fn upsert_sync_refusal(&self, record: SyncRefusalRecord) -> Result<(), AppError> {
-        self.blocking(move |store| store.upsert_sync_refusal(&record).map_err(store_error))
-            .await
     }
 
     async fn list_open_sync_refusals(
@@ -1048,20 +1095,6 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .list_open_sync_refusals(owner, account, &source, &iso(from), &iso(to))
-                .map_err(store_error)
-        })
-        .await
-    }
-
-    async fn settle_sync_refusals_besides(
-        &self,
-        filter: SyncRefusalFilter,
-        row_keys: &[String],
-    ) -> Result<(), AppError> {
-        let row_keys = row_keys.to_vec();
-        self.blocking(move |store| {
-            store
-                .settle_sync_refusals_besides(&filter, &row_keys)
                 .map_err(store_error)
         })
         .await

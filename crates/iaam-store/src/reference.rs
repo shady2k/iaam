@@ -1445,6 +1445,36 @@ impl SqliteStore {
         broker: &BrokerCode,
         broker_account: &str,
     ) -> Result<(), StoreError> {
+        self.bind_broker_account(owner, account, broker, broker_account)
+    }
+
+    /// Bind the account inside the caller's transaction (ADR 0042 point 1).
+    ///
+    /// The same work as [`Self::record_broker_account_binding`] and no
+    /// transaction of its own: a broker sync writes the binding with the facts
+    /// that confirmed it, so a kill leaves neither. Called with no transaction
+    /// open it refuses, naming itself (`StoreError::NoTransaction`).
+    pub fn record_broker_account_binding_within(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: &str,
+    ) -> Result<(), StoreError> {
+        self.require_transaction("record_broker_account_binding_within")?;
+        self.bind_broker_account(owner, account, broker, broker_account)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::write_completed();
+        Ok(())
+    }
+
+    fn bind_broker_account(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: &str,
+    ) -> Result<(), StoreError> {
         // The typed half of the triggers' work: a binding naming an account
         // this owner does not hold is refused as a not-found answer rather
         // than surfacing as the trigger's abort. The triggers stay — the

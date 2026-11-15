@@ -7,8 +7,8 @@ use crate::AppServices;
 use crate::actions::row_name_text;
 use crate::error::AppError;
 use crate::ports::{
-    BrokerChannel, BrokerRequestContext, PortfolioAsOf, Principal, Recorded, Store, StoreTx,
-    SyncRefusalFilter, TxResult,
+    BrokerChannel, BrokerRequestContext, PendingFullRedemption, PortfolioAsOf, PortfolioSnapshot,
+    Principal, Quarantined, Recorded, Store, StoreTx, SyncRefusalFilter, TxResult,
 };
 use crate::scenarios::coverage_gap;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -19,9 +19,9 @@ use iaam_core::ids::InstrumentId;
 use iaam_core::ids::{AccountId, EventId, OwnerId, PrincipalId};
 use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
 use iaam_http::{HttpRequest, RequestAllowance};
-use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
+use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, IdentityScope, KnownRecord};
 use iaam_ingest::operation::NormalizationContext;
-use iaam_ingest::{Rejection, Verdict, normalize};
+use iaam_ingest::{JournalEventEnrichment, Rejection, Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
 use iaam_market::moex::{HistoryQuery, history_request};
@@ -39,7 +39,6 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use time::Date;
 use time::OffsetDateTime;
-use tracing::Instrument;
 use uuid::Uuid;
 
 /// Why no control assertion was recorded, when none was.
@@ -254,7 +253,7 @@ pub async fn sync_broker(
         .store
         .load_events_through(principal.owner, to)
         .await?;
-    let mut known = known_records(&bounded_events);
+    let known = known_records(&bounded_events);
     // A broker may return an operation outside its requested interval. Its exact
     // recorded identity still avoids redundant enrichment, wherever it was dated.
     let initial_known = known_records(
@@ -373,13 +372,202 @@ pub async fn sync_broker(
     // the discovery made above stand. A sync that fails before this point
     // — a fetch refused, unreadable, or past its deadline — leaves no
     // binding, so a retry asks the access what it sees again instead of
-    // trusting a number nothing confirmed. This is the sync's first write.
+    // trusting a number nothing confirmed.
+    //
+    // Everything the sync writes from here is one transaction, opened after
+    // the last network call (ADR 0042 point 1): the binding, every fact, the
+    // coverage gap, the assertions and the owner's refusal questions land
+    // together or not at all, and a read that depends on this sync's own
+    // earlier writes sees them (point 2). The payment schedule is the one
+    // answer the mapping needs that the transaction does not cover — it lives
+    // on the market connection — so it is taken before the transaction opens.
+    let enrichments =
+        journal_enrichments(services, &parsed.journal, OffsetDateTime::now_utc()).await?;
+    let write = SyncWrite {
+        owner: principal.owner,
+        declared_by: PrincipalId(principal.token_id),
+        account,
+        from,
+        to,
+        broker_code: broker_code.clone(),
+        channel: channel.clone(),
+        identity_scope: broker.identity_scope(),
+        today: services.clock.today(),
+        accepted: parsed.accepted,
+        quarantined: parsed.quarantined,
+        duplicates: parsed.duplicates,
+        journal: journal_rows(parsed.journal, enrichments, parsed.pending_redemptions),
+        snapshot,
+        pending_binding,
+        known,
+        bounded_events,
+        deadline: broker_context.deadline,
+    };
+    let work = move |tx: &mut dyn StoreTx| -> Result<TxResult, AppError> {
+        let written = write_sync(tx, write)?;
+        Ok(Box::new(written) as TxResult)
+    };
+    let written = services.store.transact(Box::new(work)).await?;
+    let SyncWritten {
+        outcome,
+        diagnostic_instruments,
+        missing_fund_units,
+    } = *written
+        .downcast::<SyncWritten>()
+        .map_err(|_| AppError::Store("broker sync returned an unexpected result".to_owned()))?;
+    // The channel's own diagnostics are asked for only once the attempt has
+    // committed: they advise the owner, and nothing this sync writes depends
+    // on their answer.
+    if !missing_fund_units.is_empty() {
+        broker
+            .diagnose_missing_fund_units(
+                &missing_fund_units.into_iter().collect::<Vec<_>>(),
+                &broker_account,
+                (from, to),
+                broker_context,
+            )
+            .await;
+    }
+    if !diagnostic_instruments.is_empty() {
+        broker
+            .diagnose_instruments(
+                &diagnostic_instruments.into_iter().collect::<Vec<_>>(),
+                &broker_account,
+                (from, to),
+                broker_context,
+            )
+            .await;
+    }
+    Ok(outcome)
+}
+
+/// One sync's writes, as the value its transaction runs.
+///
+/// The network is over before this exists: it carries the fetch results, the
+/// binding the access's discovery earned, and the schedule enrichment the
+/// mapping needs — the one read that belongs to the market connection, which
+/// the store's transaction does not cover.
+struct SyncWrite {
+    owner: OwnerId,
+    /// The token that declared these rows.
+    declared_by: PrincipalId,
+    account: AccountId,
+    from: Date,
+    to: Date,
+    broker_code: BrokerCode,
+    channel: SourceChannel,
+    identity_scope: IdentityScope,
+    /// The day this sync runs, which dates a portfolio answer that names none.
+    today: Date,
+    accepted: Vec<iaam_ingest::operation::SubmittedOperation>,
+    quarantined: Vec<Quarantined>,
+    /// The recorded facts this channel's own answer already matched.
+    duplicates: Vec<EventId>,
+    /// Journal facts and pending redemptions, in the order they are resolved.
+    journal: Vec<JournalRow>,
+    /// The portfolio answer; `None` when an out-of-interval trade withheld it.
+    snapshot: Option<PortfolioSnapshot>,
+    /// The binding the access's discovery earned, if no binding stood.
+    pending_binding: Option<String>,
+    /// Every fact recorded before this attempt, extended by its own writes.
+    known: Vec<KnownRecord>,
+    /// The journal of the requested interval, for the audit that only warns.
+    bounded_events: Vec<Event>,
+    /// The sync's deadline, so the audit stops before it as the diagnostics do.
+    deadline: Option<std::time::Instant>,
+}
+
+/// One journal row in the write's order: a fact with the schedule enrichment
+/// taken for it, or a pending redemption resolved as the write reaches it.
+type JournalRow = (
+    Date,
+    Result<(iaam_ingest::SubmittedJournalEvent, JournalEventEnrichment), PendingFullRedemption>,
+);
+
+/// What one sync's transaction leaves behind: its answer, and the instruments
+/// the channel is asked about once the transaction has committed.
+struct SyncWritten {
+    outcome: SyncOutcome,
+    diagnostic_instruments: BTreeSet<InstrumentId>,
+    missing_fund_units: BTreeSet<InstrumentId>,
+}
+
+/// The schedule enrichment of every journal fact, taken before the transaction
+/// because it reads the payment schedule from the market connection; it
+/// depends on the market's rows alone, never on what this sync writes.
+async fn journal_enrichments(
+    services: &AppServices,
+    facts: &[iaam_ingest::SubmittedJournalEvent],
+    knowledge_as_of: OffsetDateTime,
+) -> Result<Vec<JournalEventEnrichment>, AppError> {
+    let mut enrichments = Vec::with_capacity(facts.len());
+    for submitted in facts {
+        enrichments.push(
+            crate::scenarios::ingest::journal_enrichment(services, submitted, knowledge_as_of)
+                .await?,
+        );
+    }
+    Ok(enrichments)
+}
+
+/// The journal facts, each with the schedule enrichment taken for it, and the
+/// pending redemptions, in the date order the write resolves them.
+fn journal_rows(
+    facts: Vec<iaam_ingest::SubmittedJournalEvent>,
+    enrichments: Vec<JournalEventEnrichment>,
+    pending_redemptions: Vec<PendingFullRedemption>,
+) -> Vec<JournalRow> {
+    let mut rows: Vec<JournalRow> = facts
+        .into_iter()
+        .zip(enrichments)
+        .map(|(submitted, enrichment)| {
+            let date = match &submitted.fact {
+                iaam_ingest::JournalFact::CorporateAction(action) => action.effective_date(),
+                iaam_ingest::JournalFact::OfferExercise { day, .. } => *day,
+            };
+            (date, Ok((submitted, enrichment)))
+        })
+        .chain(
+            pending_redemptions
+                .into_iter()
+                .map(|pending| (pending.effective_date, Err(pending))),
+        )
+        .collect();
+    rows.sort_by_key(|(date, _)| *date);
+    rows
+}
+
+/// One sync's writes in one transaction: the binding, every fact, the coverage
+/// gap, the assertions and the owner's refusal questions land together or not
+/// at all (ADR 0042 point 1), and a read that depends on this sync's own
+/// earlier writes — the holding an outbound transfer would take below zero, the
+/// position a full redemption retires — sees them because it runs inside the
+/// same transaction (point 2).
+fn write_sync(tx: &mut dyn StoreTx, write: SyncWrite) -> Result<SyncWritten, AppError> {
+    let SyncWrite {
+        owner,
+        declared_by,
+        account,
+        from,
+        to,
+        broker_code,
+        channel,
+        identity_scope,
+        today,
+        mut accepted,
+        quarantined,
+        duplicates: duplicate_events,
+        journal,
+        snapshot,
+        pending_binding,
+        mut known,
+        bounded_events,
+        deadline,
+    } = write;
+
     let binding_recorded = match pending_binding {
         Some(number) => {
-            services
-                .store
-                .record_broker_account_binding(principal.owner, account, &broker_code, number)
-                .await?;
+            tx.record_broker_account_binding(owner, account, &broker_code, number)?;
             true
         }
         None => false,
@@ -387,20 +575,18 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "map",
         status = "start",
-        accepted = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
+        accepted = accepted.len() + journal.len(),
         "broker sync phase start"
     );
-    let mut diagnostic_instruments =
-        audit_outbound_transfers(&bounded_events, account, broker_context.deadline)?;
+    let mut diagnostic_instruments = audit_outbound_transfers(&bounded_events, account, deadline)?;
     let mut missing_fund_units = std::collections::BTreeSet::new();
-    let mut recorded: Vec<_> = parsed
-        .duplicates
+    let mut recorded: Vec<_> = duplicate_events
         .iter()
         .map(|existing| Verdict::Duplicate {
             existing: *existing,
         })
         .collect();
-    let mut duplicates = parsed.duplicates.len();
+    let mut duplicates = duplicate_events.len();
     let mut possible_duplicates = 0;
     // Every refused row is named. A row the source identified is keyed by that
     // identifier; one it did not is keyed by a fingerprint of its raw payload,
@@ -411,11 +597,11 @@ pub async fn sync_broker(
     // The same set-aside rows are built twice on purpose: the gap event keeps
     // what the attempt was — keys and dimensions, nothing more — while the
     // refusal records keep what the owner can act on — each row with its
-    // reason and original payload (iaam-vg8te.1.2). The record is written to
-    // the store only once every append has succeeded; see
-    // [`keep_refusal_questions`].
+    // reason and original payload (iaam-vg8te.1.2). The records are written
+    // with everything else this attempt writes, so nothing of a killed attempt
+    // reaches the owner; see [`keep_refusal_questions`].
     let refusal_context = RefusalContext {
-        owner: principal.owner,
+        owner,
         account,
         channel: &channel,
         from,
@@ -423,13 +609,13 @@ pub async fn sync_broker(
     };
     let mut refusals: Vec<RefusedRow> = Vec::new();
     let mut refusal_records: Vec<SyncRefusalRecord> = Vec::new();
-    let quarantined = parsed.quarantined.iter().chain(
+    let quarantined_rows = quarantined.iter().chain(
         snapshot
             .as_ref()
             .map(|snapshot| snapshot.refused.as_slice())
             .unwrap_or_default(),
     );
-    for (row_index, row) in quarantined.enumerate() {
+    for (row_index, row) in quarantined_rows.enumerate() {
         tracing::debug!(
             phase = "map",
             row_index,
@@ -459,10 +645,9 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "write",
         status = "start",
-        rows = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
+        rows = accepted.len() + journal.len(),
         "broker sync phase start"
     );
-    let mut accepted = parsed.accepted;
     // Broker pages may arrive newest first. Earlier buys must stand before
     // checking a later outbound transfer against the journal.
     accepted.sort_by_key(|operation| {
@@ -479,12 +664,12 @@ pub async fn sync_broker(
             sheet: None,
             row: None,
             broker_api_source: Some(channel.source),
-            identity_scope: broker.identity_scope(),
+            identity_scope,
         };
         let normalized = match normalize(
             &operation,
             &NormalizationContext {
-                owner: principal.owner,
+                owner,
                 source: channel.source,
                 // What read the broker's response, as the channel records it.
                 // Stated here rather than stamped over the event afterwards:
@@ -519,9 +704,7 @@ pub async fn sync_broker(
             }
         };
         let mut event = normalized.event;
-        event.provenance = event
-            .provenance
-            .with_declared_by(PrincipalId(principal.token_id));
+        event.provenance = event.provenance.with_declared_by(declared_by);
         if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
         {
             tracing::debug!(
@@ -568,7 +751,9 @@ pub async fn sync_broker(
             quantity,
         } = event.kind
         {
-            let held = held_quantity_before_transfer(services, principal.owner, &event).await?;
+            // The holding is read inside the transaction, so it includes the
+            // rows this sync has just written above.
+            let held = held_quantity_before_transfer(tx, owner, &event)?;
             if held.0 < quantity.0 {
                 let reason = "outbound securities transfer would take position below zero";
                 tracing::debug!(
@@ -600,17 +785,14 @@ pub async fn sync_broker(
             }
         }
 
-        let result = crate::scenarios::ingest::append_checked(
-            services,
-            vec![event.clone()],
-            broker.identity_scope(),
-        )
-        .instrument(tracing::info_span!(
+        let result = tracing::info_span!(
             "broker_sync_row",
             row_index,
             operation_type = operation_kind_name(&operation.kind)
-        ))
-        .await?;
+        )
+        .in_scope(|| {
+            crate::scenarios::ingest::append_checked_within(tx, vec![event.clone()], identity_scope)
+        })?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         let verdict = match (possible_duplicate, event_id_from_verdict(&verdict)) {
             (Some((of, level)), Some(event)) => {
@@ -642,27 +824,9 @@ pub async fn sync_broker(
 
     // Resolve repayments in date order, after this sync's position movements
     // have entered the journal. Each lookup is bounded to the repayment date.
-    let mut journal: Vec<_> = parsed
-        .journal
-        .into_iter()
-        .map(|submitted| {
-            let date = match &submitted.fact {
-                iaam_ingest::JournalFact::CorporateAction(action) => action.effective_date(),
-                iaam_ingest::JournalFact::OfferExercise { day, .. } => *day,
-            };
-            (date, Ok(submitted))
-        })
-        .chain(
-            parsed
-                .pending_redemptions
-                .into_iter()
-                .map(|pending| (pending.effective_date, Err(pending))),
-        )
-        .collect();
-    journal.sort_by_key(|(date, _)| *date);
     for (row_index, (_, submission)) in journal.into_iter().enumerate() {
-        let submitted = match submission {
-            Ok(submitted) => submitted,
+        let (submitted, enrichment) = match submission {
+            Ok(pair) => pair,
             Err(pending) => {
                 let context = DocumentContext {
                     account: pending.account,
@@ -670,7 +834,7 @@ pub async fn sync_broker(
                     sheet: None,
                     row: None,
                     broker_api_source: Some(channel.source),
-                    identity_scope: broker.identity_scope(),
+                    identity_scope,
                 };
                 // Identity is checked before looking up holdings: on a repeat
                 // sync the previously recorded redemption has already retired them.
@@ -697,13 +861,11 @@ pub async fn sync_broker(
                     recorded.push(Verdict::Duplicate { existing });
                     continue;
                 }
-                let mut resolved =
-                    resolve_full_redemption(services, principal.owner, &pending).await?;
+                let mut resolved = resolve_full_redemption(tx, owner, &pending)?;
                 if resolved.as_ref().is_err_and(|refusal| refusal.zero_holding)
                     && let Some(bound) = pending.withdrawal_date
                     && let Some(event) =
-                        derived_blocked_arrival(services, principal, &channel, &pending, bound)
-                            .await?
+                        derived_blocked_arrival(tx, owner, declared_by, &channel, &pending, bound)?
                 {
                     let key = event
                         .provenance
@@ -716,12 +878,11 @@ pub async fn sync_broker(
                         &known,
                     );
                     if !matches!(decision, DedupDecision::Duplicate { .. }) {
-                        let result = crate::scenarios::ingest::append_checked(
-                            services,
+                        let result = crate::scenarios::ingest::append_checked_within(
+                            tx,
                             vec![event.clone()],
-                            broker.identity_scope(),
-                        )
-                        .await?;
+                            identity_scope,
+                        )?;
                         let verdict = verdict_from_recorded(&result, &mut duplicates);
                         if let Some(event_id) = event_id_from_verdict(&verdict) {
                             known.push(known_record(&event, event_id));
@@ -739,9 +900,9 @@ pub async fn sync_broker(
                         }
                         recorded.push(verdict);
                     }
-                    resolved = resolve_full_redemption(services, principal.owner, &pending).await?;
+                    resolved = resolve_full_redemption(tx, owner, &pending)?;
                 }
-                match resolved {
+                let submitted = match resolved {
                     Ok(submitted) => submitted,
                     Err(refusal) => {
                         if refusal.missing_fund_units {
@@ -768,7 +929,8 @@ pub async fn sync_broker(
                         recorded.push(Verdict::Quarantined { reason });
                         continue;
                     }
-                }
+                };
+                (submitted, JournalEventEnrichment::default())
             }
         };
         let context = DocumentContext {
@@ -777,7 +939,7 @@ pub async fn sync_broker(
             sheet: None,
             row: None,
             broker_api_source: Some(channel.source),
-            identity_scope: broker.identity_scope(),
+            identity_scope,
         };
         let key = submitted
             .source_operation_id
@@ -789,17 +951,11 @@ pub async fn sync_broker(
                     .clone()
                     .map(dedup::DedupKey::IdempotencyKey)
             });
-        let enrichment = crate::scenarios::ingest::journal_enrichment(
-            services,
-            &submitted,
-            OffsetDateTime::now_utc(),
-        )
-        .await?;
         let normalized = iaam_ingest::normalize_journal_event(
             &submitted,
             &enrichment,
             &NormalizationContext {
-                owner: principal.owner,
+                owner,
                 source: channel.source,
                 parser_version: channel.parser_version.clone(),
             },
@@ -846,9 +1002,7 @@ pub async fn sync_broker(
                 continue;
             }
         };
-        event.provenance = event
-            .provenance
-            .with_declared_by(PrincipalId(principal.token_id));
+        event.provenance = event.provenance.with_declared_by(declared_by);
         let (decision, rule) =
             dedup::assess_with_rule(key.as_ref(), event.provenance.raw_hash(), &context, &known);
         trace_dedup_decision(
@@ -863,12 +1017,11 @@ pub async fn sync_broker(
             recorded.push(Verdict::Duplicate { existing });
             continue;
         }
-        let result = crate::scenarios::ingest::append_checked(
-            services,
+        let result = crate::scenarios::ingest::append_checked_within(
+            tx,
             vec![event.clone()],
-            broker.identity_scope(),
-        )
-        .await?;
+            identity_scope,
+        )?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         let verdict = match (decision, event_id_from_verdict(&verdict)) {
             (DedupDecision::PossibleDuplicate { of, level }, Some(event)) => {
@@ -897,28 +1050,6 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
-    if !missing_fund_units.is_empty() {
-        broker
-            .diagnose_missing_fund_units(
-                &missing_fund_units.into_iter().collect::<Vec<_>>(),
-                &broker_account,
-                (from, to),
-                broker_context,
-            )
-            .await;
-    }
-
-    if !diagnostic_instruments.is_empty() {
-        broker
-            .diagnose_instruments(
-                &diagnostic_instruments.into_iter().collect::<Vec<_>>(),
-                &broker_account,
-                (from, to),
-                broker_context,
-            )
-            .await;
-    }
-
     tracing::info!(
         phase = "map",
         status = "complete",
@@ -933,7 +1064,7 @@ pub async fn sync_broker(
     // A refused row is reported whatever else happens to this response: its
     // reason names what is missing, and it reaches the owner nowhere else. A
     // set-aside position row reaches the owner the same way.
-    recorded.extend(parsed.quarantined.iter().map(|row| Verdict::Quarantined {
+    recorded.extend(quarantined.iter().map(|row| Verdict::Quarantined {
         reason: row.reason.clone(),
     }));
     recorded.extend(
@@ -955,7 +1086,7 @@ pub async fn sync_broker(
     // then skipped, because a gap that taints nothing is not a fact.
     if let Some(mut gap) = coverage_gap_event(
         AssertionTarget {
-            owner: principal.owner,
+            owner,
             account,
             from,
             to,
@@ -970,15 +1101,12 @@ pub async fn sync_broker(
             duplicates += 1;
             recorded.push(Verdict::Duplicate { existing });
         } else {
-            gap.provenance = gap
-                .provenance
-                .with_declared_by(PrincipalId(principal.token_id));
-            let result = crate::scenarios::ingest::append_checked(
-                services,
+            gap.provenance = gap.provenance.with_declared_by(declared_by);
+            let result = crate::scenarios::ingest::append_checked_within(
+                tx,
                 vec![gap.clone()],
-                broker.identity_scope(),
-            )
-            .await?;
+                identity_scope,
+            )?;
             let verdict = verdict_from_recorded(&result, &mut duplicates);
             if let Some(event_id) = event_id_from_verdict(&verdict) {
                 known.push(known_record(&gap, event_id));
@@ -1008,14 +1136,14 @@ pub async fn sync_broker(
     // why no portfolio was fetched for it; refusals only add the coverage gap
     // above and do not suppress the portfolio answer.
     let Some(snapshot) = snapshot else {
-        // The refusals were discovered above; the appends they accompany
+        // The refusals were discovered above; the writes they accompany
         // succeeded, so the questions they raise stand. The portfolio was
         // not asked for (an out-of-interval trade withholds it), so snapshot
         // refusals cannot exist here by construction.
         // The questions this sync raised stand, but nothing settles: the
         // portfolio was never fetched, so the rows that are not in this
         // sync's refusal list are merely the rows it never re-read.
-        keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
+        keep_refusal_questions(tx, &refusal_context, &refusal_records, false)?;
         tracing::info!(
             phase = "assertions",
             status = "skipped",
@@ -1024,14 +1152,18 @@ pub async fn sync_broker(
             "broker sync phase complete"
         );
         let set_aside = set_aside(&recorded);
-        return Ok(SyncOutcome {
-            recorded,
-            duplicates,
-            possible_duplicates,
-            set_aside,
-            assertions: 0,
-            assertions_withheld: None,
-            binding_recorded,
+        return Ok(SyncWritten {
+            outcome: SyncOutcome {
+                recorded,
+                duplicates,
+                possible_duplicates,
+                set_aside,
+                assertions: 0,
+                assertions_withheld: None,
+                binding_recorded,
+            },
+            diagnostic_instruments,
+            missing_fund_units,
         });
     };
     let assertions_withheld = match snapshot.as_of {
@@ -1042,9 +1174,7 @@ pub async fn sync_broker(
             // today is still dated yesterday — and only when the transport
             // gave no moment does the sync's own clock stand in
             // (`iaam-vg8te.1.1`).
-            let as_of = snapshot
-                .observed_on
-                .unwrap_or_else(|| services.clock.today());
+            let as_of = snapshot.observed_on.unwrap_or(today);
             (as_of != to).then_some(AssertionsWithheld::PortfolioDescribesAnotherDay { as_of })
         }
     };
@@ -1055,7 +1185,7 @@ pub async fn sync_broker(
         // portfolio was read but not affirmed, so position refusals absent
         // from this sync's list were not demonstrably re-read whole. A sync
         // that ended in an error would never reach here.
-        keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
+        keep_refusal_questions(tx, &refusal_context, &refusal_records, false)?;
         tracing::info!(
             phase = "assertions",
             status = "skipped",
@@ -1064,14 +1194,18 @@ pub async fn sync_broker(
             "broker sync phase complete"
         );
         let set_aside = set_aside(&recorded);
-        return Ok(SyncOutcome {
-            recorded,
-            duplicates,
-            possible_duplicates,
-            set_aside,
-            assertions: 0,
-            assertions_withheld,
-            binding_recorded,
+        return Ok(SyncWritten {
+            outcome: SyncOutcome {
+                recorded,
+                duplicates,
+                possible_duplicates,
+                set_aside,
+                assertions: 0,
+                assertions_withheld,
+                binding_recorded,
+            },
+            diagnostic_instruments,
+            missing_fund_units,
         });
     }
 
@@ -1081,7 +1215,7 @@ pub async fn sync_broker(
     for (index, claim) in snapshot.claims.into_iter().enumerate() {
         let mut event = assertion_event(
             AssertionTarget {
-                owner: principal.owner,
+                owner,
                 account,
                 from,
                 to,
@@ -1090,9 +1224,7 @@ pub async fn sync_broker(
             &channel,
             index as u32 + 1,
         );
-        event.provenance = event
-            .provenance
-            .with_declared_by(PrincipalId(principal.token_id));
+        event.provenance = event.provenance.with_declared_by(declared_by);
         let key = event.idempotency_key.clone();
         if let Some(existing) = known.iter().find_map(|record| {
             (record.idempotency_key.as_deref() == key.as_deref()).then_some(record.event)
@@ -1101,12 +1233,11 @@ pub async fn sync_broker(
             recorded.push(Verdict::Duplicate { existing });
             continue;
         }
-        let result = crate::scenarios::ingest::append_checked(
-            services,
+        let result = crate::scenarios::ingest::append_checked_within(
+            tx,
             vec![event.clone()],
-            broker.identity_scope(),
-        )
-        .await?;
+            identity_scope,
+        )?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         if matches!(verdict, Verdict::Provisional { .. }) {
             assertions += 1;
@@ -1122,7 +1253,7 @@ pub async fn sync_broker(
     // portfolio was fetched and the assertions were not withheld, so a row
     // absent from this sync's refusal list was re-read whole and is no
     // longer refused.
-    keep_refusal_questions(services, &refusal_context, &refusal_records, true).await?;
+    keep_refusal_questions(tx, &refusal_context, &refusal_records, true)?;
     tracing::info!(
         phase = "assertions",
         status = "complete",
@@ -1132,14 +1263,18 @@ pub async fn sync_broker(
         "broker sync phase complete"
     );
     let set_aside = set_aside(&recorded);
-    Ok(SyncOutcome {
-        recorded,
-        duplicates,
-        possible_duplicates,
-        set_aside,
-        assertions,
-        assertions_withheld: None,
-        binding_recorded,
+    Ok(SyncWritten {
+        outcome: SyncOutcome {
+            recorded,
+            duplicates,
+            possible_duplicates,
+            set_aside,
+            assertions,
+            assertions_withheld: None,
+            binding_recorded,
+        },
+        diagnostic_instruments,
+        missing_fund_units,
     })
 }
 
@@ -1350,10 +1485,10 @@ fn refusal_record(
 
 /// Answer the owner's questions this sync left standing: upsert every row it
 /// refused, and — only when `settle` is true — settle the rows it no longer
-/// refuses among those whose interval the sync's own covers. Only ever called
-/// once every append this sync made has succeeded — a sync that ends in an
-/// error records nothing, so a failed attempt cannot mint a question its
-/// failure should not (iaam-vg8te.1.2).
+/// refuses among those whose interval the sync's own covers. Written inside the
+/// sync's own transaction, so the questions are the attempt's: a killed attempt
+/// leaves none, and a failed one cannot mint a question its failure should not
+/// (iaam-vg8te.1.2).
 ///
 /// The upsert half runs for every successful sync: the rows this sync did
 /// refuse are questions that stand even when the rest of the sync was
@@ -1361,14 +1496,14 @@ fn refusal_record(
 /// sync has no answer about the rows it never re-read, so their absence from
 /// its refusal list proves nothing, and settling them would close the owner's
 /// question on silence (iaam-vg8te.1.2).
-async fn keep_refusal_questions(
-    services: &AppServices,
+fn keep_refusal_questions(
+    tx: &mut dyn StoreTx,
     context: &RefusalContext<'_>,
     records: &[SyncRefusalRecord],
     settle: bool,
 ) -> Result<(), AppError> {
     for record in records {
-        services.store.upsert_sync_refusal(record.clone()).await?;
+        tx.upsert_sync_refusal(record.clone())?;
     }
     if !settle {
         return Ok(());
@@ -1377,19 +1512,16 @@ async fn keep_refusal_questions(
         .iter()
         .map(|record| record.row_key.clone())
         .collect();
-    services
-        .store
-        .settle_sync_refusals_besides(
-            SyncRefusalFilter {
-                owner: context.owner,
-                account: context.account,
-                source: context.channel.source.inner().to_string(),
-                from: context.from.to_string(),
-                to: context.to.to_string(),
-            },
-            &row_keys,
-        )
-        .await
+    tx.settle_sync_refusals_besides(
+        SyncRefusalFilter {
+            owner: context.owner,
+            account: context.account,
+            source: context.channel.source.inner().to_string(),
+            from: context.from.to_string(),
+            to: context.to.to_string(),
+        },
+        &row_keys,
+    )
 }
 
 /// This channel's refusals, as the gap that says so.
@@ -1520,18 +1652,18 @@ fn audit_outbound_transfers(
     Ok(affected)
 }
 
-async fn held_quantity_before_transfer(
-    services: &AppServices,
+/// The holding of the transfer's instrument before the transfer, read inside
+/// the sync's transaction so it includes the rows this sync has just written
+/// (ADR 0042 point 2).
+fn held_quantity_before_transfer(
+    tx: &mut dyn StoreTx,
     owner: OwnerId,
     transfer: &Event,
 ) -> Result<iaam_core::money::Quantity, AppError> {
     use iaam_core::money::Quantity;
     use iaam_core::projection::balances::{Balances, PositionKey};
 
-    let events = services
-        .store
-        .load_events_through(owner, transfer.order.date())
-        .await?;
+    let events = tx.load_events_through(owner, transfer.order.date())?;
     let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
     let mut balances = Balances::new();
     for event in effective {
@@ -1567,11 +1699,16 @@ struct FullRedemptionRefusal {
 
 /// Restores only units proved by a paired withdrawal of a blocked instrument.
 /// Its date bounds the missing history; it does not assert an acquisition date.
-async fn derived_blocked_arrival(
-    services: &AppServices,
-    principal: &Principal,
+///
+/// A read of the catalogue and of the journal, both inside the sync's
+/// transaction: the journal because the history is this sync's through `bound`,
+/// the catalogue because it is the same connection (ADR 0042 point 2).
+fn derived_blocked_arrival(
+    tx: &mut dyn StoreTx,
+    owner: OwnerId,
+    declared_by: PrincipalId,
     channel: &SourceChannel,
-    pending: &crate::ports::PendingFullRedemption,
+    pending: &PendingFullRedemption,
     bound: Date,
 ) -> Result<Option<Event>, AppError> {
     use iaam_ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
@@ -1586,19 +1723,12 @@ async fn derived_blocked_arrival(
     if !quantity.0.is_positive() {
         return Ok(None);
     }
-    let instrument = services
-        .directory
-        .as_ref()
-        .instrument(pending.instrument)
-        .await?;
+    let instrument = tx.instrument(pending.instrument)?;
     if !instrument.is_some_and(|instrument| instrument.blocked_tca_flag) {
         return Ok(None);
     }
     if !pending.blocked_tca_flag && tracing::enabled!(tracing::Level::DEBUG) {
-        let blocking_handles = services
-            .directory
-            .blocked_instrument_handles(pending.instrument)
-            .await?;
+        let blocking_handles = tx.blocked_instrument_handles(pending.instrument)?;
         tracing::debug!(
             instrument = %pending.instrument.inner(),
             withdrawal_operation_id = %withdrawal_id,
@@ -1608,10 +1738,7 @@ async fn derived_blocked_arrival(
             "catalogue instrument blocked by another broker handle"
         );
     }
-    let history = services
-        .store
-        .load_events_through(principal.owner, pending.effective_date)
-        .await?;
+    let history = tx.load_events_through(owner, pending.effective_date)?;
     let effective =
         iaam_core::event::correction::resolve(&history).map_err(AppError::Correction)?;
     if effective.iter().any(|event| {
@@ -1672,7 +1799,7 @@ async fn derived_blocked_arrival(
     let mut event = normalize(
         &operation,
         &NormalizationContext {
-            owner: principal.owner,
+            owner,
             source: channel.source,
             parser_version: channel.parser_version.clone(),
         },
@@ -1684,9 +1811,7 @@ async fn derived_blocked_arrival(
     })?
     .event;
     event.confidence = Confidence::Estimated;
-    event.provenance = event
-        .provenance
-        .with_declared_by(PrincipalId(principal.token_id));
+    event.provenance = event.provenance.with_declared_by(declared_by);
     if let Some(rejection) =
         crate::scenarios::ingest::structural_rejection(&event, "derived_arrival")
     {
@@ -1699,17 +1824,17 @@ async fn derived_blocked_arrival(
     Ok(Some(event))
 }
 
-async fn resolve_full_redemption(
-    services: &AppServices,
+/// The position a full redemption retires, read inside the sync's transaction:
+/// the position movements this sync has just written decide it (ADR 0042
+/// point 2).
+fn resolve_full_redemption(
+    tx: &mut dyn StoreTx,
     owner: OwnerId,
-    pending: &crate::ports::PendingFullRedemption,
+    pending: &PendingFullRedemption,
 ) -> Result<Result<iaam_ingest::SubmittedJournalEvent, FullRedemptionRefusal>, AppError> {
     use iaam_core::event::corporate_action::CorporateAction;
     use iaam_core::projection::balances::{Balances, PositionKey};
-    let events = services
-        .store
-        .load_events_through(owner, pending.effective_date)
-        .await?;
+    let events = tx.load_events_through(owner, pending.effective_date)?;
     let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
     let mut balances = Balances::new();
     for event in &effective {
@@ -1759,7 +1884,7 @@ async fn resolve_full_redemption(
         .filter(|quantity| quantity.0.is_positive())
     else {
         if tracing::enabled!(tracing::Level::DEBUG) {
-            trace_full_redemption_refusal(services, pending, &effective).await;
+            trace_full_redemption_refusal(tx, pending, &effective);
         }
         return Ok(Err(FullRedemptionRefusal {
             reason: format!(
@@ -1789,20 +1914,16 @@ async fn resolve_full_redemption(
     }))
 }
 
-async fn trace_full_redemption_refusal(
-    services: &AppServices,
-    pending: &crate::ports::PendingFullRedemption,
+fn trace_full_redemption_refusal(
+    tx: &mut dyn StoreTx,
+    pending: &PendingFullRedemption,
     events: &[&Event],
 ) {
     use iaam_core::event::kind::{EventKind, TradeSide};
 
     let raw = serde_json::from_str::<serde_json::Value>(&pending.raw).unwrap_or_default();
-    let ticker = services
-        .directory
-        .as_ref()
-        .instrument(pending.instrument)
-        .await;
-    let aliases = services.directory.list_aliases().await;
+    let ticker = tx.instrument(pending.instrument);
+    let aliases = tx.list_aliases();
     let isin = aliases.as_ref().ok().and_then(|aliases| {
         aliases.iter().find(|alias| {
             alias.instrument == pending.instrument

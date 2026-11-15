@@ -5014,6 +5014,80 @@ async fn a_broker_whose_portfolio_fails_leaves_the_journal_unchanged() {
     assert!(load_all(&services, owner).await.is_empty());
 }
 
+/// iaam-ge08: a sync whose portfolio fetch fails after rows were refused
+/// leaves no coverage gap behind, and no question either. The gap is not a fact
+/// about the attempt that may outlive it: it and the assertions land together
+/// or not at all (ADR 0042 point 1).
+#[tokio::test]
+async fn a_portfolio_that_fails_after_rows_were_refused_leaves_no_gap() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let source = SourceId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let mut broker = api(account, source, trade_without_custody(account, instrument));
+    broker.operations = Ok(ParsedOperations {
+        duplicates: Vec::new(),
+        has_out_of_interval_trade: false,
+        accepted: vec![trade_without_custody(account, instrument)],
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
+        quarantined: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::json!({ "symbol": "FIXT@MISX" }),
+            reason: "symbol FIXT@MISX is not resolved to an instrument".to_owned(),
+            dimensions: dimensions(&[Dimension::Positions]),
+        }],
+    });
+    broker.portfolio = Err(BrokerError::Unreachable {
+        broker: "test".to_owned(),
+        detail: "offline".to_owned(),
+        retry_after: None,
+    });
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the portfolio request fails");
+    assert!(
+        matches!(error, AppError::SourceUnreachable { .. }),
+        "{error:?}"
+    );
+
+    let events = load_all(&services, owner).await;
+    assert!(
+        events.is_empty(),
+        "a refused row without the assertions of its attempt leaves no fact and no gap: {:?}",
+        events
+            .iter()
+            .map(|event| event.kind.discriminant())
+            .collect::<Vec<_>>()
+    );
+    let open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source.inner().to_string(),
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals: {error}"));
+    assert!(
+        open.is_empty(),
+        "and no question the attempt did not live to keep: {open:?}"
+    );
+}
+
 // --- iaam-xzz5.3.2: a sync reaches the broker's own account --------------
 
 /// A channel with nothing to say but an access that sees `accounts`.

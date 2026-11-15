@@ -100,6 +100,53 @@ pub trait StoreTx {
         through: Date,
     ) -> Result<Vec<Event>, AppError>;
 
+    /// The catalogue's own row for one instrument, or `None` while the
+    /// catalogue holds none.
+    ///
+    /// A read of the same connection the transaction runs on: the sync's
+    /// mapping asks the catalogue whether a blocked instrument is one, and
+    /// answers from inside the transaction rather than from a copy taken
+    /// before it.
+    fn instrument(&mut self, id: InstrumentId) -> Result<Option<InstrumentView>, AppError>;
+
+    /// The broker handles that block one instrument in the catalogue.
+    fn blocked_instrument_handles(&mut self, id: InstrumentId) -> Result<Vec<String>, AppError>;
+
+    /// Every alias the catalogue holds, for the one diagnostic that names an
+    /// instrument's ISIN beside a refusal.
+    fn list_aliases(&mut self) -> Result<Vec<AliasView>, AppError>;
+
+    /// Bind one of the owner's accounts to the broker's own account number
+    /// for it, inside the caller's transaction.
+    ///
+    /// The same upsert as [`Store::record_broker_account_binding`], except
+    /// that a broker sync writes the binding with the facts that confirmed it,
+    /// so a kill leaves neither (ADR 0042 point 1).
+    fn record_broker_account_binding(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: String,
+    ) -> Result<(), AppError>;
+
+    /// Record or refresh one refused row of a broker sync, inside the caller's
+    /// transaction, so the owner can act on it with the row and the reason in
+    /// hand (`iaam-vg8te.1.2`). A re-sync of the same owner row updates the
+    /// record and reopens it; only a later sync that no longer lists the row
+    /// settles it.
+    fn upsert_sync_refusal(&mut self, record: SyncRefusalRecord) -> Result<(), AppError>;
+
+    /// Settle every open refusal of the channel that this sync no longer
+    /// lists, among those whose interval it demonstrably covers (the filter's
+    /// `from`..`to` is the sync's own). A row that the sync refused again
+    /// stays open, however `row_keys` is ordered.
+    fn settle_sync_refusals_besides(
+        &mut self,
+        filter: SyncRefusalFilter,
+        row_keys: &[String],
+    ) -> Result<(), AppError>;
+
     /// Write one page of price observations to an unfinished run.
     ///
     /// The five methods from here to [`StoreTx::finish_run`] are the steps of
@@ -1223,12 +1270,6 @@ pub trait Store: Send + Sync {
         broker_account: String,
     ) -> Result<(), AppError>;
 
-    /// Record or refresh one refused row of a broker sync, so the owner can
-    /// act on it with the row and the reason in hand (iaam-vg8te.1.2). A
-    /// re-sync of the same owner row updates the record and reopens it; only
-    /// a later sync that no longer lists the row settles it.
-    async fn upsert_sync_refusal(&self, record: SyncRefusalRecord) -> Result<(), AppError>;
-
     /// The open refusals of one owner account and channel whose interval
     /// overlaps `[from, to]`, ordered by the row's key.
     async fn list_open_sync_refusals(
@@ -1239,16 +1280,6 @@ pub trait Store: Send + Sync {
         from: Date,
         to: Date,
     ) -> Result<Vec<SyncRefusalRecord>, AppError>;
-
-    /// Settle every open refusal of the channel that a later sync no longer
-    /// lists, among those whose interval the later sync demonstrably covers
-    /// (the filter's `from`..`to` is the sync's own). A row that the sync
-    /// refused again stays open, however `row_keys` is ordered.
-    async fn settle_sync_refusals_besides(
-        &self,
-        filter: SyncRefusalFilter,
-        row_keys: &[String],
-    ) -> Result<(), AppError>;
 
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
     async fn list_account_activity(

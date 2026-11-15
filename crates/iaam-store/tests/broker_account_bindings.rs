@@ -157,3 +157,66 @@ fn one_owners_binding_is_another_owners_silence() {
         None,
     );
 }
+
+/// A binding written inside the caller's transaction belongs to that attempt:
+/// a transaction that fails leaves no binding behind, and the method refuses
+/// to write outside one (ADR 0042 point 1).
+#[test]
+fn a_binding_written_within_a_transaction_refuses_outside_one() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let account = seed_account(&store, owner);
+
+    let outside = store
+        .record_broker_account_binding_within(owner, account, &broker(), "invented-one")
+        .expect_err("no transaction is open");
+    assert!(
+        matches!(&outside, StoreError::NoTransaction { method }
+            if *method == "record_broker_account_binding_within"),
+        "{outside}"
+    );
+
+    let failed: Result<(), StoreError> = store.with_immediate_transaction(
+        |error| error,
+        |store| {
+            store.record_broker_account_binding_within(
+                owner,
+                account,
+                &broker(),
+                "invented-one",
+            )?;
+            Err(StoreError::NotFound {
+                what: "the facts that confirmed the number",
+                id: "failed".to_owned(),
+            })
+        },
+    );
+    assert!(failed.is_err(), "the attempt fails after the binding");
+    assert_eq!(
+        store
+            .broker_account_binding(owner, account, &broker())
+            .unwrap(),
+        None,
+        "a transaction that fails leaves no binding"
+    );
+
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| {
+                store.record_broker_account_binding_within(
+                    owner,
+                    account,
+                    &broker(),
+                    "invented-one",
+                )
+            },
+        )
+        .expect("the committed transaction keeps its binding");
+    assert_eq!(
+        store
+            .broker_account_binding(owner, account, &broker())
+            .unwrap(),
+        Some("invented-one".to_owned()),
+    );
+}

@@ -95,9 +95,10 @@ async fn failed_detail_write_logs_the_statement_and_batch_row_without_financial_
         .with_max_level(tracing::Level::TRACE)
         .with_writer(move || writer.clone())
         .finish();
-    // Global, not thread-local: a callsite's interest is cached once per
-    // process, and a thread-local default does not rebuild it, so the span's
-    // fields would never be formatted.
+    // Global, not thread-local: the write happens on a `spawn_blocking`
+    // worker, and a capture that depends on the adapter propagating the
+    // thread-local dispatcher would stop proving anything the moment it
+    // stopped doing so.
     tracing::subscriber::set_global_default(subscriber)
         .expect("this test binary sets the subscriber once");
 

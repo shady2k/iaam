@@ -16,12 +16,13 @@ use crate::ports::{
     BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore,
     CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
     ControlAssertionView, CustodyUpsert, CustodyView, DecisionQuery, DecisionRecord, Declared,
-    DeclinedAccountNameView, DocumentToKeep, ImportObservationView, ImportQuestionView,
-    ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
-    InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery,
-    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store, StoreTx,
-    SyncRefusalFilter, SyncRefusalRecord, TokenAdmin, TokenView, TransactionalWork, TxResult,
-    UnresolvedAccountSourceView, UnresolvedAccountView,
+    DeclinedAccountNameView, DocumentToKeep, ImportCommitReceipt, ImportObservationView,
+    ImportPlanReads, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
+    ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
+    JournalQuery, JournalSourceCategoryQuery, NewImportQuestion, Principal, Recorded,
+    RecordedEvent, Scope, SoleOwner, Store, StoreTx, SyncRefusalFilter, SyncRefusalRecord,
+    TokenAdmin, TokenView, TransactionalWork, TxResult, UnresolvedAccountSourceView,
+    UnresolvedAccountView,
 };
 use crate::ports::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, RunHandle, RunOutcome, SeriesKey,
@@ -59,8 +60,8 @@ use iaam_store::documents::{
     ReportFormat as StoredReportFormat,
 };
 use iaam_store::import_session::{
-    NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredControlFigures,
-    StoredObservation, StoredQuestion, StoredSession, StoredSessionSummary,
+    NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredCommitReceipt,
+    StoredControlFigures, StoredObservation, StoredQuestion, StoredSession, StoredSessionSummary,
 };
 use iaam_store::journal::{
     AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
@@ -300,6 +301,45 @@ impl StoreTx for TransactionHandle<'_> {
             .map_err(store_error)
     }
 
+    fn import_plan_reads(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportPlanReads>, AppError> {
+        import_plan_reads_of(self.store, owner, session)
+    }
+
+    fn import_commit_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportCommitReceipt>, AppError> {
+        self.store
+            .import_commit_receipt(owner, session)
+            .map(|found| {
+                found.map(
+                    |StoredCommitReceipt { revision, receipt }| ImportCommitReceipt {
+                        revision,
+                        answer: receipt,
+                    },
+                )
+            })
+            .map_err(store_error)
+    }
+
+    fn commit_import_session(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        revision: &str,
+        answer: &str,
+    ) -> Result<(), AppError> {
+        self.store
+            .commit_import_session_within(owner, session, revision, answer)
+            .map(|_closed| ())
+            .map_err(import_session_error)
+    }
+
     fn record_prices(
         &mut self,
         run: &RunHandle,
@@ -495,6 +535,130 @@ fn control_figures_view(record: StoredControlFigures) -> Result<ControlSection, 
 /// A closed session and a missing one are one `NotFound` here as they are in the
 /// store: distinguishing them would tell a caller holding a stranger's
 /// identifier that the session exists.
+/// One session's plan reads, on whichever connection the caller holds
+/// (ADR 0042 point 2).
+///
+/// The one list of reads a plan is computed from ([`ImportPlanReads`]). The
+/// assessment route reaches it through the port's `blocking`, the commit through
+/// the transaction handle, and both go through here so that the plan a caller
+/// approves and the plan a commit writes cannot be computed from different
+/// readings — a second list would be a second answer to «what does this plan
+/// depend on».
+///
+/// The owner is checked by the first read: a session identifier is not an access
+/// right (§14), and the rows, questions and figures carry no owner of their own.
+fn import_plan_reads_of(
+    store: &mut SqliteStore,
+    owner: OwnerId,
+    session: ImportSessionId,
+) -> Result<Option<ImportPlanReads>, AppError> {
+    let Some(found) = store
+        .load_import_session(owner, session)
+        .map_err(store_error)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ImportPlanReads {
+        session: import_session_view(found),
+        observations: store
+            .list_import_observations(session)
+            .map_err(store_error)?
+            .into_iter()
+            .map(import_observation_view)
+            .collect(),
+        questions: store
+            .list_import_questions(session)
+            .map_err(store_error)?
+            .into_iter()
+            .map(import_question_view)
+            .collect(),
+        control_figures: store
+            .list_import_control_figures(session)
+            .map_err(store_error)?
+            .into_iter()
+            .map(control_figures_view)
+            .collect::<Result<Vec<_>, _>>()?,
+        contours: contour_views(store, owner)?,
+        exclusions: store
+            .list_account_scope_exclusions(owner)
+            .map_err(store_error)?
+            .into_iter()
+            .map(
+                |record: AccountScopeExclusionRecord| AccountScopeExclusionView {
+                    account: record.account,
+                    reason: record.reason,
+                },
+            )
+            .collect(),
+        unresolved: store
+            .list_unresolved_accounts(owner)
+            .map_err(store_error)?
+            .into_iter()
+            .map(|record| UnresolvedAccountView {
+                session: ImportSessionId(record.import_session),
+                document_hash: record.document_hash.as_str().to_owned(),
+                printed: record.printed,
+                records: record.records,
+            })
+            .collect(),
+        accounts: store
+            .list_account_details(owner)
+            .map_err(store_error)?
+            .into_iter()
+            .map(account_detail_view)
+            .collect(),
+        transfer_statements: store
+            .list_account_transfer_statements(owner)
+            .map_err(store_error)?
+            .into_iter()
+            .map(
+                |record: AccountTransferStatementRecord| AccountTransferStatementView {
+                    account: record.account,
+                    partners: record.partners,
+                },
+            )
+            .collect(),
+        classification_rules: store
+            .rule_history(owner)
+            .map_err(store_error)?
+            .into_iter()
+            .map(classification_rule_view)
+            .collect::<Result<Vec<_>, _>>()?,
+        journal: store
+            .load_events_through(owner, time::Date::MAX)
+            .map_err(store_error)?,
+    }))
+}
+
+/// The owner's contours, each with the accounts of its current version.
+///
+/// One function because the assessment route and the plan's own read list both
+/// need it, and two loops over the same listing would be two answers to «which
+/// accounts does this contour hold».
+fn contour_views(store: &SqliteStore, owner: OwnerId) -> Result<Vec<ContourView>, AppError> {
+    let contours = store.list_contours(owner).map_err(store_error)?;
+    let mut views = Vec::with_capacity(contours.len());
+    for record in contours {
+        let record: ContourRecord = record;
+        // `load_contour` returns `None` for a version with no members
+        // and for a version that does not exist; the identity came from
+        // the listing, so here only the first reading is possible and an
+        // empty composition is the honest answer.
+        let accounts = store
+            .load_contour(owner, record.id, record.version)
+            .map_err(store_error)?
+            .map(|definition| definition.accounts().collect())
+            .unwrap_or_default();
+        views.push(ContourView {
+            id: record.id,
+            version: record.version,
+            title: record.title,
+            accounts,
+        });
+    }
+    Ok(views)
+}
+
 fn import_session_error(error: iaam_store::StoreError) -> AppError {
     match error {
         iaam_store::StoreError::NotFound { what, id } => AppError::NotFound { what, id },
@@ -996,30 +1160,8 @@ impl Store for SqliteAdapter {
     }
 
     async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError> {
-        self.blocking(move |store| {
-            let contours = store.list_contours(owner).map_err(store_error)?;
-            let mut views = Vec::with_capacity(contours.len());
-            for record in contours {
-                let record: ContourRecord = record;
-                // `load_contour` returns `None` for a version with no members
-                // and for a version that does not exist; the identity came from
-                // the listing, so here only the first reading is possible and an
-                // empty composition is the honest answer.
-                let accounts = store
-                    .load_contour(owner, record.id, record.version)
-                    .map_err(store_error)?
-                    .map(|definition| definition.accounts().collect())
-                    .unwrap_or_default();
-                views.push(ContourView {
-                    id: record.id,
-                    version: record.version,
-                    title: record.title,
-                    accounts,
-                });
-            }
-            Ok(views)
-        })
-        .await
+        self.blocking(move |store| contour_views(store, owner))
+            .await
     }
 
     async fn report_default_contour(&self, owner: OwnerId) -> Result<Option<ContourId>, AppError> {
@@ -1580,6 +1722,15 @@ impl Store for SqliteAdapter {
                 .map_err(store_error)
         })
         .await
+    }
+
+    async fn import_plan_reads(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportPlanReads>, AppError> {
+        self.blocking(move |store| import_plan_reads_of(store, owner, session))
+            .await
     }
 
     async fn list_import_sessions(

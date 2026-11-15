@@ -21,7 +21,7 @@ use crate::StoreError;
 /// altogether; the column would then exist in every database created after the
 /// change and in none created before it, and the failure would arrive at run
 /// time, on a statement naming a column that is not there.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Which numbering [`SCHEMA_VERSION`] belongs to.
 ///
@@ -69,7 +69,7 @@ pub const LAST_UNMARKED_SCHEMA_VERSION: u32 = 1;
 /// hard-coding a second list of migration filenames: that test's job is to
 /// notice a `CREATE TABLE` this crate forgot to classify, and it can only do
 /// that against the same migrations this build actually applies.
-pub const MIGRATIONS: [(u32, &str); 19] = [
+pub const MIGRATIONS: [(u32, &str); 20] = [
     (1, include_str!("../migrations/0001_schema.sql")),
     (
         2,
@@ -130,6 +130,10 @@ pub const MIGRATIONS: [(u32, &str); 19] = [
     (
         19,
         include_str!("../migrations/0019_partial_redemption_optional_custody.sql"),
+    ),
+    (
+        20,
+        include_str!("../migrations/0020_import_commit_receipt.sql"),
     ),
 ];
 

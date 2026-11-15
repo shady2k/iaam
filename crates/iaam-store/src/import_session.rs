@@ -75,6 +75,18 @@ pub struct StoredSession {
     pub closed_at: Option<String>,
 }
 
+/// What the commit that closed a session answered, kept with the session.
+///
+/// Both halves are opaque here. `revision` is the application's stamp of the
+/// reading the commit was planned from, and `receipt` is its answer; the store
+/// neither mints nor reads either, exactly as it neither mints nor reads an
+/// observation's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCommitReceipt {
+    pub revision: String,
+    pub receipt: String,
+}
+
 /// A session in a listing, with how much it holds.
 ///
 /// Two counts, and not the rows themselves. A listing carrying the rows would
@@ -883,6 +895,106 @@ impl SqliteStore {
         session: ImportSessionId,
     ) -> Result<Vec<StoredControlFigures>, StoreError> {
         control_figures(&self.conn, session)
+    }
+
+    /// The answer the commit that closed a session gave, or nothing.
+    ///
+    /// A commit is recognised by the session and by the revision its caller
+    /// read, so a repeat after a lost response finds the first answer here and
+    /// is not refused as «session not open» (ADR 0042 point 4). `revision` is
+    /// the stamp the commit was planned from, written by the same statement that
+    /// closed the session; `receipt` is opaque JSON, kept for
+    /// [`Self::commit_import_session_within`]'s reason.
+    ///
+    /// `None` on every session that commit did not close — an open one, an
+    /// abandoned one, and one committed before this column existed. A caller
+    /// that finds nothing has no first answer to give and must say so.
+    pub fn import_commit_receipt(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<StoredCommitReceipt>, StoreError> {
+        let found: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT commit_revision, commit_receipt FROM import_sessions
+                 WHERE owner = ?1 AND id = ?2",
+                params![owner.inner().to_string(), session.inner().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match found {
+            Some((Some(revision), Some(receipt))) => {
+                Ok(Some(StoredCommitReceipt { revision, receipt }))
+            }
+            // A session with one column set and the other not cannot exist: both
+            // are written by one statement. Reading it as «no receipt» would
+            // answer a retried commit with a refusal it did not earn, so the
+            // half-written pair is an error rather than an absence.
+            Some((None, None)) | None => Ok(None),
+            Some(_) => Err(StoreError::InvalidValue {
+                field: "import commit receipt",
+                value: session.inner().to_string(),
+            }),
+        }
+    }
+
+    /// Close a session as committed, recording what the commit answered.
+    ///
+    /// **Inside the caller's transaction and nowhere else**: the answer is
+    /// written with the rows it describes, so a kill cannot leave a closed
+    /// session whose commit wrote nothing, nor a commit whose answer was lost
+    /// (ADR 0042 points 1 and 4). Called with no transaction open it refuses,
+    /// naming itself (`StoreError::NoTransaction`).
+    ///
+    /// `revision` is the stamp the commit was planned from and `receipt` is the
+    /// answer it gives, opaque JSON whose only property this crate checks is
+    /// that it parses — the same rule a payload follows, and for the same
+    /// reason: a receipt nothing above can read must not be written silently.
+    ///
+    /// Only an open session closes. The state is in the statement rather than
+    /// read before it, as [`Self::close_import_session`] puts it there, so two
+    /// writers cannot both close one session.
+    pub fn commit_import_session_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        revision: &str,
+        receipt: &str,
+    ) -> Result<StoredSession, StoreError> {
+        self.require_transaction("commit_import_session_within")?;
+        if serde_json::from_str::<serde_json::Value>(receipt).is_err() {
+            return Err(StoreError::InvalidValue {
+                field: "import commit receipt",
+                value: "a value that does not parse as JSON".to_owned(),
+            });
+        }
+        let updated = self.conn.execute(
+            "UPDATE import_sessions
+                SET state = 'committed', closed_at = ?3,
+                    commit_revision = ?4, commit_receipt = ?5
+              WHERE owner = ?1 AND id = ?2 AND state = 'open'",
+            params![
+                owner.inner().to_string(),
+                session.inner().to_string(),
+                now(),
+                revision,
+                receipt,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                what: "an open import session",
+                id: session.inner().to_string(),
+            });
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::write_completed();
+        self.load_import_session(owner, session)?
+            .ok_or(StoreError::NotFound {
+                what: "an import session",
+                id: session.inner().to_string(),
+            })
     }
 
     /// Close a session, committed or abandoned.

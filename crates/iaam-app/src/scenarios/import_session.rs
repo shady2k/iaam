@@ -11,6 +11,11 @@
 //! never appends an event; [`commit_session`] does, once, out of what the
 //! session already holds, and [`abandon_session`] does not read or write the
 //! journal at all.
+//!
+//! The **session's life** is not a transaction, and the difference is the point:
+//! questions are answered over hours and a connection held open that long blocks
+//! every other writer. The **commit that ends it** is one, opened after the last
+//! reading and closed with everything it writes (ADR 0042).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,6 +45,7 @@ use iaam_ingest::mirror::{MirrorSide, Unpaired, mirrored};
 use iaam_ingest::observation::{Intake, ObservedDirection, ObservedRow};
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Rejection, SubmittedOperation, Verdict, normalize};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -52,14 +58,14 @@ use crate::error::{AppError, FieldRejection};
 use iaam_ingest::dedup::IdentityScope;
 
 use crate::ports::{
-    AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, AnswerRule,
-    ContourView, ImportObservationView, ImportQuestionView, ImportSessionState,
-    ImportSessionSummaryView, ImportSessionView, NewImportQuestion, Principal, Recorded,
-    UnresolvedAccountView,
+    AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
+    AnswerRule, ClassificationRuleView, ContourView, ImportObservationView, ImportPlanReads,
+    ImportQuestionView, ImportSessionState, ImportSessionSummaryView, ImportSessionView,
+    NewImportQuestion, Principal, Recorded, StoreTx, TxResult, UnresolvedAccountView,
 };
 use crate::scenarios::classification::{ClassifiedAs, classified_as, subject};
 use crate::scenarios::coverage_gap;
-use crate::scenarios::ingest::{RowOrigin, submit_candidates};
+use crate::scenarios::ingest::{RowOrigin, submit_candidates, submit_candidates_within};
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
 
 /// The durable question one row raised.
@@ -684,8 +690,8 @@ pub const SESSION_CHANNEL: &str = "session";
 /// - deduplication is scoped by the source, so it had nothing stable to scope
 ///   against;
 /// - and worst, because it is the one that would be hardest to debug:
-///   [`plan_session`] runs a second time inside [`commit_session`], so the
-///   assessment the owner read and the commit planned from it minted
+///   the plan is computed twice — once for the assessment the owner read, once
+///   inside the commit — so with a fresh identifier per reading the two minted
 ///   **different** source identities. Invisible today only because
 ///   `PlannedFactDto` carries no source — but «what the assessment said» and
 ///   «what the commit wrote» differed in provenance, and the assessment is what
@@ -2039,20 +2045,38 @@ pub async fn state_control_figures(
 /// purpose: committing with a question open means recording the guess the
 /// question exists to prevent.
 ///
-/// **This function does not decide what is written.** [`plan_session`] does, and
-/// commit is that same function carried one step further, into
-/// `submit_candidates`. The split is the whole of iaam-k1xa: an assessment
-/// produced beside the import rather than by it describes a different import
-/// from the one that runs, and the two drift. There is no second pass over the
-/// rows here, and there must never be one.
+/// **This function does not decide what is written.** The plan does, and commit
+/// carries it one step further, into `submit_candidates`. The split is the whole
+/// of iaam-k1xa: an assessment produced beside the import rather than by it
+/// describes a different import from the one that runs, and the two drift. There
+/// is no second pass over the rows here, and there must never be one: the plan
+/// this commit writes from is [`assemble_plan`] over reads taken inside its own
+/// transaction, the same function [`plan_session`] is.
+///
+/// **One transaction** (ADR 0042 points 1 and 2). The rows, the control
+/// assertions, the coverage gaps, the session's close and the answer this call
+/// gives are written together or not at all, and every read the plan depends on
+/// — the session and its rows, the answers, the journal, the owner's accounts
+/// and his rules — is taken inside that transaction. A kill anywhere inside
+/// therefore leaves the session open and nothing of the commit written, and a
+/// session changed since the caller read its plan fails the revision check below
+/// rather than being written on a stale reading.
 ///
 /// `revision` is the stamp the plan the caller read carried. Supplied, it is
-/// checked against the plan this commit just produced and a difference refuses:
-/// the rows, the answers, the owner's accounts or their classification rules
-/// changed between the reading and the writing, so the assessment the caller
-/// approved is not what would be recorded. Omitted, the commit proceeds and the
-/// outcome carries the revision it wrote under, so a caller that committed blind
-/// is at least told what it committed.
+/// checked against the plan this commit produced inside its transaction and a
+/// difference refuses: the rows, the answers, the owner's accounts or their
+/// classification rules changed between the reading and the writing, so the
+/// assessment the caller approved is not what would be recorded. Omitted, the
+/// commit proceeds and the outcome carries the revision it wrote under, so a
+/// caller that committed blind is at least told what it committed.
+///
+/// **A repeat of a commit that already ran is answered, not refused**
+/// (point 4). A caller whose response was lost repeats the identical call, and
+/// finds a closed session where it expected an open one. The session and the
+/// revision name that commit, and the answer the first call gave is kept beside
+/// it in the same transaction that wrote it: the repeat is given that answer and
+/// writes nothing, while a revision naming another reading is refused as a
+/// closed session always was.
 ///
 /// `accept_control_mismatch` is how a batch that does not agree with its own
 /// source's control section is committed anyway. Two disagreements pass through
@@ -2090,14 +2114,82 @@ pub async fn commit_session(
     accept_control_mismatch: bool,
 ) -> Result<CommitOutcome, AppError> {
     require_submit(principal)?;
-    let planned = plan_session(services, principal, session).await?;
-    if planned.plan.session.state != ImportSessionState::Open {
+    // One request is one transaction (ADR 0042 point 1), and it is opened here
+    // — after anything network-bound, of which a commit has nothing. The plan
+    // is computed from reads taken **inside** it, so the session, its revision
+    // and every journal fact the plan is judged against are the ones that stand
+    // when the rows are written (point 2).
+    let principal = principal.clone();
+    let stated = revision.cloned();
+    let result = services
+        .store
+        .transact(Box::new(move |tx: &mut dyn StoreTx| {
+            let outcome = commit_inside(
+                tx,
+                &principal,
+                session,
+                stated.as_ref(),
+                accept_control_mismatch,
+            )?;
+            Ok(Box::new(outcome) as TxResult)
+        }))
+        .await?;
+    result
+        .downcast::<CommitOutcome>()
+        .map(|outcome| *outcome)
+        .map_err(|_| AppError::Store("import commit returned an unexpected result".to_owned()))
+}
+
+/// The body of [`commit_session`], inside the store's transaction.
+///
+/// Everything this reads it reads through `tx`, and everything it writes it
+/// writes through `tx`: the rows, the control assertions, the coverage gaps, the
+/// session's close and the answer it gives. A returned error — including every
+/// refusal below — rolls the whole thing back, so a session is never left closed
+/// by a commit that wrote nothing, and no assertion is ever left standing
+/// without the gap written with it.
+fn commit_inside(
+    tx: &mut dyn StoreTx,
+    principal: &Principal,
+    session: ImportSessionId,
+    revision: Option<&SessionRevision>,
+    accept_control_mismatch: bool,
+) -> Result<CommitOutcome, AppError> {
+    let reads = tx
+        .import_plan_reads(principal.owner, session)?
+        .ok_or_else(|| AppError::NotFound {
+            what: "an import session",
+            id: session.inner().to_string(),
+        })?;
+    // A commit that already closed this session is **recognised before the
+    // state-dependent refusal** (ADR 0042 point 4). Its key is the session and
+    // the revision its caller read: the answer kept beside the commit names
+    // that revision, and a caller repeating the same request — with the same
+    // revision, or with none at all, since a caller that committed blind has
+    // nothing else to repeat — is given the answer the first call gave rather
+    // than «session not open». A revision that names a different reading is not
+    // this commit, and falls through to the refusal below.
+    if reads.session.state != ImportSessionState::Open {
+        if reads.session.state == ImportSessionState::Committed
+            && let Some(receipt) = tx.import_commit_receipt(principal.owner, session)?
+            && revision.is_none_or(|stated| stated.0 == receipt.revision)
+        {
+            return serde_json::from_str::<CommitOutcome>(&receipt.answer).map_err(|error| {
+                AppError::Store(format!(
+                    "the recorded answer of import session {} could not be read: {error}",
+                    session.inner()
+                ))
+            });
+        }
         return Err(AppError::Invalid {
             field: "session".to_owned(),
             expected: "an open import session".to_owned(),
-            actual: planned.plan.session.state.code().to_owned(),
+            actual: reads.session.state.code().to_owned(),
         });
     }
+    let answer_accounts = account_views(&reads.accounts);
+    let questions = reads.questions.clone();
+    let planned = assemble_plan(reads, principal)?;
     if let Some(stated) = revision
         && *stated != planned.plan.revision
     {
@@ -2110,12 +2202,11 @@ pub async fn commit_session(
     let open = planned.plan.interpretation.open_questions.len();
     if open > 0 {
         return Err(unanswered_refusal(
-            services,
-            principal,
+            &questions,
+            &answer_accounts,
             session,
             &planned.plan.interpretation.open_questions,
-        )
-        .await);
+        ));
     }
 
     if !accept_control_mismatch
@@ -2129,14 +2220,13 @@ pub async fn commit_session(
     // put back at their own positions here: a caller reads this list by
     // position, and a list that renumbered itself around a settled row would
     // report every later row's outcome against the wrong row.
-    let written = submit_candidates(
-        services,
-        principal,
+    let written = submit_candidates_within(
+        tx,
+        PrincipalId(principal.token_id),
+        session,
         "operation",
-        Some(session),
         planned.candidates,
-    )
-    .await?;
+    )?;
     let mut written = written.into_iter();
     let mut verdicts = Vec::with_capacity(planned.dispositions.len());
     for disposition in &planned.dispositions {
@@ -2157,11 +2247,8 @@ pub async fn commit_session(
     // The assertions go in **after** the rows, and the order is not arbitrary:
     // an assertion is a statement about a period, and one written over a journal
     // that does not yet hold the period's rows is a discrepancy against an empty
-    // interval. A failure between the two leaves the session open, so committing
-    // again re-submits only candidates not already held by the journal: active
-    // identities answer `duplicate`, while a direct per-row submission whose
-    // identity names a withdrawn or superseded event is `quarantined` with
-    // correction guidance. The assertions' own keys answer `duplicate`.
+    // interval. Both are in this transaction, so the order is what a reader of
+    // the committed journal sees rather than a moment a kill can stop at.
     //
     // The coverage gaps go in **with** the assertions and not after them, in one
     // call. A gap says what this commit was handed and declined, and an
@@ -2182,21 +2269,46 @@ pub async fn commit_session(
     let mut recorded = if writing.is_empty() {
         Vec::new()
     } else {
-        crate::scenarios::ingest::append_checked(services, writing, IdentityScope::Source).await?
+        crate::scenarios::ingest::append_checked_within(tx, writing, IdentityScope::Source)?
     }
     .into_iter();
     let control_assertions: Vec<Recorded> = recorded.by_ref().take(stated).collect();
     let coverage_gaps: Vec<Recorded> = recorded.collect();
-    services
-        .store
-        .close_import_session(principal.owner, session, ImportSessionState::Committed)
-        .await?;
-    Ok(CommitOutcome {
+    let outcome = CommitOutcome {
         revision: planned.plan.revision,
         verdicts,
         control_assertions,
         coverage_gaps,
-    })
+    };
+    // The answer is written **with** the close, in this same transaction, so a
+    // caller who lost the response finds it and a caller who never lost it finds
+    // a session closed by a commit that wrote everything the answer names
+    // (ADR 0042 point 4). Serialised before the write so that an answer this
+    // build cannot render is an error and not a closed session with no answer.
+    let answer = serde_json::to_string(&outcome).map_err(|error| {
+        AppError::Store(format!(
+            "the commit's answer could not be recorded: {error}"
+        ))
+    })?;
+    tx.commit_import_session(principal.owner, session, &outcome.revision.0, &answer)?;
+    Ok(outcome)
+}
+
+/// The owner's accounts in the shape an answer's candidates are offered in.
+///
+/// A projection of the one account read the plan takes, not a second query: two
+/// reads of one table can see two states, and the candidates offered beside a
+/// refusal would then name an account the resolution those rows were judged
+/// against did not hold.
+fn account_views(accounts: &[AccountDetailView]) -> Vec<AccountView> {
+    accounts
+        .iter()
+        .map(|account| AccountView {
+            id: account.id,
+            title: account.title.clone(),
+            institution: account.institution.clone(),
+        })
+        .collect()
 }
 
 /// The refusal a mismatching batch earns, or nothing.
@@ -2313,13 +2425,15 @@ fn decimal(amount: PostedMinor, currency: CurrencyCode) -> String {
 /// The first by row order is the one offered, so two identical refusals name the
 /// same question.
 ///
-/// Every read here is on a path that has already decided to refuse. A failing
-/// read costs the caller the resolution, not the refusal: the commit was
-/// invalid before the read was attempted, and reporting a store failure instead
-/// would send the caller to retry a request that cannot succeed.
-async fn unanswered_refusal(
-    services: &AppServices,
-    principal: &Principal,
+/// Every read here is on a path that has already decided to refuse, and there
+/// are none: the questions and the accounts are the ones the plan the commit
+/// refused was computed from (ADR 0042 point 2). They are read inside the
+/// commit's transaction, so the refusal names a question that stood when the
+/// refusal was decided and offers a call for that same question — a second
+/// reading could name one the plan no longer holds.
+fn unanswered_refusal(
+    questions: &[ImportQuestionView],
+    accounts: &[AccountView],
     session: ImportSessionId,
     open_questions: &[OpenQuestion],
 ) -> AppError {
@@ -2334,7 +2448,8 @@ async fn unanswered_refusal(
     else {
         return rejection.into();
     };
-    let Some(resolution) = answer_resolution(services, principal, session, first.question).await
+    let Some(resolution) = asked_question(questions, first.question)
+        .map(|asked| answer_resolution_of(&asked, accounts, session, first.question))
     else {
         return rejection.into();
     };
@@ -2365,20 +2480,34 @@ async fn answer_resolution(
         .list_accounts(principal.owner)
         .await
         .unwrap_or_default();
+    Some(answer_resolution_of(&asked, &accounts, session, question))
+}
 
+/// The call that answers one question, from the question and the accounts in
+/// hand.
+///
+/// One construction for the refusal that reads through the ports and the one
+/// that refuses inside a transaction: two would eventually offer the same
+/// question in two shapes, and one of them would be the stale one.
+fn answer_resolution_of(
+    asked: &Question,
+    accounts: &[AccountView],
+    session: ImportSessionId,
+    question: ImportQuestionId,
+) -> ResolutionOption {
     let mut preset = std::collections::BTreeMap::new();
     // Both are path segments of the answering route, and both are known here:
     // the session is the one in hand and the question is the one being named.
     preset.insert("session".to_owned(), session.inner().to_string().into());
     preset.insert("question".to_owned(), question.inner().to_string().into());
 
-    Some(ResolutionOption {
+    ResolutionOption {
         operation: OperationKey::AnswerImportQuestion,
         request: RequestPlan {
             preset,
-            missing: vec![answer_input(&asked, &accounts)],
+            missing: vec![answer_input(asked, accounts)],
         },
-    })
+    }
 }
 
 /// The typed question behind one identifier, or nothing.
@@ -2394,15 +2523,26 @@ async fn read_asked_question(
     question: ImportQuestionId,
 ) -> Option<Question> {
     let contents = read_session(services, principal, session).await.ok()?;
-    let stored = contents
-        .questions
+    asked_question(&contents.questions, question)
+}
+
+/// The stored question, read as the typed question this build asks.
+///
+/// The JSON the store holds beside the row is what was offered when it was
+/// asked; a build that no longer parses it offers no next call, which is the
+/// whole of what an unparseable question costs.
+fn asked_question(
+    questions: &[ImportQuestionView],
+    question: ImportQuestionId,
+) -> Option<Question> {
+    let stored = questions
         .iter()
         .find(|candidate| candidate.id == question)?;
     serde_json::from_str(&stored.question).ok()
 }
 
 /// What committing wrote, and under which reading of the session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommitOutcome {
     /// The revision the commit was planned from. A caller that supplied one has
     /// it echoed; a caller that supplied none learns what it committed.
@@ -2441,7 +2581,7 @@ pub struct CommitOutcome {
 /// Opaque on purpose: it is a fingerprint of the plan, and a caller that parsed
 /// it would be depending on how the plan is rendered rather than on what it
 /// says.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionRevision(pub String);
 
 /// What an import will and will not record, and what it is still waiting on.
@@ -3920,6 +4060,21 @@ impl SessionReading {
         contents: &SessionContents,
     ) -> Result<Self, AppError> {
         let resolver = Resolver::load(services, principal.owner).await?;
+        Ok(Self::with_resolver(resolver, principal, contents))
+    }
+
+    /// The same reading, against a resolver already loaded.
+    ///
+    /// The plan is computed from one list of reads ([`crate::ports::ImportPlanReads`]),
+    /// and the commit takes that list inside its transaction (ADR 0042 point 2):
+    /// a plan that loaded its own resolver again would read the accounts and the
+    /// rules twice, and the second reading could be of a different state from the
+    /// one the caller's plan was computed from.
+    fn with_resolver(
+        resolver: Resolver,
+        principal: &Principal,
+        contents: &SessionContents,
+    ) -> Self {
         let mut read_rows = Vec::with_capacity(contents.observations.len());
         for observation in &contents.observations {
             let intake = parse_intake(&observation.payload).ok();
@@ -4015,11 +4170,11 @@ impl SessionReading {
         // transfers, each carrying a leg on each account.
         let mirrors = mirrored_rows(contents.session.id, &read_rows, &contents.questions);
         settle_mirrored(&mut read_rows, &mirrors);
-        Ok(Self {
+        Self {
             resolver,
             rows: read_rows,
             mirrors,
-        })
+        }
     }
 
     /// What this reading settled, in the shape every reader of a question's
@@ -4102,25 +4257,59 @@ pub async fn plan_session(
     principal: &Principal,
     session: ImportSessionId,
 ) -> Result<PlannedSession, AppError> {
-    let contents = read_session(services, principal, session).await?;
-    let contours = services.store.list_contours(principal.owner).await?;
-    let exclusions = services
+    let reads = services
         .store
-        .list_account_scope_exclusions(principal.owner)
-        .await?;
+        .import_plan_reads(principal.owner, session)
+        .await?
+        .ok_or_else(|| AppError::NotFound {
+            what: "an import session",
+            id: session.inner().to_string(),
+        })?;
+    assemble_plan(reads, principal)
+}
+
+/// The plan those reads describe: [`plan_session`]'s whole body, and the only
+/// pass over the rows.
+///
+/// Both callers reach it — the assessment route with a read taken through the
+/// port, the commit with the same read taken inside its transaction (ADR 0042
+/// point 2) — so a plan published to a caller and the plan a commit writes from
+/// are one function of one reading. It reads nothing: everything it decides is
+/// decided from what it is handed, which is what makes «the session changed
+/// since the plan» a difference between two callings of this rather than a race
+/// between a read and a write.
+fn assemble_plan(
+    reads: ImportPlanReads,
+    principal: &Principal,
+) -> Result<PlannedSession, AppError> {
+    let ImportPlanReads {
+        session: session_view,
+        observations,
+        questions,
+        control_figures,
+        contours,
+        exclusions,
+        unresolved,
+        accounts,
+        transfer_statements,
+        classification_rules,
+        journal,
+    } = reads;
+    let contents = SessionContents {
+        session: session_view,
+        observations,
+        questions,
+        control_figures,
+    };
     // What the journal already holds, in the terms the write path recognises:
     // so the plan can say which rows will commit to `duplicate` rather than to
     // a fact, and which carry no identity it can decide on at all. Read here
     // rather than at commit for the reason the whole split exists: what commit
     // will do is what the owner is entitled to read before it does it.
-    let recorded = RecordedIdentities::of(
-        &services
-            .store
-            .load_events_through(principal.owner, time::Date::MAX)
-            .await?,
-    );
+    let recorded = RecordedIdentities::of(&journal);
 
-    let reading = SessionReading::of(services, principal, &contents).await?;
+    let resolver = Resolver::from_views(accounts, transfer_statements, classification_rules)?;
+    let reading = SessionReading::with_resolver(resolver, principal, &contents);
     // What this reading settled without a word from the owner, folded once and
     // read by everything below that asks whether a question is still his to
     // answer. See [`QuestionSettlements`].
@@ -4167,13 +4356,11 @@ pub async fn plan_session(
     // fresh session — moves the record to the newer session while this one still
     // holds rows out of that document; the inventory's own digests are what keep
     // this assessment answering for them.
-    let recorded_names: Vec<UnresolvedAccountView> = services
-        .store
-        .list_unresolved_accounts(principal.owner)
-        .await?
+    let recorded_names: Vec<UnresolvedAccountView> = unresolved
         .into_iter()
         .filter(|name| {
-            name.session == session || source_inventory.documents.contains(&name.document_hash)
+            name.session == contents.session.id
+                || source_inventory.documents.contains(&name.document_hash)
         })
         .collect();
     let account_resolution = account_resolution(&resolver, &read_rows, &recorded_names);
@@ -4338,7 +4525,7 @@ pub async fn plan_session(
             let event = read.candidate.as_ref()?.as_ref().ok()?;
             let mut leg = transfer_pairing::leg_of_event(event)?;
             leg.origin = LegOrigin::Observed {
-                session,
+                session: contents.session.id,
                 row: read.row,
             };
             Some(leg)
@@ -6011,6 +6198,27 @@ impl Resolver {
             .list_account_transfer_statements(owner)
             .await?;
         let stored = services.rules.list_rules(owner).await?;
+        Self::from_views(accounts, statements, stored)
+    }
+
+    /// The same resolver, from reads already taken.
+    ///
+    /// The one place the owner's accounts, his statements about them and his
+    /// rules become the directory and the rules a row is judged against. The
+    /// plan reads them as part of its one read list
+    /// ([`crate::ports::ImportPlanReads`]), and it arrives here rather than
+    /// loading a second copy: two loads are two readings, and a commit that
+    /// judged a row against a rule its caller's plan had not seen would record
+    /// what the caller approved only by coincidence.
+    ///
+    /// Retired rules are dropped here, exactly as they were when this was
+    /// written into [`Self::load`]: a rule the owner retired decides nothing, and
+    /// the plan is what he is shown before anything is written.
+    fn from_views(
+        accounts: Vec<AccountDetailView>,
+        statements: Vec<AccountTransferStatementView>,
+        stored: Vec<ClassificationRuleView>,
+    ) -> Result<Self, AppError> {
         let mut rules = Vec::with_capacity(stored.len());
         for rule in stored.into_iter().filter(|rule| rule.retired_at.is_none()) {
             rules.push(crate::scenarios::classification::rule_from_view(rule)?);

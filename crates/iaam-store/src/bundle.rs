@@ -597,6 +597,18 @@ pub struct ImportSessionSection {
     pub opened_at: String,
     pub closed_at: Option<String>,
     pub account: Option<uuid::Uuid>,
+    /// The revision the commit that closed this session was planned from, and
+    /// the answer it gave, where a commit closed it.
+    ///
+    /// Carried because a restore that dropped them would leave a committed
+    /// session whose retry is refused as «session not open» — the answer the
+    /// owner lost would be lost for good (`iaam-mkbfh.4`, ADR 0042 point 4).
+    /// Absent from a bundle written before they existed, and absent is what an
+    /// open or abandoned session holds: an absence, not a value.
+    #[serde(default)]
+    pub commit_revision: Option<String>,
+    #[serde(default)]
+    pub commit_receipt: Option<String>,
 }
 
 /// One row of `import_observations`: one submitted line's provisional state.
@@ -2141,7 +2153,8 @@ impl SqliteStore {
         }
 
         let mut statement = self.conn.prepare(
-            "SELECT id, state, source, import, opened_at, closed_at, account
+            "SELECT id, state, source, import, opened_at, closed_at, account,
+                    commit_revision, commit_receipt
              FROM import_sessions
              WHERE owner = ?1
              ORDER BY opened_at, id",
@@ -2155,11 +2168,14 @@ impl SqliteStore {
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?;
         let mut import_sessions = Vec::new();
         for row in rows {
-            let (id, state, source, import, opened_at, closed_at, account) = row?;
+            let (id, state, source, import, opened_at, closed_at, account, revision, receipt) =
+                row?;
             import_sessions.push(ImportSessionSection {
                 id: parse(&id, "import session")?,
                 state,
@@ -2168,6 +2184,8 @@ impl SqliteStore {
                 opened_at,
                 closed_at,
                 account: account.map(|value| parse(&value, "account")).transpose()?,
+                commit_revision: revision,
+                commit_receipt: receipt,
             });
         }
 
@@ -3599,8 +3617,10 @@ impl SqliteStore {
 
         for session in &bundle.import_sessions {
             transaction.execute(
-                "INSERT INTO import_sessions (id, owner, state, source, import, opened_at, closed_at, account)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO import_sessions
+                     (id, owner, state, source, import, opened_at, closed_at, account,
+                      commit_revision, commit_receipt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (id) DO NOTHING",
                 params![
                     session.id.to_string(),
@@ -3611,6 +3631,8 @@ impl SqliteStore {
                     session.opened_at,
                     session.closed_at,
                     session.account.map(|id| id.to_string()),
+                    session.commit_revision,
+                    session.commit_receipt,
                 ],
             )?;
         }

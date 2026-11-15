@@ -44,6 +44,7 @@ pub use iaam_store::market::{
 };
 pub use iaam_store::reference::CashAssetClass;
 pub use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use time::{Date, OffsetDateTime};
@@ -54,7 +55,11 @@ use crate::error::AppError;
 
 /// Result of writing an event. The type belongs to the port, not the store:
 /// otherwise the transport would learn about SQLite through the return value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because a commit's answer is kept with the session it closed and
+/// given back to a repeat of the same request (ADR 0042 point 4): the answer
+/// names the events it wrote, and a retry must name the same ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Recorded {
     Inserted { id: iaam_core::ids::EventId },
     Duplicate { existing: iaam_core::ids::EventId },
@@ -145,6 +150,49 @@ pub trait StoreTx {
         &mut self,
         filter: SyncRefusalFilter,
         row_keys: &[String],
+    ) -> Result<(), AppError>;
+
+    /// Everything one session's plan is computed from, read inside the caller's
+    /// transaction.
+    ///
+    /// `None` when the session is not the owner's or not there, which are one
+    /// answer (§14). The commit computes its plan from this reading and writes
+    /// from the same one, so no writer can change the session or the journal
+    /// between the reading and the write (ADR 0042 point 2).
+    fn import_plan_reads(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportPlanReads>, AppError>;
+
+    /// The answer the commit that closed this session gave, read inside the
+    /// caller's transaction.
+    ///
+    /// `None` for a session this store's commit did not close, which includes
+    /// one closed before the answer was kept. A caller that finds nothing has
+    /// no first answer to give and says so.
+    fn import_commit_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportCommitReceipt>, AppError>;
+
+    /// Close the session as committed, recording what the commit answered.
+    ///
+    /// The answer and the close are one write and take part in the caller's
+    /// transaction, so a kill leaves neither a closed session whose commit
+    /// wrote nothing nor a commit whose answer was lost (ADR 0042 points 1
+    /// and 4). The rows, the assertions and the gaps go in before it, through
+    /// [`StoreTx::append_events_in_order`].
+    ///
+    /// Refused for a session that is not open: a commit closes an open session
+    /// and nothing else.
+    fn commit_import_session(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        revision: &str,
+        answer: &str,
     ) -> Result<(), AppError>;
 
     /// Write one page of price observations to an unfinished run.
@@ -1575,6 +1623,18 @@ pub trait Store: Send + Sync {
         session: ImportSessionId,
     ) -> Result<Option<ImportSessionView>, AppError>;
 
+    /// Everything one session's plan is computed from, as one read.
+    ///
+    /// The assessment route's door to the same reading the commit takes inside
+    /// its transaction, so the plan a caller approves and the plan a commit
+    /// writes are computed from one list of reads (see [`ImportPlanReads`]).
+    /// `None` when the session is not theirs or not there (§14).
+    async fn import_plan_reads(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportPlanReads>, AppError>;
+
     /// Every session of the owner's, newest first, with how much each holds.
     ///
     /// This is what makes a question outlive the response that carried it.
@@ -1856,6 +1916,70 @@ pub struct ImportSessionSummaryView {
     pub row_count: usize,
     /// How many of its questions are still waiting on the owner.
     pub unanswered: usize,
+}
+
+/// What the commit that closed a session answered, as the store keeps it.
+///
+/// Both halves are opaque here: `revision` is the stamp the commit was planned
+/// from and `answer` is the answer it gave, in the application's own
+/// vocabulary. The port carries strings rather than the commit's outcome
+/// because a receipt is stored and read back unchanged — the store neither
+/// mints nor interprets it, exactly as it neither mints nor interprets an
+/// observation's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCommitReceipt {
+    /// The revision the commit was planned from, which names the commit a
+    /// repeat of it is.
+    pub revision: String,
+    /// What the commit answered.
+    pub answer: String,
+}
+
+/// Everything one session's plan is computed from, read as one thing.
+///
+/// **One list, because a plan has one reading.** The assessment route
+/// publishes a plan and the commit writes one, and the two must be the same
+/// function of the same state or the caller approves a plan the commit does not
+/// carry out (`iaam-k1xa`). A plan read added to that function is one field
+/// here, and both callers see it — the alternative, a second list of reads
+/// beside the plan's own, is how the assessment and the commit come to disagree
+/// about which journal the rows were judged against.
+///
+/// It is also what makes the reads happen **inside the commit's transaction**
+/// (ADR 0042 point 2): the journal this reads shows what the same work already
+/// wrote, and a session changed since the caller read its plan is refused rather
+/// than written on a stale reading.
+///
+/// The owner's accounts appear once, in [`ImportPlanReads::accounts`]. The
+/// narrower [`AccountView`] a refusal offers as an answer's candidates is a
+/// projection of that same reading rather than a second query: two reads of one
+/// table can see two different states, and the candidate list would then offer
+/// an account the resolution did not know about.
+#[derive(Debug, Clone)]
+pub struct ImportPlanReads {
+    /// The session as it stands, state included: the commit's refusal for a
+    /// closed session and its recognition of a retry both read it here.
+    pub session: ImportSessionView,
+    pub observations: Vec<ImportObservationView>,
+    pub questions: Vec<ImportQuestionView>,
+    /// The control figures the source printed about itself, as it printed them.
+    pub control_figures: Vec<ControlSection>,
+    /// The owner's contours, which decide which of his accounts are in scope.
+    pub contours: Vec<ContourView>,
+    /// The accounts he has said are outside the scope, with his reason.
+    pub exclusions: Vec<AccountScopeExclusionView>,
+    /// Names a reading of one of his documents could not place.
+    pub unresolved: Vec<UnresolvedAccountView>,
+    /// His accounts, with what they declare: what every row is resolved against.
+    pub accounts: Vec<AccountDetailView>,
+    /// What he has said about which of his accounts money moves between.
+    pub transfer_statements: Vec<AccountTransferStatementView>,
+    /// His classification rules, retired ones included: the plan reads the
+    /// standing ones, and reading them all is what lets a rule retired since
+    /// the caller's reading be seen as the change it is.
+    pub classification_rules: Vec<ClassificationRuleView>,
+    /// The owner's journal through every day, in effective order.
+    pub journal: Vec<Event>,
 }
 
 /// One submitted line held in a session.

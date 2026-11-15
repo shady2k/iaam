@@ -743,3 +743,153 @@ fn a_closed_session_takes_no_minted_rule() {
             .is_err()
     );
 }
+
+/// The answer a commit gave is kept with the session it closed, and nowhere
+/// else (`iaam-mkbfh.4`, ADR 0042 point 4).
+///
+/// This is what lets a repeat of a commit whose response was lost be answered
+/// rather than refused as «session not open»: the pair is read back under the
+/// owner and the session, and an open session has none.
+#[test]
+fn a_committed_session_keeps_the_answer_its_commit_gave() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+
+    assert_eq!(
+        store
+            .import_commit_receipt(owner, session)
+            .expect("the query runs"),
+        None,
+        "an open session has no answer to give"
+    );
+
+    let closed = store
+        .with_immediate_transaction(
+            |error| error,
+            |store| {
+                store.commit_import_session_within(owner, session, "revision-1", r#"{"rows":[]}"#)
+            },
+        )
+        .expect("the commit closes the session");
+    assert_eq!(closed.state, SessionState::Committed);
+    assert!(closed.closed_at.is_some());
+
+    let receipt = store
+        .import_commit_receipt(owner, session)
+        .expect("the query runs")
+        .expect("the answer is kept beside the session");
+    assert_eq!(receipt.revision, "revision-1");
+    assert_eq!(receipt.receipt, r#"{"rows":[]}"#);
+
+    // A second commit of the same session is not what the retry is answered
+    // from: the caller reads the answer this session already has.
+    assert!(
+        store
+            .with_immediate_transaction(
+                |error| error,
+                |store| { store.commit_import_session_within(owner, session, "revision-2", "{}") }
+            )
+            .is_err(),
+        "only an open session commits"
+    );
+    assert_eq!(
+        store
+            .import_commit_receipt(owner, session)
+            .expect("the query runs")
+            .expect("the first answer stands"),
+        receipt,
+        "the refusal changed nothing"
+    );
+}
+
+/// The commit's close and answer write only inside a caller's transaction
+/// (ADR 0042 points 1 and 4): outside one they would commit on their own, and
+/// the answer would then be durable before the rows it names.
+#[test]
+fn a_commit_outside_a_transaction_refuses_to_run() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+
+    assert!(
+        matches!(
+            store.commit_import_session_within(owner, session, "revision-1", "{}"),
+            Err(iaam_store::StoreError::NoTransaction { .. })
+        ),
+        "the commit's close must not commit a transaction of its own"
+    );
+    assert_eq!(
+        store
+            .load_import_session(owner, session)
+            .expect("the query runs")
+            .expect("the session is still there")
+            .state,
+        SessionState::Open,
+        "and the refusal left the session open"
+    );
+}
+
+/// An answer the application could not read back must not be written: it would
+/// be a closed session whose retry is answered with an unreadable receipt.
+#[test]
+fn a_receipt_that_is_not_json_is_refused() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+
+    assert!(
+        store
+            .with_immediate_transaction(
+                |error| error,
+                |store| {
+                    store.commit_import_session_within(owner, session, "revision-1", "not json")
+                }
+            )
+            .is_err(),
+        "a receipt that does not parse is refused"
+    );
+    assert_eq!(
+        store
+            .load_import_session(owner, session)
+            .expect("the query runs")
+            .expect("the session is still there")
+            .state,
+        SessionState::Open,
+        "and nothing was closed by the refusal"
+    );
+}
+
+/// Another owner's session keeps no answer this owner can read (§14).
+#[test]
+fn another_owners_receipt_is_not_read() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let stranger = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.commit_import_session_within(owner, session, "revision-1", "{}"),
+        )
+        .expect("the commit closes the session");
+
+    assert_eq!(
+        store
+            .import_commit_receipt(stranger, session)
+            .expect("the query runs"),
+        None
+    );
+}

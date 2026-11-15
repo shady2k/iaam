@@ -246,24 +246,66 @@ pub async fn submit_candidates(
     let declared_by = PrincipalId(principal.token_id);
 
     let mut verdicts = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
+    for candidate in stamp_candidates(candidates, declared_by, session) {
         // The sequence number within a day is assigned by the store in the same
         // transaction as the insert: calling «get next» separately is
         // a race that gives two events the same number (§4.8).
-        let mut event = match candidate {
-            Ok(event) => event,
-            Err(rejection) => {
-                verdicts.push(Verdict::Rejected { rejection });
-                continue;
-            }
-        };
-        event.provenance = event.provenance.with_declared_by(declared_by);
-        if let Some(session) = session {
-            event.provenance = event.provenance.with_import_session(session);
+        match candidate {
+            Ok(event) => verdicts.push(record_candidate(services, event, field).await?),
+            Err(rejection) => verdicts.push(Verdict::Rejected { rejection }),
         }
-        verdicts.push(record_candidate(services, event, field).await?);
     }
     Ok(verdicts)
+}
+
+/// The same submission inside the caller's transaction (ADR 0042 point 1).
+///
+/// The import commit writes its rows through here: the verdicts are the same
+/// ones [`submit_candidates`] gives — the same stamping, the same structural
+/// validation, the same duplicate and quarantine answers — and only the
+/// transaction boundary differs. The journal a duplicate is judged against is
+/// read through the transaction's own handle, so it holds what this commit has
+/// already written (ADR 0042 point 2).
+pub fn submit_candidates_within(
+    tx: &mut dyn crate::ports::StoreTx,
+    declared_by: PrincipalId,
+    session: ImportSessionId,
+    field: &'static str,
+    candidates: Vec<Result<Event, Rejection>>,
+) -> Result<Vec<Verdict>, AppError> {
+    let mut verdicts = Vec::with_capacity(candidates.len());
+    for candidate in stamp_candidates(candidates, declared_by, Some(session)) {
+        match candidate {
+            Ok(event) => verdicts.push(record_candidate_within(tx, event, field)?),
+            Err(rejection) => verdicts.push(Verdict::Rejected { rejection }),
+        }
+    }
+    Ok(verdicts)
+}
+
+/// The stamp every submission applies to its rows, in one place.
+///
+/// The declaring principal and the import session a row was committed under are
+/// stamped here rather than by each caller, exactly as they are in
+/// [`submit_candidates`]: two loops that stamped their own would eventually
+/// stamp different things, and a row whose provenance names no session cannot
+/// be told from one recorded outside an import.
+fn stamp_candidates(
+    candidates: Vec<Result<Event, Rejection>>,
+    declared_by: PrincipalId,
+    session: Option<ImportSessionId>,
+) -> Vec<Result<Event, Rejection>> {
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let mut event = candidate?;
+            event.provenance = event.provenance.with_declared_by(declared_by);
+            if let Some(session) = session {
+                event.provenance = event.provenance.with_import_session(session);
+            }
+            Ok(event)
+        })
+        .collect()
 }
 
 /// Convert a structural validation failure into the row rejection shared by all inputs.
@@ -332,19 +374,60 @@ pub async fn record_candidate(
         return Ok(Verdict::Rejected { rejection });
     }
     let owner = event.owner;
-    let idempotency_key = event.idempotency_key.as_deref().map(str::to_owned);
+    let idempotency_key = event.idempotency_key.clone();
     let recorded = append_checked(services, vec![event], IdentityScope::Source).await?;
+    let journal = match recorded.first() {
+        Some(Recorded::Duplicate { .. }) => {
+            services
+                .store
+                .load_events_through(owner, time::Date::MAX)
+                .await?
+        }
+        _ => Vec::new(),
+    };
+    verdict_of(&recorded, idempotency_key.as_deref(), &journal)
+}
+
+/// The same write inside the caller's transaction (ADR 0042 point 1).
+///
+/// The journal a duplicate is judged against is read inside the transaction, so
+/// it names what this commit has already written rather than a copy taken
+/// before it (ADR 0042 point 2).
+pub fn record_candidate_within(
+    tx: &mut dyn crate::ports::StoreTx,
+    event: Event,
+    field: &'static str,
+) -> Result<Verdict, AppError> {
+    if let Some(rejection) = structural_rejection(&event, field) {
+        return Ok(Verdict::Rejected { rejection });
+    }
+    let owner = event.owner;
+    let idempotency_key = event.idempotency_key.clone();
+    let recorded = append_checked_within(tx, vec![event], IdentityScope::Source)?;
+    let journal = match recorded.first() {
+        Some(Recorded::Duplicate { .. }) => tx.load_events_through(owner, time::Date::MAX)?,
+        _ => Vec::new(),
+    };
+    verdict_of(&recorded, idempotency_key.as_deref(), &journal)
+}
+
+/// What one written candidate answered, given the journal as it stands.
+///
+/// Shared by the two doors above so that a row written inside an import commit
+/// and the same row written by its own request cannot be given two different
+/// verdicts for the same journal.
+fn verdict_of(
+    recorded: &[Recorded],
+    idempotency_key: Option<&str>,
+    journal: &[Event],
+) -> Result<Verdict, AppError> {
     Ok(match recorded.first() {
         Some(Recorded::Inserted { id }) => Verdict::Provisional { event: *id },
         Some(Recorded::Duplicate { existing }) => {
-            let journal = services
-                .store
-                .load_events_through(owner, time::Date::MAX)
-                .await?;
             if let Some(disposition) =
-                crate::scenarios::correction::removal_disposition(&journal, *existing)
+                crate::scenarios::correction::removal_disposition(journal, *existing)
             {
-                let identity = idempotency_key.as_deref().map_or_else(
+                let identity = idempotency_key.map_or_else(
                     || "the source operation identity".to_owned(),
                     |key| format!("idempotency key {key}"),
                 );

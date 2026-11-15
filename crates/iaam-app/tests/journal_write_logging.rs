@@ -95,7 +95,11 @@ async fn failed_detail_write_logs_the_statement_and_batch_row_without_financial_
         .with_max_level(tracing::Level::TRACE)
         .with_writer(move || writer.clone())
         .finish();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    // Global, not thread-local: a callsite's interest is cached once per
+    // process, and a thread-local default does not rebuild it, so the span's
+    // fields would never be formatted.
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("this test binary sets the subscriber once");
 
     let error = adapter
         .append_events(vec![first, failing], IdentityScope::Source)

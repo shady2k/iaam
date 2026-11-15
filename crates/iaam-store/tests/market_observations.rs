@@ -272,6 +272,45 @@ fn an_expired_lease_is_refused_by_recording() {
     assert!(matches!(result, Err(StoreError::LeaseExpired)));
 }
 
+/// A running lease whose expiry cannot be read is refused, never treated as
+/// free: reading corrupt data as «no lease» would let a second writer publish
+/// into a run that may still be alive elsewhere.
+#[test]
+fn a_running_lease_with_an_unreadable_expiry_is_refused_rather_than_treated_as_free() {
+    let (mut store, _) = store_with_instrument();
+    let series = series_with_dataset("fx", "USD/RUB");
+    store
+        .begin_run(
+            series.clone(),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("active lease");
+    store
+        .connection()
+        .execute(
+            "UPDATE sync_runs SET lease_expires_at = 'not-a-moment' WHERE status = 'running'",
+            [],
+        )
+        .expect("test writes an unreadable expiry");
+
+    let result = store.begin_run(
+        series,
+        date!(2026 - 08 - 03),
+        date!(2026 - 08 - 03),
+        lease(),
+    );
+
+    match result {
+        Err(StoreError::InvalidValue { field, value }) => {
+            assert_eq!(field, "lease_expires_at");
+            assert_eq!(value, "not-a-moment");
+        }
+        other => panic!("a lease that cannot be read must be refused, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_missing_lease_is_refused_by_recording() {
     let (mut store, _) = store_with_instrument();

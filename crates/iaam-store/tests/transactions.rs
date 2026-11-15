@@ -1,8 +1,26 @@
 //! ADR 0042 point 3: a panic inside the work rolls the transaction back.
 
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+
 use iaam_core::ids::{AccountId, OwnerId};
 use iaam_store::reference::AccountRecord;
 use iaam_store::{SqliteStore, StoreError};
+
+/// A log sink the assertions can read back.
+#[derive(Clone, Default)]
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn a_panic_inside_the_work_rolls_the_transaction_back_and_the_store_stays_usable() {
@@ -190,6 +208,21 @@ fn an_abandoned_transaction_is_rolled_back_before_the_next_one_begins() {
         institution: None,
     };
 
+    // The abandon is logged at error level: work was lost, and the log must
+    // account for it. The subscriber is global so the callsite's interest —
+    // cached once per process — is decided with a subscriber present; under a
+    // thread-local default the message is never formatted.
+    let writer = LogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("this test binary sets the subscriber once");
+
     store
         .connection()
         .execute_batch("BEGIN IMMEDIATE")
@@ -208,5 +241,16 @@ fn an_abandoned_transaction_is_rolled_back_before_the_next_one_begins() {
         accounts.iter().map(|account| account.title.clone()).collect::<Vec<_>>(),
         vec!["Saved".to_owned()],
         "the abandoned transaction's write is rolled back and the new one's is kept"
+    );
+
+    let log = String::from_utf8(captured.0.lock().expect("log buffer").clone())
+        .expect("UTF-8 tracing output");
+    let line = log
+        .lines()
+        .find(|line| line.contains("ERROR") && line.contains("another was begun"))
+        .unwrap_or_else(|| panic!("the abandon must be logged at error level: {log}"));
+    assert!(
+        line.contains("rolling it back first"),
+        "the log says what it did with the abandoned work: {line}"
     );
 }

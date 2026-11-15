@@ -540,6 +540,57 @@ mod tests {
         );
     }
 
+    /// A commit SQLite refuses is rolled back and returned, and the connection
+    /// is out of the transaction: the caller learns the work did not land and
+    /// can run the next one.
+    ///
+    /// `defer_foreign_keys` postpones the check to the commit, which is the one
+    /// way the transaction's `COMMIT` fails where none of its statements did.
+    #[test]
+    fn a_refused_commit_is_rolled_back_and_reported() {
+        let mut store = SqliteStore::open_in_memory().expect("in-memory database");
+        let outcome: Result<(), StoreError> = store.with_immediate_transaction(
+            |error| error,
+            |store| {
+                store
+                    .connection()
+                    .execute_batch("PRAGMA defer_foreign_keys = ON")?;
+                store.connection().execute(
+                    "INSERT INTO price_observations
+                         (instrument_id, board, session, trade_date, kind, source_id,
+                          observed_at, price, currency, quotation_basis, basis_evidence,
+                          executability, raw_hash, sync_run_id)
+                     VALUES ('missing-instrument', 'TQBR', 1, '2026-08-03', 'close',
+                             'moex-iss', '2026-08-03T09:00:00Z', '100.00', 'RUB',
+                             'money_per_unit', 'test:refused-commit', 'executable',
+                             'raw', 'missing-run')",
+                    [],
+                )?;
+                Ok(())
+            },
+        );
+
+        let error = outcome.expect_err("the deferred foreign key fails the commit");
+        match &error {
+            StoreError::Sqlite(source) => assert!(
+                source.to_string().contains("FOREIGN KEY"),
+                "the commit's own refusal is kept: {source}"
+            ),
+            other => panic!("expected the commit's failure, got {other:?}"),
+        }
+        assert!(
+            store.connection().is_autocommit(),
+            "the connection is out of the refused transaction"
+        );
+        let written: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
+                row.get(0)
+            })
+            .expect("row count");
+        assert_eq!(written, 0, "the rolled-back row is not there");
+    }
+
     #[test]
     fn open_existing_keeps_the_cause_when_the_database_cannot_be_reached() {
         use std::os::unix::fs::PermissionsExt;

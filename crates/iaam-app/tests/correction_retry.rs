@@ -392,3 +392,46 @@ async fn a_retry_answers_duplicate_where_the_first_call_answered_duplicate() {
         "the retry writes nothing"
     );
 }
+
+/// A key an ordinary fact holds is not this correction's retry. The retry path
+/// leaves it to the write path, whose refusal names the event that holds it —
+/// answering «provisional» here would report a write the caller's key did not
+/// produce.
+#[tokio::test]
+async fn a_key_held_by_an_ordinary_fact_is_refused_rather_than_answered_as_a_retry() {
+    let directory = TempDirectory::new("occupied-by-ordinary");
+    let services = services(&directory.database());
+    let owner = OwnerId::new_random();
+    let (account, _, target) = seed(&services, owner).await;
+    let before = journal(&services, owner).await;
+
+    // The seed's deposit is an ordinary fact under this key: no relation, so
+    // it is not the replacement the request describes.
+    let key = "correction-retry-target";
+    let refused = correct_events(
+        &services,
+        &principal(owner, Uuid::new_v4()),
+        true,
+        &[replace(target, account, key, time!(10:00))],
+    )
+    .await
+    .expect_err("a key an ordinary fact holds is occupied, not this correction's");
+
+    let AppError::Conflict { what } = refused else {
+        panic!("expected a conflict, got {refused:?}");
+    };
+    let holder = before
+        .iter()
+        .find(|event| event.idempotency_key.as_deref() == Some(key))
+        .expect("an ordinary fact holds the key");
+    assert!(what.contains("not this correction"), "{what}");
+    assert!(
+        what.contains(&holder.id.inner().to_string()),
+        "the refusal names the event that holds the key: {what}"
+    );
+    assert_eq!(
+        journal(&services, owner).await.len(),
+        before.len(),
+        "the refusal writes nothing"
+    );
+}

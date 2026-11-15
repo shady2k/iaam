@@ -138,6 +138,21 @@ pub const MIGRATIONS: [(u32, &str); 19] = [
 /// The database is newer than the program—reject it rather than attempt to operate: an unknown
 /// column is silently read as absent, which is the worst kind of error.
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    apply_missing(conn, &MIGRATIONS)
+}
+
+/// Apply missing migrations from a caller-supplied list.
+///
+/// Test-only: the kill harness needs a migration this build does not ship, so
+/// that it can kill one inside its transaction without touching [`MIGRATIONS`]
+/// or a real database. The production door is [`migrate`], and there is one
+/// implementation behind both.
+#[cfg(any(test, feature = "test-support"))]
+pub fn migrate_with(conn: &Connection, migrations: &[(u32, &str)]) -> Result<(), StoreError> {
+    apply_missing(conn, migrations)
+}
+
+fn apply_missing(conn: &Connection, migrations: &[(u32, &str)]) -> Result<(), StoreError> {
     let current: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > SCHEMA_VERSION {
         return Err(StoreError::SchemaTooNew {
@@ -145,7 +160,7 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
             supported: SCHEMA_VERSION,
         });
     }
-    for (version, sql) in MIGRATIONS {
+    for &(version, sql) in migrations {
         if version <= current {
             continue;
         }
@@ -212,6 +227,8 @@ fn apply_inside_transaction(
     }
     conn.execute_batch(&format!("{sql} PRAGMA user_version = {version};"))?;
     refuse_broken_references(conn, version)?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::fault::migration_point(crate::fault::MIGRATION_INSIDE_TRANSACTION);
     Ok(true)
 }
 

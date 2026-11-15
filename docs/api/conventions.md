@@ -1179,3 +1179,31 @@ A row the source answered with and this system could not turn into a fact is
 **not** one of these: the sync completes and names the row in its answer
 (`recorded`, code `quarantined`), counts the rows set aside in `set_aside`,
 and stands a coverage gap in the journal until the dimension is confirmed.
+
+## 10. A sync that is already running
+
+> **A sync of a series that another sync is running on answers `409` with the
+> code `sync_in_progress`, and `Retry-After` says when the same call is worth
+> sending again.**
+
+A market series is synchronised under a lease, and the lease is the one market
+write made before the network (ADR 0042). It keeps two syncs of one series from
+fetching and publishing beside each other; it is an availability limit, not a
+data-safety one. Nothing of the refused sync is written, and the running sync's
+publication is one transaction, so an answer is never half of one.
+
+| Code | Status | When | What the caller does |
+|---|---|---|---|
+| `sync_in_progress` | 409 | Another sync of the same series holds its lease. `Retry-After` carries the seconds left on it. | Send the same request again after the wait; nothing else has to change. |
+
+Three things this code is not. It is not `already_exists`: nothing is bound or
+held that the owner could revoke, and the request is not a second copy of a
+record that exists. It is not `store_unavailable`: the store is fine, and what
+the caller waits for is a lease, not a fault. And it is not one of §9's source
+codes: the call never left, so no answer from a source caused the refusal.
+
+A sync killed between taking its lease and publishing its run answers this code
+until the lease expires — at most ten minutes — because the lease is the one
+thing a killed process leaves behind on purpose. The scheduled job treats the
+answer as «try next tick», never as a spent day: the series is synced once the
+lease runs out, and the owner does nothing.

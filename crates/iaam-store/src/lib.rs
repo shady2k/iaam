@@ -5,6 +5,13 @@
 //! `rusqlite` blocks the thread, and calling it directly from an axum handler
 //! stops the executor (§3.2).
 
+/// The kill harness (ADR 0042 point 7) is a test fixture, never a production
+/// surface: a release build that enables it is refused.
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!(
+    "iaam-store feature `test-support` requires debug assertions and cannot be enabled in release builds"
+);
+
 pub mod broker_access;
 pub mod broker_egress;
 pub mod broker_operation_kinds;
@@ -15,6 +22,12 @@ pub mod bundle;
 pub mod categories;
 pub mod decisions;
 pub mod documents;
+/// Named stop points for the child-process kill harness (ADR 0042 point 7).
+///
+/// Test-only, like the raw connection: it exists under `cfg(test)` or the
+/// `test-support` feature, and the feature is refused in release builds.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fault;
 pub mod import_session;
 pub mod journal;
 pub mod reference;
@@ -138,16 +151,41 @@ pub enum StoreError {
     /// where the number already points.
     #[error("broker account is already bound to account {account}")]
     BrokerAccountBindingHeld { account: String },
-    #[error("a synchronization run is already in progress for {source_id}/{dataset}/{series_key}")]
+    /// Another run of the series holds its lease.
+    ///
+    /// Carries the lease's expiry, because the honest answer to a caller
+    /// refused this way is when the same call is worth making again: the lease
+    /// is an availability limit, not a data-safety one, and a sync killed
+    /// between taking its lease and publishing its run holds it until it
+    /// expires.
+    #[error(
+        "a synchronization run is already in progress for {source_id}/{dataset}/{series_key}, \
+         until {lease_expires_at}"
+    )]
     LeaseHeld {
         source_id: String,
         dataset: String,
         series_key: String,
+        lease_expires_at: OffsetDateTime,
     },
     #[error("synchronization run lease has expired")]
     LeaseExpired,
     #[error("synchronization run not found or lease token is invalid")]
     RunNotFound,
+    /// The form of a write that runs inside the caller's transaction was
+    /// called with no transaction open.
+    ///
+    /// ADR 0042 point 1: one request is one transaction, opened by the scenario
+    /// once the network is done. Outside one, each of these writes would commit
+    /// statement by statement — the partial write the decision removed — so
+    /// they refuse rather than run. The name of the method travels with the
+    /// refusal: the caller is a scenario's closure that has not been given a
+    /// transaction, and the method is what it must stop calling there.
+    #[error(
+        "{method} must run inside the caller's transaction: outside one it would commit each \
+         statement of the request on its own (ADR 0042 point 1)"
+    )]
+    NoTransaction { method: &'static str },
     #[error("classification rule field {field} is not JSON: {source}")]
     RuleNotJson {
         field: &'static str,
@@ -389,27 +427,89 @@ impl SqliteStore {
     /// committing) into the caller's error type: this crate does not know
     /// `iaam-app`'s `AppError`, or any other caller's error type, so it
     /// cannot implement `From<StoreError>` for it.
+    ///
+    /// An unwind out of `work` is a rollback too (ADR 0042 point 3): the panic
+    /// is caught only long enough to `ROLLBACK` and is then resumed, so a
+    /// caller's panic still reaches it while the database returns to what it
+    /// held before the transaction opened. The connection is left out of a
+    /// transaction either way, so the store stays usable.
     pub fn with_immediate_transaction<T, E>(
         &mut self,
         convert: impl Fn(StoreError) -> E,
         work: impl FnOnce(&mut Self) -> Result<T, E>,
     ) -> Result<T, E> {
+        self.end_abandoned_transaction().map_err(&convert)?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| convert(error.into()))?;
-        match work(self) {
-            Ok(value) => match self.conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(value),
-                Err(error) => {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    Err(convert(error.into()))
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::transaction_began();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
+        match outcome {
+            Ok(Ok(value)) => {
+                #[cfg(any(test, feature = "test-support"))]
+                crate::fault::transaction_point(crate::fault::BEFORE_COMMIT);
+                match self.conn.execute_batch("COMMIT") {
+                    Ok(()) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        crate::fault::transaction_point(crate::fault::AFTER_COMMIT);
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        Err(convert(error.into()))
+                    }
                 }
-            },
-            Err(error) => {
+            }
+            Ok(Err(error)) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
             }
+            Err(payload) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                std::panic::resume_unwind(payload)
+            }
         }
+    }
+
+    /// Return the connection to autocommit before a new transaction begins.
+    ///
+    /// SQLite refuses `BEGIN` inside a transaction, and ignoring that refusal
+    /// would leave the connection inside the abandoned one: every later `BEGIN`
+    /// fails the same way and nothing outside it can ever commit. So an open
+    /// transaction found here is rolled back first, and that is logged at error
+    /// level — no caller of [`Self::with_immediate_transaction`] should leave
+    /// one open, and a run that does has lost work the log must account for.
+    ///
+    /// A `ROLLBACK` that itself fails is returned rather than swallowed: the
+    /// connection is then in a state nothing asked for, and running the caller's
+    /// work inside somebody else's transaction is the worse answer.
+    fn end_abandoned_transaction(&mut self) -> Result<(), StoreError> {
+        if self.conn.is_autocommit() {
+            return Ok(());
+        }
+        tracing::error!(
+            "the connection was inside a transaction when another was begun: rolling it back \
+             first, because BEGIN inside a transaction is refused and the connection would \
+             otherwise stay inside the abandoned one"
+        );
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    /// Refuse a write that only makes sense inside the caller's transaction.
+    ///
+    /// The `*_within` methods exist for one caller: a scenario's closure, run
+    /// by [`Self::with_immediate_transaction`], where the whole request is one
+    /// transaction (ADR 0042 point 1). Called with no transaction open they
+    /// would run in autocommit and commit each statement on its own, which is
+    /// the second way to publish this branch closed — so the refusal is here,
+    /// where the method meets the connection, rather than in a doc comment.
+    pub(crate) fn require_transaction(&self, method: &'static str) -> Result<(), StoreError> {
+        if self.conn.is_autocommit() {
+            return Err(StoreError::NoTransaction { method });
+        }
+        Ok(())
     }
 
     /// Sets the connection's busy-wait budget.
@@ -438,6 +538,54 @@ mod tests {
             parsed.year() >= 2025,
             "timestamp is not from a previous century: {stamp}"
         );
+    }
+
+    /// A commit SQLite refuses is rolled back and returned, and the connection
+    /// is out of the transaction: the caller learns the work did not land and
+    /// can run the next one.
+    ///
+    /// `defer_foreign_keys` postpones the check to the commit, which is the one
+    /// way the transaction's `COMMIT` fails where none of its statements did.
+    #[test]
+    fn a_refused_commit_is_rolled_back_and_reported() {
+        let mut store = SqliteStore::open_in_memory().expect("in-memory database");
+        let outcome: Result<(), StoreError> = store.with_immediate_transaction(
+            |error| error,
+            |store| {
+                store
+                    .connection()
+                    .execute_batch("PRAGMA defer_foreign_keys = ON")?;
+                store.connection().execute(
+                    "INSERT INTO price_observations
+                         (instrument_id, board, session, trade_date, kind, source_id,
+                          observed_at, price, currency, quotation_basis, basis_evidence,
+                          executability, raw_hash, sync_run_id)
+                     VALUES ('missing-instrument', 'TQBR', 1, '2026-08-03', 'close',
+                             'moex-iss', '2026-08-03T09:00:00Z', '100.00', 'RUB',
+                             'money_per_unit', 'test:refused-commit', 'executable',
+                             'raw', 'missing-run')",
+                    [],
+                )?;
+                Ok(())
+            },
+        );
+
+        let error = outcome.expect_err("the deferred foreign key fails the commit");
+        assert!(
+            matches!(&error, StoreError::Sqlite(source) if source.to_string().contains("FOREIGN KEY")),
+            "the commit's own refusal is kept: {error}"
+        );
+        assert!(
+            store.connection().is_autocommit(),
+            "the connection is out of the refused transaction"
+        );
+        let written: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
+                row.get(0)
+            })
+            .expect("row count");
+        assert_eq!(written, 0, "the rolled-back row is not there");
     }
 
     #[test]

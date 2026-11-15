@@ -461,6 +461,21 @@ impl Provenance {
         self
     }
 
+    /// The same provenance with the presenting credential left out.
+    ///
+    /// [`Self::declared_by`] answers *which credential presented* a fact, and
+    /// that is not part of what the fact says: a retry of one command may
+    /// arrive under another token — a rotated one, or the owner's own after
+    /// the agent's — and it is still the same command. Comparing two
+    /// submissions to decide «is this the same command again» therefore
+    /// compares them through this, so that a retry is recognised whatever
+    /// credential carried it.
+    #[must_use]
+    pub const fn without_declared_by(mut self) -> Self {
+        self.declared_by = None;
+        self
+    }
+
     /// Stamp the import session this fact is being committed out of.
     ///
     /// Applied after normalisation for the reason the import and the declaring

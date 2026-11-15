@@ -54,6 +54,9 @@ iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
 # enabled. Unit tests inside `src/` need no such thing: `cfg(test)` is already
 # true for them when this crate itself is under test.
 iaam-store = { path = ".", version = "0.1.0", features = ["test-support"] }
+# Only for tests: the abandoned-transaction test reads back the error log that
+# accounts for the rolled-back work.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [lints]
 workspace = true

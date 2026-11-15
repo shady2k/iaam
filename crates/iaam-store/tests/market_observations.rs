@@ -4,7 +4,8 @@ use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
 use iaam_store::market::{
-    AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, PriceVenue, RunOutcome, SeriesKey,
+    AccruedInterestRow, Coverage, FixturePublication, FxRow, KeyRateRow, PriceRow, PriceVenue,
+    RunOutcome, SeriesKey,
 };
 use iaam_store::reference::InstrumentRecord;
 use iaam_store::{SqliteStore, StoreError};
@@ -269,6 +270,45 @@ fn an_expired_lease_is_refused_by_recording() {
     let result = store.record_fx(&run, "raw-expired", &[fx("2026-08-03T09:00:00Z", "80")]);
 
     assert!(matches!(result, Err(StoreError::LeaseExpired)));
+}
+
+/// A running lease whose expiry cannot be read is refused, never treated as
+/// free: reading corrupt data as «no lease» would let a second writer publish
+/// into a run that may still be alive elsewhere.
+#[test]
+fn a_running_lease_with_an_unreadable_expiry_is_refused_rather_than_treated_as_free() {
+    let (mut store, _) = store_with_instrument();
+    let series = series_with_dataset("fx", "USD/RUB");
+    store
+        .begin_run(
+            series.clone(),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("active lease");
+    store
+        .connection()
+        .execute(
+            "UPDATE sync_runs SET lease_expires_at = 'not-a-moment' WHERE status = 'running'",
+            [],
+        )
+        .expect("test writes an unreadable expiry");
+
+    let result = store.begin_run(
+        series,
+        date!(2026 - 08 - 03),
+        date!(2026 - 08 - 03),
+        lease(),
+    );
+
+    match result {
+        Err(StoreError::InvalidValue { field, value }) => {
+            assert_eq!(field, "lease_expires_at");
+            assert_eq!(value, "not-a-moment");
+        }
+        other => panic!("a lease that cannot be read must be refused, got {other:?}"),
+    }
 }
 
 #[test]
@@ -575,14 +615,15 @@ fn accrued_interest_is_invisible_before_its_knowledge_coordinate() {
 }
 
 #[test]
-fn a_second_run_on_the_same_series_is_refused_while_the_lease_holds() {
+fn a_second_run_on_the_same_series_is_refused_naming_when_the_lease_ends() {
     let (mut store, _) = store_with_instrument();
+    let held = lease();
     let _first = store
         .begin_run(
             series("SBER:TQBR:1"),
             date!(2026 - 08 - 03),
             date!(2026 - 08 - 03),
-            lease(),
+            held,
         )
         .expect("first lease");
     let refused = store.begin_run(
@@ -592,7 +633,22 @@ fn a_second_run_on_the_same_series_is_refused_while_the_lease_holds() {
         lease(),
     );
 
-    assert!(matches!(refused, Err(StoreError::LeaseHeld { .. })));
+    // The expiry travels with the refusal: it is what tells a caller when the
+    // same call is worth making again, and only this store knows it.
+    match refused {
+        Err(StoreError::LeaseHeld {
+            source_id,
+            dataset,
+            series_key,
+            lease_expires_at,
+        }) => {
+            assert_eq!(source_id, "moex-iss");
+            assert_eq!(dataset, "prices");
+            assert_eq!(series_key, "SBER:TQBR:1");
+            assert_eq!(lease_expires_at, held, "the refusal names the lease's end");
+        }
+        other => panic!("expected the lease refusal, got {other:?}"),
+    }
 }
 
 #[test]

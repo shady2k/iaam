@@ -19,9 +19,12 @@ use crate::ports::{
     DeclinedAccountNameView, DocumentToKeep, ImportObservationView, ImportQuestionView,
     ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
     InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery,
-    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store,
-    SyncRefusalFilter, SyncRefusalRecord, TokenAdmin, TokenView, UnresolvedAccountSourceView,
-    UnresolvedAccountView,
+    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store, StoreTx,
+    SyncRefusalFilter, SyncRefusalRecord, TokenAdmin, TokenView, TransactionalWork, TxResult,
+    UnresolvedAccountSourceView, UnresolvedAccountView,
+};
+use crate::ports::{
+    AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, RunHandle, RunOutcome, SeriesKey,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -201,6 +204,109 @@ impl SqliteAdapter {
     }
 }
 
+/// The store inside a caller's transaction, handed to [`Store::transact`]
+/// work.
+///
+/// A thin holder rather than a second store: every method delegates to a
+/// [`SqliteStore`] call that neither opens nor commits a transaction of its
+/// own, so the transaction stays the caller's and adding an operation is one
+/// more method on [`StoreTx`] and one more delegation here.
+struct TransactionHandle<'a> {
+    store: &'a mut SqliteStore,
+}
+
+impl StoreTx for TransactionHandle<'_> {
+    fn append_events_in_order(
+        &mut self,
+        events: Vec<Event>,
+        identity_scope: IdentityScope,
+    ) -> Result<Vec<Recorded>, AppError> {
+        let mut recorded = Vec::with_capacity(events.len());
+        for (row_index, event) in events.iter().enumerate() {
+            let span = tracing::info_span!("journal_append", row_index,
+                event_id = %event.id.inner(), account_id = %event.account.inner());
+            let _entered = span.enter();
+            let outcome = self
+                .store
+                .append_event_in_order_within(event, identity_scope)
+                .map_err(|error| {
+                    tracing::error!(error = %error, "journal append failed");
+                    store_error(error)
+                })?;
+            recorded.push(match outcome {
+                Appended::Inserted { id } => Recorded::Inserted { id },
+                Appended::Duplicate { existing } => Recorded::Duplicate { existing },
+            });
+        }
+        Ok(recorded)
+    }
+
+    fn load_events_through(
+        &mut self,
+        owner: OwnerId,
+        through: Date,
+    ) -> Result<Vec<Event>, AppError> {
+        self.store
+            .load_events_through(owner, through)
+            .map_err(store_error)
+    }
+
+    fn record_prices(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[PriceRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_prices_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn record_accrued_interest(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[AccruedInterestRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_accrued_interest_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn record_fx(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[FxRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_fx_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn record_key_rate(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[KeyRateRow],
+    ) -> Result<usize, AppError> {
+        self.store
+            .record_key_rate_within(run, raw_hash, rows)
+            .map_err(store_error)
+    }
+
+    fn finish_run(
+        &mut self,
+        run: &RunHandle,
+        outcome: RunOutcome,
+        coverage: Option<Coverage>,
+    ) -> Result<(), AppError> {
+        self.store
+            .finish_run_within(run, outcome, coverage)
+            .map_err(store_error)
+    }
+}
+
 /// Session state: from the port to the store, and back.
 ///
 /// Exhaustive in both directions, for the reason `scope_from_store` is: a fourth
@@ -372,6 +478,24 @@ fn store_error(error: iaam_store::StoreError) -> AppError {
         iaam_store::StoreError::BrokerAccountBindingHeld { account } => AppError::Conflict {
             what: format!("broker account is already bound to account {account}"),
         },
+        // A series another sync is running on is not a store failure: the
+        // store is fine, the journal holds nothing of the second attempt, and
+        // the same call is worth making again once the lease it names has run
+        // out. Answering `Store` here would send the caller to investigate the
+        // database for a limit that is only about when (ADR 0042, decision
+        // 0042's «the market sync lease is an availability limit»).
+        iaam_store::StoreError::LeaseHeld {
+            source_id,
+            dataset,
+            series_key,
+            lease_expires_at,
+        } => AppError::SyncInProgress {
+            series: format!("{source_id}/{dataset}/{series_key}"),
+            retry_after: std::time::Duration::try_from(
+                lease_expires_at - time::OffsetDateTime::now_utc(),
+            )
+            .unwrap_or_default(),
+        },
         other => AppError::Store(other.to_string()),
     }
 }
@@ -468,32 +592,46 @@ const fn scope_to_store(scope: Scope) -> TokenScope {
 
 #[async_trait]
 impl Store for SqliteAdapter {
+    async fn begin_market_run(
+        &self,
+        series: SeriesKey,
+        from: Date,
+        to: Date,
+        lease_expires_at: time::OffsetDateTime,
+    ) -> Result<RunHandle, AppError> {
+        self.blocking(move |store| {
+            store
+                .begin_run(series, from, to, lease_expires_at)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn transact(&self, work: TransactionalWork) -> Result<TxResult, AppError> {
+        self.blocking(move |store| {
+            store.with_immediate_transaction(store_error, |store| {
+                let mut handle = TransactionHandle { store };
+                work(&mut handle)
+            })
+        })
+        .await
+    }
+
     async fn append_events(
         &self,
         events: Vec<Event>,
         identity_scope: IdentityScope,
     ) -> Result<Vec<Recorded>, AppError> {
-        self.blocking(move |store| {
-            let mut recorded = Vec::with_capacity(events.len());
-            for (row_index, event) in events.iter().enumerate() {
-                let span = tracing::info_span!("journal_append", row_index,
-                    event_id = %event.id.inner(), account_id = %event.account.inner());
-                let _entered = span.enter();
-                let outcome =
-                    store
-                        .append_event_in_order(event, identity_scope)
-                        .map_err(|error| {
-                            tracing::error!(error = %error, "journal append failed");
-                            store_error(error)
-                        })?;
-                recorded.push(match outcome {
-                    Appended::Inserted { id } => Recorded::Inserted { id },
-                    Appended::Duplicate { existing } => Recorded::Duplicate { existing },
-                });
-            }
-            Ok(recorded)
-        })
-        .await
+        let result = self
+            .transact(Box::new(move |tx: &mut dyn StoreTx| {
+                let recorded = tx.append_events_in_order(events, identity_scope)?;
+                Ok(Box::new(recorded) as TxResult)
+            }))
+            .await?;
+        result
+            .downcast::<Vec<Recorded>>()
+            .map(|recorded| *recorded)
+            .map_err(|_| AppError::Store("journal append returned an unexpected result".to_owned()))
     }
 
     async fn load_events_through(

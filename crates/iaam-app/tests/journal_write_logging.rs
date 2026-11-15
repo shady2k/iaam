@@ -95,7 +95,12 @@ async fn failed_detail_write_logs_the_statement_and_batch_row_without_financial_
         .with_max_level(tracing::Level::TRACE)
         .with_writer(move || writer.clone())
         .finish();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    // Global, not thread-local: the write happens on a `spawn_blocking`
+    // worker, and a capture that depends on the adapter propagating the
+    // thread-local dispatcher would stop proving anything the moment it
+    // stopped doing so.
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("this test binary sets the subscriber once");
 
     let error = adapter
         .append_events(vec![first, failing], IdentityScope::Source)

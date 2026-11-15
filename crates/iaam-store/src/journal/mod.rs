@@ -140,6 +140,42 @@ pub(crate) fn parse_uuid(value: &str, what: &'static str) -> Result<uuid::Uuid, 
     })
 }
 
+/// The order-assigning append, on whichever connection-level transaction is
+/// open: its own from [`SqliteStore::append_event_in_order`], or the caller's
+/// from [`SqliteStore::append_event_in_order_within`].
+fn append_in_order(
+    conn: &Connection,
+    event: &Event,
+    identity_scope: IdentityScope,
+) -> Result<Appended, StoreError> {
+    if let Some(existing) = find_duplicate(conn, event, identity_scope)? {
+        return Ok(Appended::Duplicate { existing });
+    }
+    let day = event.order.date();
+    let used: Option<u32> = conn.query_row(
+        "SELECT MAX(sequence) FROM events WHERE owner = ?1 AND effective_date = ?2",
+        params![event.owner.inner().to_string(), day.to_string()],
+        |row| row.get(0),
+    )?;
+    let stamped = Event {
+        order: event.order.source_time().map_or_else(
+            || EffectiveOrder::new(day, used.map_or(1, |value| value.saturating_add(1))),
+            |source_time| {
+                EffectiveOrder::with_source_time(
+                    day,
+                    source_time,
+                    used.map_or(1, |value| value.saturating_add(1)),
+                )
+            },
+        ),
+        ..event.clone()
+    };
+    write::insert_event_in(conn, &stamped)?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::fault::write_completed();
+    Ok(Appended::Inserted { id: stamped.id })
+}
+
 impl SqliteStore {
     /// Record an event with an already assigned sequence.
     ///
@@ -181,31 +217,29 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = find_duplicate(&transaction, event, identity_scope)? {
-            return Ok(Appended::Duplicate { existing });
-        }
-        let day = event.order.date();
-        let used: Option<u32> = transaction.query_row(
-            "SELECT MAX(sequence) FROM events WHERE owner = ?1 AND effective_date = ?2",
-            params![event.owner.inner().to_string(), day.to_string()],
-            |row| row.get(0),
-        )?;
-        let stamped = Event {
-            order: event.order.source_time().map_or_else(
-                || EffectiveOrder::new(day, used.map_or(1, |value| value.saturating_add(1))),
-                |source_time| {
-                    EffectiveOrder::with_source_time(
-                        day,
-                        source_time,
-                        used.map_or(1, |value| value.saturating_add(1)),
-                    )
-                },
-            ),
-            ..event.clone()
-        };
-        write::insert_event_in(&transaction, &stamped)?;
+        let appended = append_in_order(&transaction, event, identity_scope)?;
         transaction.commit()?;
-        Ok(Appended::Inserted { id: stamped.id })
+        Ok(appended)
+    }
+
+    /// Record an event in order inside a transaction the caller opened.
+    ///
+    /// The same work as [`Self::append_event_in_order`] — duplicate check,
+    /// `MAX(sequence) + 1` for the day, the write and its read-back — but it
+    /// neither opens nor commits a transaction. The caller demarcates one
+    /// around this and everything else the request does, so a request is
+    /// whole or leaves nothing (ADR 0042). `MAX(sequence)` reads the caller's
+    /// own uncommitted inserts, which is what keeps the order of a batch.
+    /// Called with no transaction open it refuses, naming itself
+    /// (`StoreError::NoTransaction`): one event per commit is the partial write
+    /// the decision removed.
+    pub fn append_event_in_order_within(
+        &self,
+        event: &Event,
+        identity_scope: IdentityScope,
+    ) -> Result<Appended, StoreError> {
+        self.require_transaction("append_event_in_order_within")?;
+        append_in_order(&self.conn, event, identity_scope)
     }
 
     /// Recomputes the owner's whole `event_category_assignments` projection

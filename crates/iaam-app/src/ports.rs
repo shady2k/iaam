@@ -36,11 +36,17 @@ pub use iaam_store::journal::RecordedEvent;
 // The grouping label deliberately does not live in `iaam-core`: the core is
 // where rules live, and nothing may branch on it.
 pub use iaam_core::report::balances::NegativeBalanceExpectation;
+/// The market publication a [`StoreTx`] performs, in the store's own
+/// vocabulary: a run's handle, the page rows and the outcome the run ends in.
+/// Retyped nowhere, for the reason [`RecordedEvent`] gives above.
+pub use iaam_store::market::{
+    AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, RunHandle, RunOutcome, SeriesKey,
+};
 pub use iaam_store::reference::CashAssetClass;
 pub use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use serde_json::Value;
 use std::sync::Arc;
-use time::Date;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -52,6 +58,103 @@ use crate::error::AppError;
 pub enum Recorded {
     Inserted { id: iaam_core::ids::EventId },
     Duplicate { existing: iaam_core::ids::EventId },
+}
+
+/// What transactional work returns, type-erased because [`Store`] is
+/// object-safe: `AppServices` holds `Arc<dyn Store>` (ADR 0042 point 1).
+pub type TxResult = Box<dyn std::any::Any + Send>;
+
+/// One request's reads-for-validation and writes, run inside one store
+/// transaction by [`Store::transact`].
+///
+/// Boxed and `'static` because the work crosses to the store's blocking
+/// thread, and `Send` for the same reason. The work is synchronous on purpose:
+/// an `await` inside it is impossible, so no network call can hold the write
+/// lock. It does not stop a blocking call, so a closure is still read for one.
+pub type TransactionalWork =
+    Box<dyn FnOnce(&mut dyn StoreTx) -> Result<TxResult, AppError> + Send + 'static>;
+
+/// The store as seen inside the caller's transaction.
+///
+/// One method per operation that must take part in [`Store::transact`].
+/// Adding a document, category, import-session or account operation is one
+/// more method here and one more implementation in the adapter, not another
+/// transaction mechanism (ADR 0042 point 2). Every method is synchronous and
+/// runs on the store's blocking thread.
+pub trait StoreTx {
+    /// Append a batch in order inside the caller's transaction.
+    ///
+    /// The same outcomes, order within the day and assigned sequences as
+    /// [`Store::append_events`]; only the transaction boundary differs.
+    fn append_events_in_order(
+        &mut self,
+        events: Vec<Event>,
+        identity_scope: IdentityScope,
+    ) -> Result<Vec<Recorded>, AppError>;
+
+    /// The owner's journal through `through`, read inside the caller's
+    /// transaction and therefore seeing what the same work already wrote.
+    fn load_events_through(
+        &mut self,
+        owner: OwnerId,
+        through: Date,
+    ) -> Result<Vec<Event>, AppError>;
+
+    /// Write one page of price observations to an unfinished run.
+    ///
+    /// The five methods from here to [`StoreTx::finish_run`] are the steps of
+    /// one market publication, and they are separate steps rather than one
+    /// call because a response carries prices and accrued interest in the same
+    /// rows, FX and key rates in others. A caller puts the steps its response
+    /// produced in one [`Store::transact`], which is what makes the
+    /// publication whole: before that change each step committed on its own,
+    /// so a kill between two of them left observations no reader can see and
+    /// no completed run that names them (ADR 0042 point 1).
+    ///
+    /// The store's own page methods open no transaction either; they are
+    /// reachable only through this handle, so this is not a second way in.
+    fn record_prices(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[PriceRow],
+    ) -> Result<usize, AppError>;
+
+    /// Write one page of accrued coupon interest to an unfinished run.
+    fn record_accrued_interest(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[AccruedInterestRow],
+    ) -> Result<usize, AppError>;
+
+    /// Write one page of exchange-rate observations to an unfinished run.
+    fn record_fx(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[FxRow],
+    ) -> Result<usize, AppError>;
+
+    /// Write one page of key-rate observations to an unfinished run.
+    fn record_key_rate(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        rows: &[KeyRateRow],
+    ) -> Result<usize, AppError>;
+
+    /// Complete the run, advancing the series' completeness boundary when the
+    /// outcome is success.
+    ///
+    /// Last step of the publication or, after a source that failed, the only
+    /// one: a run that is not closed keeps its series' lease until it expires.
+    fn finish_run(
+        &mut self,
+        run: &RunHandle,
+        outcome: RunOutcome,
+        coverage: Option<Coverage>,
+    ) -> Result<(), AppError>;
 }
 
 /// Token permissions at the application level.
@@ -867,6 +970,42 @@ pub struct DeclinedAccountNameView {
 /// Store for facts and reference data.
 #[async_trait]
 pub trait Store: Send + Sync {
+    /// Run `work` inside one `BEGIN IMMEDIATE … COMMIT` transaction on the
+    /// store's blocking thread.
+    ///
+    /// The work performs a request's reads-for-validation and writes together,
+    /// so the request is whole or leaves nothing (ADR 0042 point 1). A returned
+    /// error and a panic inside the work both roll the transaction back. The
+    /// work is synchronous, which is what keeps a network call out of the
+    /// transaction by construction; reads inside it see what it already wrote,
+    /// because they run on the same connection inside the same transaction.
+    ///
+    /// Type-erased because `AppServices` holds `Arc<dyn Store>`: the closure
+    /// and its result are boxed, so nothing here knows the transaction's
+    /// concrete type.
+    async fn transact(&self, work: TransactionalWork) -> Result<TxResult, AppError>;
+
+    /// Take a series' market lease and open its run, in a transaction of its
+    /// own and before any network call.
+    ///
+    /// The lease is the one market write outside [`Store::transact`]: it is an
+    /// availability limit rather than data safety (ADR 0042, «what stays as
+    /// decided before»), and holding a transaction across the fetch would keep
+    /// the write lock for the length of a broker call. It gets a transaction of
+    /// its own so that clearing an interrupted run's expired lease and opening
+    /// the new run are one step: a caller that finds the series held is
+    /// refused, not queued.
+    ///
+    /// Publication takes [`StoreTx`] afterwards, on the same connection, so one
+    /// transaction carries the whole of what the fetch produced.
+    async fn begin_market_run(
+        &self,
+        series: SeriesKey,
+        from: Date,
+        to: Date,
+        lease_expires_at: OffsetDateTime,
+    ) -> Result<RunHandle, AppError>;
+
     /// Write events, assigning their order within the day.
     ///
     /// The store assigns the order in the same transaction as the insertion:

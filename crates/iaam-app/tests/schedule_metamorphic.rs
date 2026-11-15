@@ -25,7 +25,7 @@ use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
-use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
+use iaam_store::market::{Coverage, FixturePublication, PriceRow, RunOutcome, SeriesKey};
 use iaam_store::market_source_codes::SourceCodeEntry;
 use iaam_store::reference::InstrumentRecord;
 use time::Duration;

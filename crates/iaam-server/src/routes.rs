@@ -1906,6 +1906,12 @@ pub async fn record_broker_account_binding(
         (status = 200, description = "Market synchronisation result", body = MarketSyncOutcomeDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid range", body = ApiError),
+        (
+            status = 409,
+            description = "Another sync of this series is running and holds its lease (code `sync_in_progress`); nothing of this request was written, and `Retry-After` says when the same call is worth sending again",
+            body = ApiError,
+            headers(("Retry-After" = u64, description = "Whole seconds until the running sync's lease runs out"))
+        ),
         (status = 502, description = "The market source refused the request (code `source_refused`): a retry gets the same answer", body = ApiError),
         (
             status = 503,

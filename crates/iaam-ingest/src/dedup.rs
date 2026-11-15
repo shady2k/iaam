@@ -26,6 +26,17 @@
 //!
 //! The natural key “account + date + amount” is not used anywhere: it
 //! produces false matches and fails to catch duplicates after normalization.
+//!
+//! **A key a channel issued travels as the idempotency key and is still level
+//! 4.** [`StatementRowKey`] and `crate::csv_source`'s derived row key are both
+//! written into `idempotency_key`, because the store's duplicate lookup reads
+//! that field and `source_operation_id` and nothing else. The field is where such
+//! a key is kept, not what it is: a client naming its own submission (level 2) and
+//! a statement naming a row by its order (level 4) are different evidence, and
+//! [`distinct_keys_within_channel`] reads only the second as proof that two rows
+//! are two operations.
+
+use std::collections::BTreeMap;
 
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, EventId, SourceId};
@@ -108,6 +119,116 @@ impl DedupKey {
             Self::NormalizedFingerprint { .. } => 4,
         }
     }
+}
+
+/// Version of the key form below.
+///
+/// Part of the key, as [`CANONICAL_VERSION`] is part of the fingerprint: these
+/// keys have already been deduplicated against, so a change of form must be
+/// visible in the value rather than inferred from its shape.
+const STATEMENT_ROW_KEY_VERSION: u8 = 1;
+
+/// Prefix every key of this form starts with.
+const STATEMENT_ROW_KEY_NAME: &str = "broker-row";
+
+/// A row key the channel's own statement order issued.
+///
+/// **Why it exists.** §10.6 may not delete a row on a fingerprint match alone,
+/// so a channel row that named neither a source identifier nor a key of its own
+/// left the repeat of the answer that carried it as a level-five hint — the row
+/// was recorded a second time (iaam-mkbfh.2). ADR 0042 point 4 allows one way
+/// out and only one: the row is given a key from its content **and its
+/// occurrence inside a stated statement boundary**, and only where the channel
+/// states that the boundary, and the order of identical rows inside it, hold.
+///
+/// **The boundary is the day, and the statement is the channel's.** An
+/// operations answer is asked for by dates, so a day inside the window arrives
+/// whole: every answer that contains a day carries the same rows of that day
+/// and, given the channel's order, in the same order. The n-th identical row of
+/// a day is therefore the same row in both, which is what makes the key stable
+/// across overlapping windows and the repeat of one window recognised. The
+/// fingerprint already fixes the dates, so grouping by content is grouping by
+/// day; the day is not repeated in the value.
+///
+/// This is a locator in §10.6's sense — level 4, "document **and** row are
+/// known" — derived from the statement's order rather than printed on it. It is
+/// written as an idempotency key because the store's duplicate lookup reads
+/// `source_operation_id` and `idempotency_key` and nothing else, exactly as
+/// [`crate::csv_source`]'s own derived row key is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementRowKey(String);
+
+impl StatementRowKey {
+    /// The key of one row: which submission named it, its account, its content,
+    /// and which occurrence of that content it is in the statement's day.
+    #[must_use]
+    pub fn of(source: SourceId, account: AccountId, content: &RawHash, occurrence: u64) -> Self {
+        Self(format!(
+            "{STATEMENT_ROW_KEY_NAME}:v{STATEMENT_ROW_KEY_VERSION}:{}:{}:{}:{occurrence}",
+            source.inner(),
+            account.inner(),
+            content.as_str()
+        ))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether a key read back from the journal is one of these.
+    ///
+    /// Recognition, not parsing: a stored key is a string, and the evidence that
+    /// two different ones name two rows
+    /// ([`distinct_keys_within_channel`]) needs to tell a key this rule issued
+    /// from a key a client chose that happens to have the same shape.
+    #[must_use]
+    pub fn parse(stored: &str) -> Option<Self> {
+        let prefix = format!("{STATEMENT_ROW_KEY_NAME}:v{STATEMENT_ROW_KEY_VERSION}:");
+        let rest = stored.strip_prefix(&prefix)?;
+        let parts: Vec<&str> = rest.split(':').collect();
+        let [source, account, content, occurrence] = parts.as_slice() else {
+            return None;
+        };
+        let well_formed = !source.is_empty()
+            && !account.is_empty()
+            && RawHash::parse(content).is_some()
+            && occurrence.parse::<u64>().is_ok();
+        well_formed.then(|| Self(stored.to_owned()))
+    }
+}
+
+/// Give every row that names no identity of its own the occurrence key its
+/// channel's statement order implies; answers how many rows were given one.
+///
+/// The caller decides whether the channel states the order: this module cannot
+/// know it, because the statement is the channel's (ADR 0042 point 4). Rows that
+/// name a source identifier or a key of their own are left alone: those outrank
+/// anything derived (§10.6 levels 1 and 2).
+///
+/// **The rows are stamped before anything reorders them.** The occurrence is
+/// the channel's, so the list must still be the channel's when this runs; a
+/// caller that sorts rows first would be counting its own order.
+pub fn stamp_statement_row_keys(rows: &mut [SubmittedOperation], source: SourceId) -> usize {
+    let mut occurrences: BTreeMap<(AccountId, String), u64> = BTreeMap::new();
+    let mut stamped = 0;
+    for operation in rows.iter_mut() {
+        if operation.source_operation_id.is_some() || operation.idempotency_key.is_some() {
+            continue;
+        }
+        let content = fingerprint(operation);
+        let occurrence = occurrences
+            .entry((operation.account, content.as_str().to_owned()))
+            .or_insert(0);
+        operation.idempotency_key = Some(
+            StatementRowKey::of(source, operation.account, &content, *occurrence)
+                .as_str()
+                .to_owned(),
+        );
+        *occurrence += 1;
+        stamped += 1;
+    }
+    stamped
 }
 
 pub use iaam_core::reconciliation::evidence::IdentityScope;
@@ -317,7 +438,7 @@ pub fn assess_with_rule(
         if &record.fingerprint != fingerprint || same_document(record, context) {
             continue;
         }
-        if distinct_source_keys_within_channel(record, key, context) {
+        if distinct_keys_within_channel(record, key, context) {
             rule = DedupRule::DistinctSourceKeysWithinChannel;
             continue;
         }
@@ -334,20 +455,36 @@ pub fn assess_with_rule(
 
 /// Distinct stable keys in one broker API channel prove distinct operations.
 /// Missing keys or independent sources provide no such evidence.
-fn distinct_source_keys_within_channel(
+///
+/// Two kinds of key are such evidence: the identifier the source gave the row,
+/// and the occurrence key a channel that states its order issued
+/// ([`StatementRowKey`]). A client's own key is not — the client names the
+/// submission, and two submissions may legitimately carry equal content.
+fn distinct_keys_within_channel(
     record: &KnownRecord,
     key: Option<&DedupKey>,
     context: &DocumentContext,
 ) -> bool {
-    context.broker_api_source == Some(record.source)
-        && record.account == context.account
-        && record.document.is_none()
-        && context.document.is_none()
-        && matches!(
-            (record.source_operation_id.as_deref(), key),
-            (Some(known), Some(DedupKey::SourceOperationId(incoming)))
-                if !known.is_empty() && !incoming.is_empty() && known != incoming
-        )
+    if context.broker_api_source != Some(record.source)
+        || record.account != context.account
+        || record.document.is_some()
+        || context.document.is_some()
+    {
+        return false;
+    }
+    let source_ids = matches!(
+        (record.source_operation_id.as_deref(), key),
+        (Some(known), Some(DedupKey::SourceOperationId(incoming)))
+            if !known.is_empty() && !incoming.is_empty() && known != incoming
+    );
+    let statement_rows = matches!(
+        (record.idempotency_key.as_deref(), key),
+        (Some(known), Some(DedupKey::IdempotencyKey(incoming)))
+            if StatementRowKey::parse(known).is_some()
+                && StatementRowKey::parse(incoming).is_some()
+                && known != incoming.as_str()
+    );
+    source_ids || statement_rows
 }
 
 /// Whether it has been proven that the record and row came from the same document.

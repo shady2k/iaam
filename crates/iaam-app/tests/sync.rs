@@ -20,6 +20,7 @@ use iaam_broker::credentials::{Key, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_broker::operation_kind::{OperationKindDictionary, seed_for};
 use iaam_broker::tinkoff::TinkoffClient;
+use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
@@ -28,9 +29,11 @@ use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::SourceChannel;
+use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_http::gateway::{BUDGETS, Clock as GatewayClock, Sleeper, Transport};
 use iaam_http::{Gateway, HttpError, HttpRequest, HttpResponse, RequestAllowance};
 use iaam_ingest::dedup::DedupLevel;
@@ -55,6 +58,11 @@ struct FakeBroker {
     identity_scope: IdentityScope,
     operations: Result<ParsedOperations, BrokerError>,
     portfolio: Result<PortfolioSnapshot, BrokerError>,
+    /// Whether this double states that its identical rows keep one order inside
+    /// a day. `false` everywhere but the tests that speak for such a channel:
+    /// both channels this repository ships name every row, so a keyless row is a
+    /// statement about the channel that only the channel can make.
+    same_day_rows_keep_their_order: bool,
     /// The account numbers the access sees. Empty is empty: the access sees
     /// none, and a sync that asks is refused rather than left to guess.
     accounts: Vec<String>,
@@ -116,6 +124,10 @@ impl BrokerChannel for FakeBroker {
 
     fn identity_scope(&self) -> IdentityScope {
         self.identity_scope
+    }
+
+    fn same_day_rows_keep_their_order(&self) -> bool {
+        self.same_day_rows_keep_their_order
     }
 }
 
@@ -533,6 +545,7 @@ fn api_with_claims(
     claims: Vec<ControlClaim>,
 ) -> FakeBroker {
     FakeBroker {
+        same_day_rows_keep_their_order: false,
         accounts: vec!["invented-one".to_owned()],
         requested_numbers: Mutex::new(Vec::new()),
         accounts_requests: AtomicUsize::new(0),
@@ -648,6 +661,7 @@ async fn a_position_with_no_trade_in_the_interval_registers_no_custody() {
     });
 
     let broker = FakeBroker {
+        same_day_rows_keep_their_order: false,
         accounts: vec!["invented-one".to_owned()],
         requested_numbers: Mutex::new(Vec::new()),
         accounts_requests: AtomicUsize::new(0),
@@ -713,6 +727,7 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
     let first_operation = trade_without_custody(first_account, instrument);
     let second_operation = trade_without_custody(second_account, instrument);
     let make_broker = |operation| FakeBroker {
+        same_day_rows_keep_their_order: false,
         accounts: vec!["invented-one".to_owned()],
         requested_numbers: Mutex::new(Vec::new()),
         accounts_requests: AtomicUsize::new(0),
@@ -1118,6 +1133,137 @@ async fn repeating_refused_sync_appends_one_coverage_gap() {
             .count(),
         1
     );
+}
+
+/// A sync whose every row is refused and whose portfolio is withheld writes one
+/// coverage gap and nothing else, so the account's data-coverage dates — the
+/// global bounds and the per-account ones — do not move: a gap says an attempt
+/// refused rows, which is the opposite of a day the account's data covers
+/// (iaam-y07x).
+#[tokio::test]
+async fn a_gap_only_sync_does_not_move_the_coverage_dates() {
+    let owner = OwnerId::new_random();
+    let covered = AccountId::new_random();
+    let gap_only = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    // A day past the interval: the channel reports its present portfolio, so
+    // the answer describes another day, is withheld, and only the gap is
+    // written.
+    let services = services_with(date!(2026 - 04 - 01), |store| {
+        seed_account(store, owner, covered, "Main");
+        seed_account(store, owner, gap_only, "Savings");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    let covered_broker = api(
+        covered,
+        SourceId::new_random(),
+        trade_without_custody(covered, instrument),
+    );
+    sync_broker(
+        &services,
+        &principal(owner),
+        &covered_broker,
+        covered,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("covered account sync: {error}"));
+
+    let mut refused_broker = api(
+        gap_only,
+        SourceId::new_random(),
+        trade_without_custody(gap_only, instrument),
+    );
+    refused_broker.operations = Ok(ParsedOperations {
+        duplicates: Vec::new(),
+        has_out_of_interval_trade: false,
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
+        accepted: Vec::new(),
+        quarantined: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::json!({"operationId": "invented-1", "payment": {"units": "1", "nano": 5}}),
+            reason: "payment has a fraction below the currency's smallest unit".to_owned(),
+            dimensions: dimensions(&[Dimension::Cash]),
+        }],
+    });
+    let gap_sync = sync_broker(
+        &services,
+        &principal(owner),
+        &refused_broker,
+        gap_only,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("refused account sync: {error}"));
+    assert_eq!(gap_sync.assertions, 0);
+    assert_eq!(
+        gap_sync.assertions_withheld,
+        Some(AssertionsWithheld::PortfolioDescribesAnotherDay {
+            as_of: date!(2026 - 04 - 01)
+        })
+    );
+
+    let events = load_all(&services, owner).await;
+    let trade_day = events
+        .iter()
+        .find_map(|event| match event.kind {
+            EventKind::Trade { .. } => event.dates.effective_date(),
+            _ => None,
+        })
+        .expect("the covered account's trade");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::ImportCoverageGap { .. }))
+            .count(),
+        1,
+        "the attempt left one gap"
+    );
+
+    let rules = RuleRegistry::with_defaults();
+    let contour = ContourDefinition::new(
+        ContourId::new_random(),
+        ContourVersion(1),
+        [covered, gap_only],
+    );
+    let context = ProjectionContext {
+        contour: &contour,
+        rules: &rules,
+        lot_rule: LotRuleVersion(1),
+    };
+    let projection =
+        project(&events, &context).unwrap_or_else(|error| panic!("projection: {error}"));
+    let coverage = projection.state().coverage();
+    assert_eq!(coverage.first_event(), Some(trade_day));
+    assert_eq!(
+        coverage.last_event(),
+        Some(trade_day),
+        "a refused attempt is not a day the journal's data reaches"
+    );
+    assert_eq!(coverage.first_event_for(covered), Some(trade_day));
+    assert_eq!(
+        coverage.first_event_for(gap_only),
+        None,
+        "an account whose only event is a gap covers no day"
+    );
+
+    // The store's own account bounds already answer this way; the projection is
+    // what a report reads, and it must agree.
+    let activity = services
+        .store
+        .list_account_activity(owner)
+        .await
+        .unwrap_or_else(|error| panic!("account activity: {error}"));
+    let refused = activity
+        .iter()
+        .find(|row| row.account == gap_only)
+        .expect("the account whose attempt refused every row");
+    assert!(!refused.has_business_fact);
+    assert_eq!(refused.first_effective_date, None);
+    assert_eq!(refused.last_effective_date, None);
 }
 
 /// A T-Invest that answers each RPC from the path in the request URL: the
@@ -1954,6 +2100,202 @@ async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
         Some(Verdict::Provisional { .. })
     ));
     assert_eq!(load(&services, owner).await.len(), 4);
+}
+
+/// A row that names neither a source identifier nor a key of its own has no
+/// identity to be recognised by, so a repeat of the answer that carried it used
+/// to record it again. Where the channel states that its identical rows keep one
+/// order inside a day, the row is given the occurrence key that order implies,
+/// and the repeat answers `duplicate` (ADR 0042 point 4, iaam-mkbfh.2).
+#[tokio::test]
+async fn a_keyless_row_of_a_channel_that_states_its_order_is_recorded_once_by_a_repeat() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    let mut operation = trade_without_custody(account, instrument);
+    operation.source_operation_id = None;
+    operation.idempotency_key = None;
+    let mut broker = api(account, SourceId::new_random(), operation);
+    broker.same_day_rows_keep_their_order = true;
+
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    let recorded = match first.recorded.first() {
+        Some(Verdict::Provisional { event }) => *event,
+        other => panic!("the keyless row is recorded the first time: {other:?}"),
+    };
+    assert_eq!(first.duplicates, 0);
+    assert_eq!(first.possible_duplicates, 0);
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("repeat sync: {error}"));
+
+    assert_eq!(
+        second.possible_duplicates, 0,
+        "the repeat is recognised, not left as a hint: {:?}",
+        second.recorded
+    );
+    assert!(
+        second
+            .recorded
+            .contains(&Verdict::Duplicate { existing: recorded }),
+        "the repeat answers with the row the first sync recorded: {:?}",
+        second.recorded
+    );
+    let trades: Vec<_> = load_all(&services, owner)
+        .await
+        .into_iter()
+        .filter(|event| matches!(event.kind, EventKind::Trade { .. }))
+        .collect();
+    assert_eq!(trades.len(), 1, "the row is recorded once: {trades:?}");
+}
+
+/// Two identical rows of one statement are two operations, not one: the second
+/// occurrence has its own key, so both are kept and a repeat of the statement
+/// recognises both rather than guessing between them (ADR 0042 point 4).
+#[tokio::test]
+async fn two_identical_keyless_rows_of_one_statement_are_both_kept() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    let mut operation = trade_without_custody(account, instrument);
+    operation.source_operation_id = None;
+    operation.idempotency_key = None;
+    let mut broker = api(account, SourceId::new_random(), operation.clone());
+    broker.same_day_rows_keep_their_order = true;
+    broker.operations = Ok(ParsedOperations {
+        duplicates: Vec::new(),
+        has_out_of_interval_trade: false,
+        journal: Vec::new(),
+        pending_redemptions: Vec::new(),
+        accepted: vec![operation.clone(), operation],
+        quarantined: Vec::new(),
+    });
+
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    assert_eq!(
+        first.possible_duplicates, 0,
+        "two occurrences of one row are not each other's hint: {:?}",
+        first.recorded
+    );
+    let trades: Vec<EventId> = load_all(&services, owner)
+        .await
+        .into_iter()
+        .filter(|event| matches!(event.kind, EventKind::Trade { .. }))
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(trades.len(), 2, "both identical rows are kept: {trades:?}");
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("repeat sync: {error}"));
+    assert_eq!(second.possible_duplicates, 0, "{:?}", second.recorded);
+    for trade in &trades {
+        assert!(
+            second
+                .recorded
+                .contains(&Verdict::Duplicate { existing: *trade }),
+            "the repeat recognises the row it recorded: {trade:?} {:?}",
+            second.recorded
+        );
+    }
+    assert_eq!(
+        load_all(&services, owner)
+            .await
+            .into_iter()
+            .filter(|event| matches!(event.kind, EventKind::Trade { .. }))
+            .count(),
+        2,
+        "the repeat keeps the two rows and writes no third"
+    );
+}
+
+/// A channel that states no order leaves its keyless row exactly as §10.6 has
+/// it: the repeat is a hint the owner settles, never a key this system guessed.
+/// This is the guard on the derivation above — it must stay conditional.
+#[tokio::test]
+async fn a_keyless_row_of_a_channel_without_a_stated_order_stays_a_hint() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    let mut operation = trade_without_custody(account, instrument);
+    operation.source_operation_id = None;
+    operation.idempotency_key = None;
+    let broker = api(account, SourceId::new_random(), operation);
+
+    sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("repeat sync: {error}"));
+
+    assert_eq!(
+        second.possible_duplicates, 1,
+        "the ambiguity stays the owner's: {:?}",
+        second.recorded
+    );
 }
 
 #[tokio::test]
@@ -3883,6 +4225,7 @@ async fn one_broker_failure_does_not_poison_another_sync() {
     });
 
     let failed = FakeBroker {
+        same_day_rows_keep_their_order: false,
         accounts: vec!["invented-one".to_owned()],
         requested_numbers: Mutex::new(Vec::new()),
         accounts_requests: AtomicUsize::new(0),
@@ -4468,6 +4811,7 @@ async fn a_failed_sync_releases_its_account() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let failing = FakeBroker {
+        same_day_rows_keep_their_order: false,
         accounts: vec!["invented-one".to_owned()],
         requested_numbers: Mutex::new(Vec::new()),
         accounts_requests: AtomicUsize::new(0),
@@ -4887,6 +5231,7 @@ async fn a_broker_that_stays_throttled_is_unreachable_for_the_minimum_pause() {
 /// A broker whose operations request always fails with `error`.
 fn failing_broker(error: BrokerError) -> FakeBroker {
     FakeBroker {
+        same_day_rows_keep_their_order: false,
         accounts: vec!["invented-one".to_owned()],
         requested_numbers: Mutex::new(Vec::new()),
         accounts_requests: AtomicUsize::new(0),
@@ -5093,6 +5438,7 @@ async fn a_portfolio_that_fails_after_rows_were_refused_leaves_no_gap() {
 /// A channel with nothing to say but an access that sees `accounts`.
 fn quiet_broker(accounts: Vec<String>) -> FakeBroker {
     FakeBroker {
+        same_day_rows_keep_their_order: false,
         source: held_channel(),
         identity_scope: IdentityScope::Account,
         operations: Ok(empty_operations()),

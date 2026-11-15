@@ -100,7 +100,18 @@ impl Coverage {
 
     fn observe(&mut self, event: &Event) {
         self.events_applied += 1;
-        if let Some(date) = event.dates.effective_date() {
+        // A gap is an attempt that refused rows: it says a day the account's data
+        // does **not** reach, so it moves no coverage bound in either direction.
+        // Counting it would let a sync that recorded nothing claim the journal
+        // reaches the last day of its interval, and every report would start
+        // from a figure only the refused rows could have moved (iaam-y07x). The
+        // store's account bounds exclude the same kinds for the same reason
+        // (`iaam_store::journal::reads`).
+        if !matches!(
+            event.kind,
+            crate::event::kind::EventKind::ImportCoverageGap { .. }
+        ) && let Some(date) = event.dates.effective_date()
+        {
             self.first_event = Some(match self.first_event {
                 Some(existing) => existing.min(date),
                 None => date,

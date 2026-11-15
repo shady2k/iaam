@@ -324,15 +324,32 @@ pub async fn sync_broker(
         "broker sync phase complete"
     );
     let channel = broker.channel();
+    let mut accepted = parsed.accepted;
     // A gateway may filter by order date while the fact uses its trade date.
     // Keep the fact, but do not assert completeness for an interval it falls outside.
     let has_out_of_interval_trade = parsed.has_out_of_interval_trade
-        || parsed.accepted.iter().any(|operation| {
+        || accepted.iter().any(|operation| {
             operation
                 .dates
                 .trade
                 .is_some_and(|trade| trade < from || trade > to)
         });
+    // A row that names no identity of its own is given the one its channel's
+    // statement order implies, and only when the channel states that order
+    // (ADR 0042 point 4). It is stamped here, while the list is still the
+    // channel's: the write below sorts the rows by date, and the occurrence a
+    // key counts is the channel's, not this sync's (iaam-mkbfh.2).
+    if broker.same_day_rows_keep_their_order() {
+        let stamped = dedup::stamp_statement_row_keys(&mut accepted, channel.source);
+        if stamped > 0 {
+            tracing::debug!(
+                phase = "map",
+                rows = stamped,
+                source = %channel.source.inner(),
+                "keyless broker rows given their statement occurrence"
+            );
+        }
+    }
     // Both answers are fetched before the first write: a portfolio that fails
     // after the operations were recorded would leave a journal the refusal
     // claims is unchanged. An out-of-interval trade withholds every
@@ -393,7 +410,7 @@ pub async fn sync_broker(
         channel: channel.clone(),
         identity_scope: broker.identity_scope(),
         today: services.clock.today(),
-        accepted: parsed.accepted,
+        accepted,
         quarantined: parsed.quarantined,
         duplicates: parsed.duplicates,
         journal: journal_rows(parsed.journal, enrichments, parsed.pending_redemptions),

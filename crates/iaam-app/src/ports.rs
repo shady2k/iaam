@@ -2857,6 +2857,27 @@ pub trait BrokerChannel: Send + Sync {
     /// Scope guaranteed for source operation identifiers from this channel.
     fn identity_scope(&self) -> IdentityScope;
     fn channel(&self) -> SourceChannel;
+
+    /// Whether the identical rows of one calendar day come back in one order,
+    /// whatever window contains that day, so the n-th such row of a day is the
+    /// same row in every answer (ADR 0042 point 4).
+    ///
+    /// A row that names neither a source identifier nor a key of its own has no
+    /// identity to be recognised by, and a repeat of the answer that carried it
+    /// would record it again. The one identity ADR 0042 allows such a row is
+    /// derived from its content and its occurrence inside a statement boundary,
+    /// and only a channel that states that the order holds may have one
+    /// (`iaam_ingest::dedup::stamp_statement_row_keys`). The answer is `false`
+    /// by default, and a channel that cannot promise the order must leave the
+    /// default: its keyless rows then stay §10.6's hint for the owner to settle
+    /// instead of a key this system guessed.
+    ///
+    /// Both channels this repository ships name every row, so both keep the
+    /// default; a channel whose access prints a statement without identifiers
+    /// answers `true` only when its order is a fact about its own statement.
+    fn same_day_rows_keep_their_order(&self) -> bool {
+        false
+    }
 }
 /// Broker channel creation: the factory opens one channel per call, so one
 /// channel instance is one synchronisation's scope (the sync routes open

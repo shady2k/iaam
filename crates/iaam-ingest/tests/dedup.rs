@@ -7,8 +7,8 @@ use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, EventId, InstrumentId, SourceId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::dedup::{
-    DedupDecision, DedupKey, DedupLevel, DocumentContext, IdentityScope, KnownRecord, assess,
-    canonical_form, choose_key, fingerprint,
+    DedupDecision, DedupKey, DedupLevel, DocumentContext, IdentityScope, KnownRecord,
+    StatementRowKey, assess, canonical_form, choose_key, fingerprint, stamp_statement_row_keys,
 };
 use iaam_ingest::{OperationDates, OperationKind, SubmittedOperation};
 use time::macros::date;
@@ -841,5 +841,107 @@ fn the_canonical_fingerprint_is_frozen() {
     assert_eq!(
         fingerprint(&operation).as_str(),
         "366eff5d4b6007730b75786c85d7d9fc73d317e48b1df5c71545dafa3eb3831c"
+    );
+}
+
+/// A key of this form is the one a channel that states its order issued, and the
+/// recognition is the shape, not the string: a stored key is read back as text.
+#[test]
+fn a_statement_row_key_is_recognised_only_in_its_own_form() {
+    let account = AccountId::new_random();
+    let content = fingerprint(&deposit(account, 100_000));
+    let key = StatementRowKey::of(SourceId(Uuid::from_u128(7)), account, &content, 2);
+
+    assert_eq!(StatementRowKey::parse(key.as_str()).as_ref(), Some(&key));
+    assert_eq!(StatementRowKey::parse("client-1"), None);
+    // A different occurrence is a different row.
+    let other = StatementRowKey::of(SourceId(Uuid::from_u128(7)), account, &content, 3);
+    assert_ne!(key, other);
+}
+
+/// Two rows identical in content are two rows: the second occurrence gets its own
+/// key. The same list stamped twice gives the same keys, which is what makes a
+/// repeat of the answer recognisable (ADR 0042 point 4).
+#[test]
+fn stamping_indexes_identical_rows_and_leaves_named_rows_alone() {
+    let account = AccountId::new_random();
+    let source = SourceId(Uuid::from_u128(9));
+    let keyless = deposit(account, 100_000);
+    let mut named = deposit(account, 100_000);
+    named.source_operation_id = Some("source-1".to_owned());
+    let mut rows = vec![keyless.clone(), keyless.clone(), named];
+
+    assert_eq!(stamp_statement_row_keys(&mut rows, source), 2);
+
+    let keys: Vec<Option<&str>> = rows
+        .iter()
+        .map(|operation| operation.idempotency_key.as_deref())
+        .collect();
+    assert_ne!(keys[0], keys[1], "two occurrences are two rows: {keys:?}");
+    assert!(keys[0].is_some() && keys[1].is_some());
+    assert_eq!(keys[2], None, "a source identifier outranks a derived key");
+
+    let mut again = vec![keyless.clone(), keyless];
+    assert_eq!(stamp_statement_row_keys(&mut again, source), 2);
+    assert_eq!(
+        again
+            .iter()
+            .map(|operation| operation.idempotency_key.clone())
+            .collect::<Vec<_>>(),
+        rows.iter()
+            .take(2)
+            .map(|operation| operation.idempotency_key.clone())
+            .collect::<Vec<_>>(),
+        "the same statement derives the same keys"
+    );
+}
+
+/// Two keys a channel issued inside one channel and one account prove two rows,
+/// exactly as two source identifiers do; a key a client chose proves nothing.
+#[test]
+fn two_statement_keys_in_one_channel_do_not_read_as_one_row() {
+    let account = AccountId::new_random();
+    let context = from_stream(account);
+    let content = fingerprint(&deposit(account, 100_000));
+    let source = context.broker_api_source.expect("channel");
+    let first = StatementRowKey::of(source, account, &content, 0);
+    let second = StatementRowKey::of(source, account, &content, 1);
+
+    let known = vec![KnownRecord {
+        idempotency_key: Some(first.as_str().to_owned()),
+        source_operation_id: None,
+        ..recorded(&deposit(account, 100_000), &context)
+    }];
+    let mut incoming = deposit(account, 100_000);
+    incoming.idempotency_key = Some(second.as_str().to_owned());
+    let (decision, rule) = iaam_ingest::dedup::assess_with_rule(
+        choose_key(&incoming, &context).as_ref(),
+        &fingerprint(&incoming),
+        &context,
+        &known,
+    );
+    assert_eq!(decision, DedupDecision::Fresh);
+    assert_eq!(
+        rule,
+        iaam_ingest::dedup::DedupRule::DistinctSourceKeysWithinChannel
+    );
+
+    // A client's own key is not that evidence: two of them leave the fingerprint
+    // match a hint, as before.
+    let mut client = known[0].clone();
+    client.idempotency_key = Some("client-1".to_owned());
+    let mut incoming = deposit(account, 100_000);
+    incoming.idempotency_key = Some("client-2".to_owned());
+    assert_eq!(
+        assess(
+            choose_key(&incoming, &context).as_ref(),
+            &fingerprint(&incoming),
+            &context,
+            std::slice::from_ref(&client)
+        ),
+        DedupDecision::PossibleDuplicate {
+            of: client.event,
+            level: DedupLevel::Probabilistic,
+        }
     );
 }

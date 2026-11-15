@@ -2884,12 +2884,9 @@ mod market_tests {
         let error = sync_market(&disk.adapter, &transport, request.clone())
             .await
             .expect_err("the store refuses a price naming an unknown instrument");
-        let AppError::Store(reason) = &error else {
-            panic!("expected the store's failure, got {error:?}");
-        };
         assert!(
-            reason.contains("FOREIGN KEY"),
-            "the failure is the store's own: {reason}"
+            matches!(&error, AppError::Store(reason) if reason.contains("FOREIGN KEY")),
+            "the failure is the store's own: {error:?}"
         );
 
         let (status, errors) = latest_run(&disk);

@@ -717,7 +717,8 @@ fn an_append_inside_a_transaction_is_refused_outside_one() {
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
 
-    let refused = store.append_event_in_order_within(&ctx.deposit(1, 100_000), IdentityScope::Source);
+    let refused =
+        store.append_event_in_order_within(&ctx.deposit(1, 100_000), IdentityScope::Source);
 
     match refused {
         Err(iaam_store::StoreError::NoTransaction { method }) => {

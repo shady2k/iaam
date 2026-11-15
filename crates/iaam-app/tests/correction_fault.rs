@@ -216,10 +216,7 @@ fn meaning(event: &Event, by_id: &BTreeMap<EventId, &Event>) -> String {
 
 fn meanings(events: &[Event]) -> Vec<String> {
     let by_id: BTreeMap<EventId, &Event> = events.iter().map(|event| (event.id, event)).collect();
-    let mut meanings: Vec<String> = events
-        .iter()
-        .map(|event| meaning(event, &by_id))
-        .collect();
+    let mut meanings: Vec<String> = events.iter().map(|event| meaning(event, &by_id)).collect();
     meanings.sort();
     meanings
 }
@@ -242,7 +239,9 @@ fn answers(outcomes: &[CorrectionOutcome], events: &[Event]) -> Vec<String> {
             });
             format!(
                 "{verdict} {fact} | standing rule {:?}",
-                outcome.standing_rule.map(|standing| (standing.version, standing.still_filed))
+                outcome
+                    .standing_rule
+                    .map(|standing| (standing.version, standing.still_filed))
             )
         })
         .collect()

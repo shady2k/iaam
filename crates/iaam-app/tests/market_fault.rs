@@ -381,10 +381,7 @@ async fn a_kill_inside_publication_leaves_nothing_and_a_rerun_publishes_everythi
         }) => {
             assert_eq!(
                 series,
-                format!(
-                    "moex-iss/prices/{}:TQOB",
-                    instrument.inner()
-                ),
+                format!("moex-iss/prices/{}:TQOB", instrument.inner()),
                 "the refusal names the series whose lease is held"
             );
             assert!(

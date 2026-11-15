@@ -534,9 +534,7 @@ fn recorded_corrections(
                     existing: existing.id,
                 }
             } else {
-                Verdict::Provisional {
-                    event: existing.id,
-                }
+                Verdict::Provisional { event: existing.id }
             }));
         }
         answers.push(row);
@@ -569,11 +567,7 @@ fn same_command(candidate: &Event, existing: &Event) -> bool {
     normalized.order = stated.source_time().map_or_else(
         || EffectiveOrder::new(stated.date(), existing.order.sequence()),
         |source_time| {
-            EffectiveOrder::with_source_time(
-                stated.date(),
-                source_time,
-                existing.order.sequence(),
-            )
+            EffectiveOrder::with_source_time(stated.date(), source_time, existing.order.sequence())
         },
     );
     normalized.provenance = normalized.provenance.without_declared_by();

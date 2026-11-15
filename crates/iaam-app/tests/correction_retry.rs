@@ -12,9 +12,7 @@ use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
 use iaam_app::ports::{AccountView, Clock, Principal, Scope};
-use iaam_app::scenarios::correction::{
-    CorrectionOutcome, CorrectionRequest, correct_events,
-};
+use iaam_app::scenarios::correction::{CorrectionOutcome, CorrectionRequest, correct_events};
 use iaam_app::storage::SqliteStore;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
@@ -87,7 +85,13 @@ fn principal(owner: OwnerId, token_id: Uuid) -> Principal {
 /// The rule makes the standing-decision notice part of every answer about this
 /// row, and the second row filed by the same rule keeps that notice's count
 /// from being zero by accident.
-fn deposit(owner: OwnerId, account: AccountId, key: &str, rule: ClassificationRuleId, rule_version: u32) -> Event {
+fn deposit(
+    owner: OwnerId,
+    account: AccountId,
+    key: &str,
+    rule: ClassificationRuleId,
+    rule_version: u32,
+) -> Event {
     let money = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
     Event {
         id: EventId::new_random(),
@@ -188,7 +192,9 @@ async fn journal(services: &AppServices, owner: OwnerId) -> Vec<Event> {
 
 /// What one correction answered, without the identifiers a fresh attempt
 /// generates for facts it writes: the verdict's kind, and the standing notice.
-fn answer_shape(outcome: &CorrectionOutcome) -> (String, Option<(ClassificationRuleId, u32, usize)>) {
+fn answer_shape(
+    outcome: &CorrectionOutcome,
+) -> (String, Option<(ClassificationRuleId, u32, usize)>) {
     let kind = match &outcome.verdict {
         Verdict::Provisional { .. } => "provisional".to_owned(),
         Verdict::Duplicate { .. } => "duplicate".to_owned(),

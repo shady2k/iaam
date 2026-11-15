@@ -2697,6 +2697,249 @@ mod market_tests {
         );
     }
 
+    /// A Central Bank daily page is FX observations, published like any other
+    /// page: its rows and the run's completion in one transaction.
+    #[tokio::test]
+    async fn a_daily_fx_response_publishes_rates_and_advances_the_boundary() {
+        let disk = Disk::new();
+        let transport = FixtureTransport {
+            body: include_bytes!("../../../../tests/fixtures/market/cbr-xml-daily.xml").to_vec(),
+            status: 200,
+        };
+        let result = sync_market(
+            &disk.adapter,
+            &transport,
+            MarketSyncRequest {
+                source: MarketSource::CbrDaily,
+                from: date!(2026 - 08 - 20),
+                to: date!(2026 - 08 - 26),
+            },
+        )
+        .await
+        .expect("synchronisation");
+
+        assert_eq!(result.status(), "succeeded");
+        assert!(result.rows > 0, "the invented page carries rates");
+        let written: i64 = disk
+            .reader()
+            .connection()
+            .query_row("SELECT COUNT(*) FROM fx_observations", [], |row| row.get(0))
+            .expect("rates written");
+        assert!(written > 0, "the page's rows are written, not only counted");
+        assert_eq!(
+            disk.reader()
+                .complete_through(&SeriesKey {
+                    source_id: "cbr".to_owned(),
+                    dataset: "fx".to_owned(),
+                    series_key: "daily".to_owned(),
+                })
+                .expect("boundary"),
+            Some(date!(2026 - 08 - 26))
+        );
+    }
+
+    /// The key rate travels its own dataset, and the run's coverage is what the
+    /// boundary speaks for.
+    #[tokio::test]
+    async fn a_key_rate_response_publishes_the_rate_and_advances_the_boundary() {
+        let disk = Disk::new();
+        let transport = FixtureTransport {
+            body: include_bytes!("../../../../tests/fixtures/market/cbr-keyrate-soap.xml").to_vec(),
+            status: 200,
+        };
+        let result = sync_market(
+            &disk.adapter,
+            &transport,
+            MarketSyncRequest {
+                source: MarketSource::CbrKeyRate,
+                from: date!(2026 - 04 - 01),
+                to: date!(2026 - 04 - 30),
+            },
+        )
+        .await
+        .expect("synchronisation");
+
+        assert_eq!(result.status(), "succeeded");
+        assert!(result.rows > 0, "the invented response carries rates");
+        let written: i64 = disk
+            .reader()
+            .connection()
+            .query_row("SELECT COUNT(*) FROM key_rate_observations", [], |row| {
+                row.get(0)
+            })
+            .expect("rates written");
+        assert!(
+            written > 0,
+            "the response's rows are written, not only counted"
+        );
+        assert_eq!(
+            disk.reader()
+                .complete_through(&SeriesKey {
+                    source_id: "cbr".to_owned(),
+                    dataset: "key_rate".to_owned(),
+                    series_key: "key_rate".to_owned(),
+                })
+                .expect("boundary"),
+            Some(date!(2026 - 04 - 30))
+        );
+    }
+
+    /// A page the source answered but this build cannot read is a partial run:
+    /// the reason is recorded, nothing is published and the boundary stays put,
+    /// so the next attempt fetches the same interval again.
+    #[tokio::test]
+    async fn an_unreadable_response_is_partial_and_records_why() {
+        let disk = Disk::new();
+        let transport = FixtureTransport {
+            body: b"<KeyRate><KR><DT>not-a-moment</DT><Rate>14.50</Rate></KR></KeyRate>".to_vec(),
+            status: 200,
+        };
+        let result = sync_market(
+            &disk.adapter,
+            &transport,
+            MarketSyncRequest {
+                source: MarketSource::CbrKeyRate,
+                from: date!(2026 - 04 - 01),
+                to: date!(2026 - 04 - 30),
+            },
+        )
+        .await
+        .expect("a partial run is an answer, not a failure");
+
+        assert_eq!(result.status(), "partial");
+        assert_eq!(result.rows, 0);
+        assert!(result.covered.is_none(), "a partial run covers nothing");
+        let (status, errors) = latest_run(&disk);
+        assert_eq!(status, "partial");
+        assert!(
+            errors.contains("could not be parsed"),
+            "the recorded reason names the unreadable page: {errors}"
+        );
+        assert_eq!(
+            disk.reader()
+                .complete_through(&SeriesKey {
+                    source_id: "cbr".to_owned(),
+                    dataset: "key_rate".to_owned(),
+                    series_key: "key_rate".to_owned(),
+                })
+                .expect("boundary"),
+            None
+        );
+    }
+
+    /// A transport failure that is neither the source being down nor the source
+    /// refusing is still a partial run: the failure is the caller's to read
+    /// from the result, and the lease is released either way.
+    #[tokio::test]
+    async fn a_transport_failure_that_is_not_the_sources_answer_is_partial() {
+        let disk = Disk::new();
+        let transport = FailingTransport;
+        let result = sync_market(
+            &disk.adapter,
+            &transport,
+            MarketSyncRequest {
+                source: MarketSource::CbrKeyRate,
+                from: date!(2026 - 04 - 01),
+                to: date!(2026 - 04 - 30),
+            },
+        )
+        .await
+        .expect("a partial run is an answer, not a failure");
+
+        assert_eq!(result.status(), "partial");
+        assert!(result.covered.is_none());
+        let (status, errors) = latest_run(&disk);
+        assert_eq!(status, "partial");
+        assert!(
+            errors.contains("market gateway is not configured"),
+            "the recorded reason is the failure: {errors}"
+        );
+    }
+
+    /// A publication the store refuses rolls its own transaction back, and the
+    /// run is then closed in a second one: the error reaches the caller, the
+    /// series' lease does not stay held, and a corrected retry publishes.
+    #[tokio::test]
+    async fn a_refused_publication_closes_the_run_and_the_lease_is_free_again() {
+        let disk = Disk::new();
+        // The request names an instrument the store does not know, so the
+        // price row fails its foreign key inside the publication transaction.
+        let instrument = InstrumentId::new_random();
+        let transport = FixtureTransport {
+            body: include_bytes!("../../../../tests/fixtures/market/moex-iss-history-sber.json")
+                .to_vec(),
+            status: 200,
+        };
+        let request = MarketSyncRequest {
+            source: MarketSource::Moex {
+                engine: "stock".to_owned(),
+                market: "shares".to_owned(),
+                board: "TQBR".to_owned(),
+                secid: "SBER".to_owned(),
+                instrument,
+            },
+            from: date!(2026 - 08 - 03),
+            to: date!(2026 - 08 - 21),
+        };
+        let error = sync_market(&disk.adapter, &transport, request.clone())
+            .await
+            .expect_err("the store refuses a price naming an unknown instrument");
+        let AppError::Store(reason) = &error else {
+            panic!("expected the store's failure, got {error:?}");
+        };
+        assert!(
+            reason.contains("FOREIGN KEY"),
+            "the failure is the store's own: {reason}"
+        );
+
+        let (status, errors) = latest_run(&disk);
+        assert_eq!(status, "failed", "the run is closed as failed");
+        assert!(
+            errors.contains("FOREIGN KEY"),
+            "the run records why it failed: {errors}"
+        );
+        let prices: i64 = disk
+            .reader()
+            .connection()
+            .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
+                row.get(0)
+            })
+            .expect("no published prices");
+        assert_eq!(prices, 0, "the refused publication wrote nothing");
+
+        disk.seed_instrument(instrument);
+        let retried = sync_market(&disk.adapter, &transport, request)
+            .await
+            .expect("the released lease lets the corrected attempt run");
+        assert_eq!(retried.status(), "succeeded");
+        assert!(retried.rows > 0);
+    }
+
+    /// A transport that fails with an error of its own, not the source's.
+    struct FailingTransport;
+
+    #[async_trait]
+    impl OutboundHttp for FailingTransport {
+        async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
+            Err(AppError::NotConfigured {
+                what: "market gateway",
+            })
+        }
+    }
+
+    /// The latest run's status and recorded reasons, as a reader sees them.
+    fn latest_run(disk: &Disk) -> (String, String) {
+        disk.reader()
+            .connection()
+            .query_row(
+                "SELECT status, page_errors FROM sync_runs
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the run")
+    }
+
     #[tokio::test]
     async fn a_source_failure_is_partial_and_keeps_the_previous_boundary() {
         let disk = Disk::new();

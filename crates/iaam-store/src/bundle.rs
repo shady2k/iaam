@@ -622,6 +622,16 @@ pub struct ImportObservationSection {
     pub answer: Option<String>,
     pub answer_rule: Option<uuid::Uuid>,
     pub answer_rule_version: Option<i64>,
+    /// The answer the intake request that wrote this row gave for it, where a
+    /// request of this build wrote it (`iaam-mkbfh.9.1`).
+    ///
+    /// Carried because a restore that dropped it would leave a row whose repeat
+    /// is answered from nothing — the answer the owner lost would be lost for
+    /// good (ADR 0042 point 4). Absent from a bundle written before it existed,
+    /// and absent is what a row nothing has answered holds: an absence, not a
+    /// value.
+    #[serde(default)]
+    pub intake_receipt: Option<String>,
 }
 
 /// One row of `import_questions`: one thing the engine could not decide on
@@ -638,6 +648,14 @@ pub struct ImportQuestionSection {
     pub answered_at: Option<String>,
     pub answer: Option<String>,
     pub rule: Option<uuid::Uuid>,
+    /// The answer the answer request that settled this question gave, where a
+    /// request of this build settled it (`iaam-mkbfh.9.1`).
+    ///
+    /// Carried for the reason [`ImportObservationSection::intake_receipt`] is:
+    /// a restore that dropped it would leave a question whose repeat is refused
+    /// as «already answered» (ADR 0042 point 4).
+    #[serde(default)]
+    pub answer_receipt: Option<String>,
 }
 
 /// One row of `import_control_figures`: the control section a statement
@@ -2194,7 +2212,7 @@ impl SqliteStore {
         // tables below carries an `owner` column of its own.
         let mut statement = self.conn.prepare(
             "SELECT o.session, o.row, o.row_key, o.concluded, o.payload, o.answer,
-                    o.answer_rule, o.answer_rule_version
+                    o.answer_rule, o.answer_rule_version, o.intake_receipt
              FROM import_observations o
              JOIN import_sessions s ON s.id = o.session
              WHERE s.owner = ?1
@@ -2210,6 +2228,7 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?;
         let mut import_observations = Vec::new();
@@ -2223,6 +2242,7 @@ impl SqliteStore {
                 answer,
                 answer_rule,
                 answer_rule_version,
+                intake_receipt,
             ) = row?;
             import_observations.push(ImportObservationSection {
                 session: parse(&session, "import session")?,
@@ -2235,12 +2255,13 @@ impl SqliteStore {
                     .map(|value| parse(&value, "classification rule"))
                     .transpose()?,
                 answer_rule_version,
+                intake_receipt,
             });
         }
 
         let mut statement = self.conn.prepare(
             "SELECT q.id, q.session, q.row, q.question, q.alternatives, q.prompt,
-                    q.asked_at, q.answered_at, q.answer, q.rule
+                    q.asked_at, q.answered_at, q.answer, q.rule, q.answer_receipt
              FROM import_questions q
              JOIN import_sessions s ON s.id = q.session
              WHERE s.owner = ?1
@@ -2258,6 +2279,7 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         let mut import_questions = Vec::new();
@@ -2273,6 +2295,7 @@ impl SqliteStore {
                 answered_at,
                 answer,
                 rule,
+                answer_receipt,
             ) = row?;
             import_questions.push(ImportQuestionSection {
                 id: parse(&id, "import question")?,
@@ -2287,6 +2310,7 @@ impl SqliteStore {
                 rule: rule
                     .map(|value| parse(&value, "classification rule"))
                     .transpose()?,
+                answer_receipt,
             });
         }
 
@@ -3658,8 +3682,9 @@ impl SqliteStore {
         for observation in &bundle.import_observations {
             transaction.execute(
                 "INSERT INTO import_observations
-                     (session, row, row_key, concluded, payload, answer, answer_rule, answer_rule_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     (session, row, row_key, concluded, payload, answer, answer_rule, answer_rule_version,
+                      intake_receipt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (session, row) DO NOTHING",
                 params![
                     observation.session.to_string(),
@@ -3670,6 +3695,7 @@ impl SqliteStore {
                     observation.answer,
                     observation.answer_rule.map(|id| id.to_string()),
                     observation.answer_rule_version,
+                    observation.intake_receipt,
                 ],
             )?;
         }
@@ -3678,8 +3704,8 @@ impl SqliteStore {
             transaction.execute(
                 "INSERT INTO import_questions
                      (id, session, row, question, alternatives, prompt, asked_at,
-                      answered_at, answer, rule)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                      answered_at, answer, rule, answer_receipt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT (id) DO NOTHING",
                 params![
                     question.id.to_string(),
@@ -3692,6 +3718,7 @@ impl SqliteStore {
                     question.answered_at,
                     question.answer,
                     question.rule.map(|id| id.to_string()),
+                    question.answer_receipt,
                 ],
             )?;
         }

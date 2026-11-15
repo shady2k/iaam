@@ -4,10 +4,19 @@
 //! writes reaches `events`. That is the line the whole design rests on: nothing
 //! in the journal is provisional, and nothing provisional is in the journal.
 //!
-//! `payload`, `question` and `answer` are opaque JSON here, exactly as a
-//! classification rule's matcher is (see [`crate::rules`]): the store keeps them
-//! and the application reads them. It validates that they parse, because a
-//! payload the application cannot read must not be written silently.
+//! `payload`, `question`, `answer` and the two receipts are opaque JSON here,
+//! exactly as a classification rule's matcher is (see [`crate::rules`]): the
+//! store keeps them and the application reads them. It validates that they
+//! parse, because a payload the application cannot read must not be written
+//! silently.
+//!
+//! **A request is one transaction and a repeat of it is recognised.** The rows
+//! of one intake, their questions and the answer the request gave are written
+//! through this module inside one caller's transaction, and so are the answers,
+//! the rule they minted and the stamps on the rows it settled; the answer each
+//! request gave is kept beside what it wrote, so a caller repeating an identical
+//! request after a lost response is answered rather than refused (ADR 0042
+//! points 1 and 4).
 
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId,
@@ -149,6 +158,21 @@ pub struct StoredObservation {
     /// existed — nothing is back-filled, so silence here is silence and never a
     /// claim.
     pub answer_rule: Option<StoredAnswerRule>,
+}
+
+/// One row held in a session, with the answer its intake request gave.
+///
+/// The pair is what a repeat of the request is recognised by (`iaam-mkbfh.9.1`,
+/// ADR 0042 point 4): the row carries the command — the payload it was written
+/// from — and `receipt` carries what the first call answered, opaque JSON this
+/// crate neither mints nor reads. A row with no answer is a row no request of
+/// this build has answered yet, which is every row written before the column
+/// existed; a caller that has no answer to give must build one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHeldRow {
+    pub observation: StoredObservation,
+    /// What the request that wrote this row answered for it, as it answered it.
+    pub receipt: Option<String>,
 }
 
 /// A question about to be written: its typed form, its alternatives, its wording.
@@ -409,36 +433,85 @@ impl SqliteStore {
             && let Some(existing) = observation_by_key(&transaction, session, key)?
         {
             transaction.commit()?;
+            return Ok(existing.observation);
+        }
+        let stored = insert_observation(&transaction, session, row_key, concluded, payload)?;
+        transaction.commit()?;
+        Ok(stored.observation)
+    }
+
+    /// Hold one submitted line inside the caller's transaction, and say what
+    /// answer the request that wrote it gave (`iaam-mkbfh.9.1`, ADR 0042
+    /// point 4).
+    ///
+    /// The same row [`Self::add_import_observation`] writes, and the same
+    /// idempotent answer for a key this session already holds — the row it
+    /// occupies, unchanged — with one addition: the answer its request recorded,
+    /// which the caller compares its own command against and gives back.
+    ///
+    /// **Inside the caller's transaction and nowhere else**: the row is one
+    /// write of a request whose other writes are its question and its answer,
+    /// and a commit of its own would leave a row whose request never finished
+    /// (ADR 0042 point 1). Called with no transaction open it refuses, naming
+    /// itself (`StoreError::NoTransaction`).
+    pub fn hold_import_row_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row_key: Option<&str>,
+        concluded: bool,
+        payload: &str,
+    ) -> Result<StoredHeldRow, StoreError> {
+        self.require_transaction("hold_import_row_within")?;
+        check_json(payload, "observation payload")?;
+        // The key is looked for **before the state is consulted**, and that is
+        // the point of the method (ADR 0042 point 4): a request repeated after
+        // its session was closed is still a repeat of a request that ran, and
+        // the row it wrote is what answers it. Only a row this session does not
+        // hold needs an open session.
+        require_owner(&self.conn, owner, session)?;
+        if let Some(key) = row_key
+            && let Some(existing) = observation_by_key(&self.conn, session, key)?
+        {
             return Ok(existing);
         }
-        let used: Option<u32> = transaction.query_row(
-            "SELECT MAX(row) FROM import_observations WHERE session = ?1",
-            [session.inner().to_string()],
-            |row| row.get(0),
+        require_open(&self.conn, owner, session)?;
+        insert_observation(&self.conn, session, row_key, concluded, payload)
+    }
+
+    /// Keep the answer one intake request gave for one row.
+    ///
+    /// Written after the row it answers, in the same transaction, so a kill
+    /// leaves neither a row whose request never answered it nor an answer to a
+    /// row that is not there. `receipt` is opaque JSON, checked only for
+    /// parsing, exactly as a payload is.
+    ///
+    /// **Inside the caller's transaction and nowhere else** for the reason
+    /// [`Self::hold_import_row_within`] states.
+    pub fn record_intake_receipt_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        receipt: &str,
+    ) -> Result<(), StoreError> {
+        self.require_transaction("record_intake_receipt_within")?;
+        check_json(receipt, "intake answer")?;
+        require_open(&self.conn, owner, session)?;
+        let updated = self.conn.execute(
+            "UPDATE import_observations SET intake_receipt = ?3
+              WHERE session = ?1 AND row = ?2",
+            params![session.inner().to_string(), row, receipt],
         )?;
-        let stored = StoredObservation {
-            row: used.map_or(1, |value| value.saturating_add(1)),
-            row_key: row_key.map(str::to_owned),
-            concluded,
-            payload: payload.to_owned(),
-            answer: None,
-            // Nothing is minted at intake, and nothing is back-filled: a row
-            // names a rule only once an answer of his has written one.
-            answer_rule: None,
-        };
-        transaction.execute(
-            "INSERT INTO import_observations (session, row, row_key, concluded, payload, answer)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-            params![
-                session.inner().to_string(),
-                stored.row,
-                stored.row_key,
-                i64::from(concluded),
-                stored.payload,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(stored)
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                what: "an import row",
+                id: row.to_string(),
+            });
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::write_completed();
+        Ok(())
     }
 
     /// A session's lines in submission order.
@@ -486,39 +559,33 @@ impl SqliteStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_open(&transaction, owner, session)?;
-        if let Some(existing) = question_for_row(&transaction, session, row)? {
-            transaction.commit()?;
-            return Ok(existing);
-        }
-        let stored = StoredQuestion {
-            id: ImportQuestionId::new_random(),
-            session,
-            row,
-            question: asking.question.clone(),
-            alternatives: asking.alternatives.clone(),
-            prompt: asking.prompt.clone(),
-            asked_at: now(),
-            answered_at: None,
-            answer: None,
-            rule: None,
-        };
-        transaction.execute(
-            "INSERT INTO import_questions
-                 (id, session, row, question, alternatives, prompt, asked_at,
-                  answered_at, answer, rule)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)",
-            params![
-                stored.id.inner().to_string(),
-                session.inner().to_string(),
-                row,
-                stored.question,
-                stored.alternatives,
-                stored.prompt,
-                stored.asked_at,
-            ],
-        )?;
+        let stored = write_question(&transaction, session, row, asking)?;
         transaction.commit()?;
         Ok(stored)
+    }
+
+    /// The same question inside the caller's transaction (ADR 0042 point 1).
+    ///
+    /// The intake request writes one row and the question it raised in one
+    /// transaction, so a kill leaves neither the row without its question nor a
+    /// question about a row that is not there. The question a row already raised
+    /// is returned unchanged, exactly as [`Self::record_import_question`] does:
+    /// a repeat of a request that wrote it finds it here.
+    ///
+    /// **Inside the caller's transaction and nowhere else** for the reason
+    /// [`Self::hold_import_row_within`] states.
+    pub fn record_import_question_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        asking: &NewQuestion,
+    ) -> Result<StoredQuestion, StoreError> {
+        self.require_transaction("record_import_question_within")?;
+        check_json(&asking.question, "question")?;
+        check_json(&asking.alternatives, "question alternatives")?;
+        require_open(&self.conn, owner, session)?;
+        write_question(&self.conn, session, row, asking)
     }
 
     /// A session's questions, in row order.
@@ -593,40 +660,32 @@ impl SqliteStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_open(&transaction, owner, session)?;
-        let answered_at = now();
-        let updated = transaction.execute(
-            "UPDATE import_questions SET answered_at = ?3, answer = ?4
-             WHERE session = ?1 AND id = ?2 AND answered_at IS NULL",
-            params![
-                session.inner().to_string(),
-                question.inner().to_string(),
-                answered_at,
-                answer,
-            ],
-        )?;
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                what: "an unanswered import question",
-                id: question.inner().to_string(),
-            });
-        }
-        transaction.execute(
-            "UPDATE import_observations SET answer = ?3
-             WHERE session = ?1
-               AND row = (SELECT row FROM import_questions WHERE id = ?2)",
-            params![
-                session.inner().to_string(),
-                question.inner().to_string(),
-                answer,
-            ],
-        )?;
-        let stored =
-            question_by_id(&transaction, session, question)?.ok_or(StoreError::NotFound {
-                what: "an import question",
-                id: question.inner().to_string(),
-            })?;
+        let stored = write_answer(&transaction, session, question, answer)?;
         transaction.commit()?;
         Ok(stored)
+    }
+
+    /// The same answer inside the caller's transaction (ADR 0042 point 1).
+    ///
+    /// One answer request writes several answers — the row it addressed and
+    /// every row its reach settled — the rule they generalised into and the
+    /// rows that rule was stamped on. All of it in one transaction, so a kill
+    /// leaves none of it, and the answer's own receipt is kept beside it
+    /// (ADR 0042 point 4).
+    ///
+    /// **Inside the caller's transaction and nowhere else** for the reason
+    /// [`Self::hold_import_row_within`] states.
+    pub fn answer_import_question_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        answer: &str,
+    ) -> Result<StoredQuestion, StoreError> {
+        self.require_transaction("answer_import_question_within")?;
+        check_json(answer, "answer")?;
+        require_open(&self.conn, owner, session)?;
+        write_answer(&self.conn, session, question, answer)
     }
     /// Withdraw a retired rule's answer from an open session.
     ///
@@ -678,9 +737,13 @@ impl SqliteStore {
                 what: "a second import question names the same minted rule",
             });
         }
+        // The answer this request gave goes with it: a reopened question is
+        // one a caller may answer again, and a receipt left standing would
+        // answer the new request with the old answer (`iaam-mkbfh.9.1`,
+        // ADR 0042 point 4).
         transaction.execute(
             "UPDATE import_questions
-             SET answered_at = NULL, answer = NULL, rule = NULL
+             SET answered_at = NULL, answer = NULL, rule = NULL, answer_receipt = NULL
              WHERE session = ?1 AND id = ?2",
             params![session.inner().to_string(), question.inner().to_string()],
         )?;
@@ -711,19 +774,12 @@ impl SqliteStore {
     ///
     /// A second write rather than a column of [`Self::answer_import_question`],
     /// because the two facts are written by two different ports and only one of
-    /// them is this store's. The rule lives behind
-    /// `ClassificationRuleStore`; no transaction spans both, and there is no
-    /// handle either signature could pass to make one. So the order carries what
-    /// a transaction cannot: the answer is durable before the rule exists, and
-    /// the rule is created before anything claims the question made it.
-    ///
-    /// What remains possible after that ordering is one thing, and it is stated
-    /// rather than hidden: the rule is created and this call fails, leaving a
-    /// standing rule the question does not name. The question then reports
-    /// `available` — a rule was possible and none is recorded — which is a state
-    /// the action queue offers the owner an act for, and adopting it a second
-    /// time writes a rule that classifies identically. The failure the old order
-    /// had was not recoverable at all: the answer itself was lost.
+    /// them is this store's: the rule lives behind `ClassificationRuleStore`.
+    /// Since `iaam-mkbfh.9.1` the caller runs both inside one
+    /// [`Self::attach_import_question_rule_within`]'s transaction (ADR 0042
+    /// point 1), so no failure can leave a standing rule the question does not
+    /// name — the order alone is what carries it for a caller that is not one
+    /// transaction, and the answer is still durable before the rule exists.
     ///
     /// `answered_at IS NOT NULL AND rule IS NULL` is the condition, so this
     /// cannot invent a rule for an open question and cannot overwrite one
@@ -741,28 +797,27 @@ impl SqliteStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_open(&transaction, owner, session)?;
-        let updated = transaction.execute(
-            "UPDATE import_questions SET rule = ?3
-             WHERE session = ?1 AND id = ?2 AND answered_at IS NOT NULL AND rule IS NULL",
-            params![
-                session.inner().to_string(),
-                question.inner().to_string(),
-                rule,
-            ],
-        )?;
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                what: "an answered import question without a rule",
-                id: question.inner().to_string(),
-            });
-        }
-        let stored =
-            question_by_id(&transaction, session, question)?.ok_or(StoreError::NotFound {
-                what: "an import question",
-                id: question.inner().to_string(),
-            })?;
+        let stored = name_question_rule(&transaction, session, question, rule)?;
         transaction.commit()?;
         Ok(stored)
+    }
+
+    /// The same naming inside the caller's transaction (ADR 0042 point 1).
+    ///
+    /// The rule an answer minted is written with the answer that minted it, so a
+    /// kill cannot leave a standing rule whose question says the owner
+    /// generalised nothing. **Inside the caller's transaction and nowhere
+    /// else** for the reason [`Self::hold_import_row_within`] states.
+    pub fn attach_import_question_rule_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        rule: &str,
+    ) -> Result<StoredQuestion, StoreError> {
+        self.require_transaction("attach_import_question_rule_within")?;
+        require_open(&self.conn, owner, session)?;
+        name_question_rule(&self.conn, session, question, rule)
     }
 
     /// Stamp the rule one answer minted onto every row that answer settled.
@@ -806,26 +861,101 @@ impl SqliteStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_open(&transaction, owner, session)?;
-        for row in rows {
-            let updated = transaction.execute(
-                "UPDATE import_observations SET answer_rule = ?3, answer_rule_version = ?4
-                 WHERE session = ?1 AND row = ?2
-                   AND answer IS NOT NULL AND answer_rule IS NULL",
-                params![
-                    session.inner().to_string(),
-                    row,
-                    rule.inner().to_string(),
-                    version,
-                ],
-            )?;
-            if updated == 0 {
-                return Err(StoreError::NotFound {
-                    what: "an answered import row without a minted rule",
-                    id: row.to_string(),
-                });
-            }
-        }
+        stamp_answer_rule(&transaction, session, rows, rule, version)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// The same stamping inside the caller's transaction (ADR 0042 point 1).
+    ///
+    /// The rows an answer settled are stamped with the rule it minted, and both
+    /// are written with the answer, so a kill leaves either the whole decision
+    /// or none of it. **Inside the caller's transaction and nowhere else** for
+    /// the reason [`Self::hold_import_row_within`] states.
+    pub fn attach_import_answer_rule_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        rows: &[u32],
+        rule: ClassificationRuleId,
+        version: u32,
+    ) -> Result<(), StoreError> {
+        self.require_transaction("attach_import_answer_rule_within")?;
+        require_open(&self.conn, owner, session)?;
+        stamp_answer_rule(&self.conn, session, rows, rule, version)
+    }
+
+    /// What the answer request that answered this question answered, as it
+    /// answered it.
+    ///
+    /// An answer is recognised by the session and the question, so a repeat
+    /// after a lost response finds the first answer here instead of being
+    /// refused as «already answered» (`iaam-mkbfh.9.1`, ADR 0042 point 4).
+    /// `None` on every question no answer request of this build has answered —
+    /// a question still open, one answered before this column existed, and one
+    /// in a session that is not this owner's (§14: the two read as one absence,
+    /// exactly as [`Self::import_commit_receipt`] does). A caller that finds
+    /// nothing has no first answer to give and says so.
+    pub fn import_answer_receipt(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+    ) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT q.answer_receipt
+                   FROM import_questions q
+                   JOIN import_sessions s ON s.id = q.session
+                  WHERE s.owner = ?1 AND q.session = ?2 AND q.id = ?3",
+                params![
+                    owner.inner().to_string(),
+                    session.inner().to_string(),
+                    question.inner().to_string()
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(StoreError::from)
+    }
+
+    /// Keep the answer one answer request gave, with the question it addressed.
+    ///
+    /// Written after the answers it describes, in the same transaction, so a
+    /// kill leaves neither an answered question whose request recorded no answer
+    /// nor an answer to a question nothing answered. `receipt` is opaque JSON,
+    /// checked only for parsing, exactly as a payload is.
+    ///
+    /// **Inside the caller's transaction and nowhere else** for the reason
+    /// [`Self::hold_import_row_within`] states.
+    pub fn record_answer_receipt_within(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        receipt: &str,
+    ) -> Result<(), StoreError> {
+        self.require_transaction("record_answer_receipt_within")?;
+        check_json(receipt, "answer receipt")?;
+        require_owner(&self.conn, owner, session)?;
+        let updated = self.conn.execute(
+            "UPDATE import_questions SET answer_receipt = ?3
+              WHERE session = ?1 AND id = ?2",
+            params![
+                session.inner().to_string(),
+                question.inner().to_string(),
+                receipt,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                what: "an import question",
+                id: question.inner().to_string(),
+            });
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::write_completed();
         Ok(())
     }
 
@@ -1212,34 +1342,269 @@ fn require_open(
     }
 }
 
+/// Refuse a session that is not this owner's, whatever state it is in.
+///
+/// The check [`require_open`] makes without the state: a row or an answer is
+/// recognised on a session that has since been closed, because the request being
+/// repeated wrote it while the session was open (`iaam-mkbfh.9.1`, ADR 0042
+/// point 4) — but no owner reads another's (§14).
+fn require_owner(
+    conn: &Connection,
+    owner: OwnerId,
+    session: ImportSessionId,
+) -> Result<(), StoreError> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM import_sessions WHERE owner = ?1 AND id = ?2",
+            params![owner.inner().to_string(), session.inner().to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match found {
+        Some(_) => Ok(()),
+        None => Err(StoreError::NotFound {
+            what: "an import session",
+            id: session.inner().to_string(),
+        }),
+    }
+}
+
 fn observation_by_key(
     conn: &Connection,
     session: ImportSessionId,
     key: &str,
-) -> Result<Option<StoredObservation>, StoreError> {
-    conn.query_row(
-        "SELECT row, row_key, concluded, payload, answer, answer_rule, answer_rule_version
-         FROM import_observations WHERE session = ?1 AND row_key = ?2",
-        params![session.inner().to_string(), key],
-        |row| {
-            Ok((
-                StoredObservation {
-                    row: row.get(0)?,
-                    row_key: row.get(1)?,
-                    concluded: row.get::<_, i64>(2)? != 0,
-                    payload: row.get(3)?,
-                    answer: row.get(4)?,
-                    answer_rule: None,
-                },
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<u32>>(6)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(StoreError::from)?
-    .map(with_answer_rule)
-    .transpose()
+) -> Result<Option<StoredHeldRow>, StoreError> {
+    let found = conn
+        .query_row(
+            "SELECT row, row_key, concluded, payload, answer, answer_rule, answer_rule_version,
+                    intake_receipt
+             FROM import_observations WHERE session = ?1 AND row_key = ?2",
+            params![session.inner().to_string(), key],
+            |row| {
+                Ok((
+                    (
+                        StoredObservation {
+                            row: row.get(0)?,
+                            row_key: row.get(1)?,
+                            concluded: row.get::<_, i64>(2)? != 0,
+                            payload: row.get(3)?,
+                            answer: row.get(4)?,
+                            answer_rule: None,
+                        },
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<u32>>(6)?,
+                    ),
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)?;
+    found
+        .map(|((observation, rule, version), receipt)| {
+            with_answer_rule((observation, rule, version)).map(|observation| StoredHeldRow {
+                observation,
+                receipt,
+            })
+        })
+        .transpose()
+}
+
+/// Write one line, and report it as a row whose request has not answered it
+/// yet.
+///
+/// The insert and the "which row number is next" read share the caller's
+/// transaction, so two concurrent submissions cannot take one number. A caller
+/// that must find a line its key already holds reads it first — the two callers
+/// of this function do, and on a caller's transaction that read sees what the
+/// same request already wrote (ADR 0042 point 2).
+fn insert_observation(
+    conn: &Connection,
+    session: ImportSessionId,
+    row_key: Option<&str>,
+    concluded: bool,
+    payload: &str,
+) -> Result<StoredHeldRow, StoreError> {
+    let used: Option<u32> = conn.query_row(
+        "SELECT MAX(row) FROM import_observations WHERE session = ?1",
+        [session.inner().to_string()],
+        |row| row.get(0),
+    )?;
+    let stored = StoredObservation {
+        row: used.map_or(1, |value| value.saturating_add(1)),
+        row_key: row_key.map(str::to_owned),
+        concluded,
+        payload: payload.to_owned(),
+        answer: None,
+        // Nothing is minted at intake, and nothing is back-filled: a row names
+        // a rule only once an answer of his has written one.
+        answer_rule: None,
+    };
+    conn.execute(
+        "INSERT INTO import_observations (session, row, row_key, concluded, payload, answer)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        params![
+            session.inner().to_string(),
+            stored.row,
+            stored.row_key,
+            i64::from(concluded),
+            stored.payload,
+        ],
+    )?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::fault::write_completed();
+    Ok(StoredHeldRow {
+        observation: stored,
+        receipt: None,
+    })
+}
+
+/// Write the question one row raises, or return the one it already raised.
+fn write_question(
+    conn: &Connection,
+    session: ImportSessionId,
+    row: u32,
+    asking: &NewQuestion,
+) -> Result<StoredQuestion, StoreError> {
+    if let Some(existing) = question_for_row(conn, session, row)? {
+        return Ok(existing);
+    }
+    let stored = StoredQuestion {
+        id: ImportQuestionId::new_random(),
+        session,
+        row,
+        question: asking.question.clone(),
+        alternatives: asking.alternatives.clone(),
+        prompt: asking.prompt.clone(),
+        asked_at: now(),
+        answered_at: None,
+        answer: None,
+        rule: None,
+    };
+    conn.execute(
+        "INSERT INTO import_questions
+             (id, session, row, question, alternatives, prompt, asked_at,
+              answered_at, answer, rule)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)",
+        params![
+            stored.id.inner().to_string(),
+            session.inner().to_string(),
+            row,
+            stored.question,
+            stored.alternatives,
+            stored.prompt,
+            stored.asked_at,
+        ],
+    )?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::fault::write_completed();
+    Ok(stored)
+}
+
+/// Record the owner's answer on one question and on the row it is about.
+fn write_answer(
+    conn: &Connection,
+    session: ImportSessionId,
+    question: ImportQuestionId,
+    answer: &str,
+) -> Result<StoredQuestion, StoreError> {
+    let answered_at = now();
+    let updated = conn.execute(
+        "UPDATE import_questions SET answered_at = ?3, answer = ?4
+         WHERE session = ?1 AND id = ?2 AND answered_at IS NULL",
+        params![
+            session.inner().to_string(),
+            question.inner().to_string(),
+            answered_at,
+            answer,
+        ],
+    )?;
+    if updated == 0 {
+        return Err(StoreError::NotFound {
+            what: "an unanswered import question",
+            id: question.inner().to_string(),
+        });
+    }
+    conn.execute(
+        "UPDATE import_observations SET answer = ?3
+         WHERE session = ?1
+           AND row = (SELECT row FROM import_questions WHERE id = ?2)",
+        params![
+            session.inner().to_string(),
+            question.inner().to_string(),
+            answer,
+        ],
+    )?;
+    let stored = question_by_id(conn, session, question)?.ok_or(StoreError::NotFound {
+        what: "an import question",
+        id: question.inner().to_string(),
+    })?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::fault::write_completed();
+    Ok(stored)
+}
+
+/// Name the standing rule an answered question was generalised into.
+fn name_question_rule(
+    conn: &Connection,
+    session: ImportSessionId,
+    question: ImportQuestionId,
+    rule: &str,
+) -> Result<StoredQuestion, StoreError> {
+    let updated = conn.execute(
+        "UPDATE import_questions SET rule = ?3
+         WHERE session = ?1 AND id = ?2 AND answered_at IS NOT NULL AND rule IS NULL",
+        params![
+            session.inner().to_string(),
+            question.inner().to_string(),
+            rule,
+        ],
+    )?;
+    if updated == 0 {
+        return Err(StoreError::NotFound {
+            what: "an answered import question without a rule",
+            id: question.inner().to_string(),
+        });
+    }
+    let stored = question_by_id(conn, session, question)?.ok_or(StoreError::NotFound {
+        what: "an import question",
+        id: question.inner().to_string(),
+    })?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::fault::write_completed();
+    Ok(stored)
+}
+
+/// Stamp the rule one answer minted onto every row that answer settled.
+fn stamp_answer_rule(
+    conn: &Connection,
+    session: ImportSessionId,
+    rows: &[u32],
+    rule: ClassificationRuleId,
+    version: u32,
+) -> Result<(), StoreError> {
+    for row in rows {
+        let updated = conn.execute(
+            "UPDATE import_observations SET answer_rule = ?3, answer_rule_version = ?4
+             WHERE session = ?1 AND row = ?2
+               AND answer IS NOT NULL AND answer_rule IS NULL",
+            params![
+                session.inner().to_string(),
+                row,
+                rule.inner().to_string(),
+                version,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                what: "an answered import row without a minted rule",
+                id: row.to_string(),
+            });
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::write_completed();
+    }
+    Ok(())
 }
 
 fn question_for_row(

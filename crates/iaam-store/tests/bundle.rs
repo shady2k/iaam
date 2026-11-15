@@ -2097,7 +2097,7 @@ fn evidence_fixture() -> (SqliteStore, OwnerId, BondReferenceData) {
             "{\"invented\":true}",
         )
         .unwrap();
-    store
+    let question = store
         .record_import_question(
             owner,
             session.id,
@@ -2106,6 +2106,28 @@ fn evidence_fixture() -> (SqliteStore, OwnerId, BondReferenceData) {
                 question: "\"invented_question\"".to_owned(),
                 alternatives: "[\"a\",\"b\"]".to_owned(),
                 prompt: "which one?".to_owned(),
+            },
+        )
+        .unwrap();
+    // The answers the requests over this session gave, which a restore must
+    // carry too: a session restored without them answers a repeat of either
+    // request with nothing (`iaam-mkbfh.9.1`, ADR 0042 point 4).
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| {
+                store.record_intake_receipt_within(
+                    owner,
+                    session.id,
+                    1,
+                    r#"{"held":{"row":1}}"#,
+                )?;
+                store.record_answer_receipt_within(
+                    owner,
+                    session.id,
+                    question.id,
+                    r#"{"settled":[]}"#,
+                )
             },
         )
         .unwrap();
@@ -2271,6 +2293,16 @@ fn the_evidence_he_acquired_round_trips_into_a_genuinely_empty_database() {
     assert_eq!(back.import_sessions, bundle.import_sessions);
     assert_eq!(back.import_observations, bundle.import_observations);
     assert_eq!(back.import_questions, bundle.import_questions);
+    assert_eq!(
+        back.import_observations[0].intake_receipt.as_deref(),
+        Some(r#"{"held":{"row":1}}"#),
+        "the answer the intake request gave survives the round trip"
+    );
+    assert_eq!(
+        back.import_questions[0].answer_receipt.as_deref(),
+        Some(r#"{"settled":[]}"#),
+        "and so does the one the answer request gave"
+    );
     assert_eq!(back.import_control_figures, bundle.import_control_figures);
     assert_eq!(back.source_profile_versions, bundle.source_profile_versions);
     assert_eq!(back.broker_operation_kinds, bundle.broker_operation_kinds);

@@ -893,3 +893,283 @@ fn another_owners_receipt_is_not_read() {
         None
     );
 }
+
+/// The answer one intake request gave for a row is kept with the row, and a
+/// row no request answered yet has none (`iaam-mkbfh.9.1`, ADR 0042 point 4).
+///
+/// The row and its answer are written inside one caller's transaction, so a
+/// repeat of the request finds both or neither. The key is what the row is in
+/// the session — its own key — and the answer is opaque JSON here, exactly as
+/// an observation's payload is.
+#[test]
+fn a_held_row_keeps_the_answer_its_intake_request_gave() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+
+    let held = store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.hold_import_row_within(owner, session, Some("row/1"), false, "{}"),
+        )
+        .expect("the row is held");
+    assert_eq!(held.observation.row, 1);
+    assert_eq!(
+        held.receipt, None,
+        "a row whose request has not answered it yet has no answer to give"
+    );
+
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.record_intake_receipt_within(owner, session, 1, r#"{"held":{"row":1}}"#),
+        )
+        .expect("the answer is kept beside the row");
+    let again = store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.hold_import_row_within(owner, session, Some("row/1"), false, "{}"),
+        )
+        .expect("the same key returns the row it already occupies");
+    assert_eq!(again.observation.row, 1, "nothing was held a second time");
+    assert_eq!(
+        again.receipt.as_deref(),
+        Some(r#"{"held":{"row":1}}"#),
+        "the answer the first request gave comes back with the row"
+    );
+}
+
+/// A held row and its answer are one write: outside a caller's transaction
+/// they would commit on their own, and the answer could be durable before the
+/// row it names (ADR 0042 point 1).
+#[test]
+fn holding_a_row_outside_a_transaction_refuses_to_run() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+
+    assert!(
+        matches!(
+            store.hold_import_row_within(owner, session, Some("row/1"), false, "{}"),
+            Err(iaam_store::StoreError::NoTransaction { .. })
+        ),
+        "the intake's write must not commit a transaction of its own"
+    );
+    assert!(
+        store
+            .list_import_observations(session)
+            .expect("the query runs")
+            .is_empty(),
+        "and the refusal held nothing"
+    );
+}
+
+/// An answer kept for one row does not parse as JSON is refused, exactly as a
+/// payload is: a receipt nothing above can read must not be written silently.
+#[test]
+fn an_intake_answer_that_is_not_json_is_refused() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let row = store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.hold_import_row_within(owner, session, Some("row/1"), false, "{}"),
+        )
+        .expect("the row is held")
+        .observation
+        .row;
+
+    assert!(
+        store
+            .with_immediate_transaction(
+                |error| error,
+                |store| { store.record_intake_receipt_within(owner, session, row, "not json") }
+            )
+            .is_err(),
+        "an answer that does not parse is refused"
+    );
+}
+
+/// The answer one answer request gave is kept with the question it addressed,
+/// and a question nobody has answered has none (`iaam-mkbfh.9.1`, ADR 0042
+/// point 4).
+///
+/// This is what lets a repeat of an answer whose response was lost be answered
+/// rather than refused as «already answered»: the pair is read back under the
+/// owner, the session and the question.
+#[test]
+fn an_answered_question_keeps_the_answer_its_request_gave() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let row = store
+        .add_import_observation(owner, session, Some("row/1"), false, "{}")
+        .expect("row added")
+        .row;
+    let question = store
+        .record_import_question(owner, session, row, &asking())
+        .expect("question recorded")
+        .id;
+
+    assert_eq!(
+        store
+            .import_answer_receipt(owner, session, question)
+            .expect("the query runs"),
+        None,
+        "an unanswered question has no answer to give"
+    );
+
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| {
+                store.answer_import_question_within(
+                    owner,
+                    session,
+                    question,
+                    r#"{"answer":"paid"}"#,
+                )
+            },
+        )
+        .expect("the answer is recorded");
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| {
+                store.record_answer_receipt_within(owner, session, question, r#"{"settled":[]}"#)
+            },
+        )
+        .expect("the answer it gave is kept beside it");
+
+    assert_eq!(
+        store
+            .import_answer_receipt(owner, session, question)
+            .expect("the query runs")
+            .as_deref(),
+        Some(r#"{"settled":[]}"#)
+    );
+    assert_eq!(
+        store
+            .import_answer_receipt(OwnerId::new_random(), session, question)
+            .expect("the query runs"),
+        None,
+        "another owner reads none of it (§14)"
+    );
+}
+
+/// Withdrawing an answer reopens the question, and the answer its request gave
+/// goes with it: a question reopened is one a caller may answer again, and a
+/// receipt left standing would answer a new request with the old answer.
+#[test]
+fn withdrawing_an_answer_clears_the_answer_its_request_gave() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let row = store
+        .add_import_observation(owner, session, Some("row/withdraw"), false, "{}")
+        .expect("row added")
+        .row;
+    let question = store
+        .record_import_question(owner, session, row, &asking())
+        .expect("question recorded")
+        .id;
+    store
+        .answer_import_question(owner, session, question, r#"{"answer":"paid"}"#)
+        .expect("answer recorded");
+    store
+        .attach_import_question_rule(owner, session, question, "retired-rule")
+        .expect("rule attached");
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| {
+                store.record_answer_receipt_within(owner, session, question, r#"{"settled":[]}"#)
+            },
+        )
+        .expect("the answer its request gave is kept");
+
+    store
+        .withdraw_import_answer(owner, session, question)
+        .expect("withdrawal clears provisional state");
+    assert_eq!(
+        store
+            .import_answer_receipt(owner, session, question)
+            .expect("the query runs"),
+        None,
+        "the reopened question keeps no answer its last request gave"
+    );
+}
+
+/// A request repeated after its session was committed is answered from what the
+/// request wrote, not refused as «session not open» (`iaam-mkbfh.9.1`, ADR 0042
+/// point 4).
+///
+/// The row's key is looked for before the session's state is consulted, and that
+/// is what makes the recognition a recognition rather than another state check. A
+/// row the session does not hold still needs an open session: a new line added
+/// after commit would sit in a session whose facts are already written and would
+/// never be written itself.
+#[test]
+fn a_held_row_is_recognised_after_its_session_was_committed() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.hold_import_row_within(owner, session, Some("row/1"), false, "{}"),
+        )
+        .expect("the row is held");
+    store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.record_intake_receipt_within(owner, session, 1, r#"{"held":{"row":1}}"#),
+        )
+        .expect("the answer is kept beside the row");
+    store
+        .close_import_session(owner, session, SessionState::Committed)
+        .expect("session closes");
+
+    let again = store
+        .with_immediate_transaction(
+            |error| error,
+            |store| store.hold_import_row_within(owner, session, Some("row/1"), false, "{}"),
+        )
+        .expect("the row is recognised");
+    assert_eq!(again.observation.row, 1);
+    assert_eq!(
+        again.receipt.as_deref(),
+        Some(r#"{"held":{"row":1}}"#),
+        "with the answer the request that wrote it gave"
+    );
+    assert!(
+        store
+            .with_immediate_transaction(
+                |error| error,
+                |store| {
+                    store.hold_import_row_within(owner, session, Some("row/2"), false, "{}")
+                }
+            )
+            .is_err(),
+        "a row the closed session does not hold is still refused"
+    );
+}

@@ -14,8 +14,12 @@
 //!
 //! The **session's life** is not a transaction, and the difference is the point:
 //! questions are answered over hours and a connection held open that long blocks
-//! every other writer. The **commit that ends it** is one, opened after the last
-//! reading and closed with everything it writes (ADR 0042).
+//! every other writer. **Each request over the session is one** (ADR 0042): the
+//! rows fed to a session, their questions and the answer that request gives are
+//! one transaction; an answer writes its answers, its rule and the stamps on the
+//! rows it settled in one; and the commit that ends the session is one opened
+//! after the last reading. A request repeated after a lost response is
+//! recognised by its natural key and answered as the first call was.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,7 +77,7 @@ use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
 /// Returned beside the verdict rather than folded into it: the published verdict
 /// vocabulary carries the sentence, and the identifiers are what a caller needs
 /// to answer it after the response is gone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskedQuestion {
     pub session: ImportSessionId,
     pub question: ImportQuestionId,
@@ -89,7 +93,7 @@ pub struct AskedQuestion {
 /// `quarantined`, whose published meaning is that no fact *could* be written
 /// from the row. A held row will be written, at commit and at no other moment,
 /// and saying so needs a word the verdict vocabulary does not have.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HeldRow {
     /// Held, and nothing about it is in doubt.
     Held { row: u32 },
@@ -291,7 +295,33 @@ pub async fn answerable_questions(
     } else {
         Vec::new()
     };
-    Ok(questions
+    Ok(answer_questions_of(
+        &contents.observations,
+        questions,
+        &asked,
+        &accounts,
+        &settlements,
+    ))
+}
+
+/// The pairing itself, from reads already taken.
+///
+/// One construction for the route that lists a session's questions, the answer
+/// that gives one and answers it, and a repeat of that answer rebuilt from the
+/// answer the first call gave (ADR 0042 point 4): three callers, one shape, so
+/// what a caller is shown before answering, what it is answered with and what a
+/// retry is answered with cannot come to differ.
+///
+/// `asked` is the typed question behind each view, where the view is open and
+/// readable, and it is indexed like `questions`.
+fn answer_questions_of(
+    observations: &[ImportObservationView],
+    questions: &[ImportQuestionView],
+    asked: &[Option<Question>],
+    accounts: &[AccountView],
+    settlements: &QuestionSettlements,
+) -> Vec<AnswerableQuestion> {
+    questions
         .iter()
         .zip(asked)
         .map(|(question, asked)| AnswerableQuestion {
@@ -303,13 +333,13 @@ pub async fn answerable_questions(
             // rules at all. So the call stays open to him and the answer keeps
             // meaning what it meant — what he is no longer told is that he must
             // make it.
-            accounts: asked.map_or_else(Vec::new, |asked| {
-                answer_account_candidates(&asked, &accounts)
-            }),
-            generalisation: generalisation_of(&contents.observations, question),
+            accounts: asked
+                .as_ref()
+                .map_or_else(Vec::new, |asked| answer_account_candidates(asked, accounts)),
+            generalisation: generalisation_of(observations, question),
             settled_without_answer: settlements.settlement_of(question).cloned(),
         })
-        .collect())
+        .collect()
 }
 
 /// Submit rows without naming a session.
@@ -980,8 +1010,17 @@ pub async fn list_sessions(
 /// wrong, while a row for another account contradicts the declaration the
 /// session was opened under, and holding the agreeing half would leave a
 /// half-import staged under an identity that names the wrong account. It is
-/// refused **before** the first observation is written, so a refused call
-/// leaves the session exactly as it found it.
+/// refused **before the first observation is written**, and now for a stronger
+/// reason than the order of two calls: the request is one transaction, so a
+/// refused call leaves the session exactly as it found it however far into the
+/// rows the refusal was decided (ADR 0042 point 1).
+///
+/// **One request is one transaction** (ADR 0042 points 1 and 2), and it is
+/// opened here, after anything network-bound, of which this call has nothing.
+/// The session's declaration, the owner's accounts, his statements and his rules
+/// are read inside it, so the rows are judged and written against one reading.
+/// A kill anywhere inside leaves none of the request, and the identical retry
+/// completes it ([`add_rows_inside`]).
 ///
 /// The refusal names no request index. The rows this function receives are the
 /// ones the transport could read, so a position here is a position in that
@@ -995,13 +1034,50 @@ pub async fn add_rows(
     rows: &[Intake],
 ) -> Result<Vec<HeldRow>, AppError> {
     require_submit(principal)?;
-    // A session that cannot be found declares nothing, and the refusal for that
-    // is `add_import_observation`'s own: reporting it here as well would give
-    // one mistake two answers.
-    let declared = services
+    let principal = principal.clone();
+    let rows = rows.to_vec();
+    let result = services
         .store
-        .load_import_session(principal.owner, session)
-        .await?
+        .transact(Box::new(move |tx: &mut dyn StoreTx| {
+            let held = add_rows_inside(tx, &principal, session, &rows)?;
+            Ok(Box::new(held) as TxResult)
+        }))
+        .await?;
+    result
+        .downcast::<Vec<HeldRow>>()
+        .map(|held| *held)
+        .map_err(|_| AppError::Store("import intake returned an unexpected result".to_owned()))
+}
+
+/// The body of [`add_rows`], inside the store's transaction.
+///
+/// Every read here reads through `tx` and every write writes through it, so the
+/// whole request is one transaction and the answer this call gives is kept with
+/// the rows it gave it for.
+///
+/// **A repeat of a request that already ran is answered, not written again**
+/// (ADR 0042 point 4). A row's natural key is what it is in the session — the
+/// key it stated — and a caller repeating an identical request finds each row
+/// where the first call left it, with the answer the first call gave. A row
+/// already held under that key with **another** payload is refused: it is a
+/// different row wearing the same name, and answering it with the stored row
+/// would record one line twice under one identity.
+///
+/// A row that states no key has no natural key, so nothing here can recognise
+/// it: the same is true of the journal, which refuses to guess an identity a
+/// source did not state. Such a row is held once per request, and a caller that
+/// repeats a request of them is not recognised as repeating anything.
+fn add_rows_inside(
+    tx: &mut dyn StoreTx,
+    principal: &Principal,
+    session: ImportSessionId,
+    rows: &[Intake],
+) -> Result<Vec<HeldRow>, AppError> {
+    // A session that cannot be found declares nothing, and the refusal for that
+    // is the row's own: reporting it here as well would give one mistake two
+    // answers.
+    let declared = tx
+        .load_import_session(principal.owner, session)?
         .and_then(|view| view.account);
     if let Some(declared) = declared {
         for (index, intake) in rows.iter().enumerate() {
@@ -1022,52 +1098,82 @@ pub async fn add_rows(
             }
         }
     }
-    let resolver = Resolver::load(services, principal.owner).await?;
+    let resolver = resolver_within(tx, principal.owner)?;
     let mut outcomes: Vec<HeldRow> = Vec::with_capacity(rows.len());
     for intake in rows {
-        let observation = services
-            .store
-            .add_import_observation(
-                principal.owner,
-                session,
-                intake.row_key(),
-                intake.is_concluded(),
-                serde_json::to_string(intake).map_err(|error| {
-                    AppError::Store(format!("import observation could not be written: {error}"))
-                })?,
-            )
-            .await?;
-        let Intake::Observed { row, .. } = intake else {
-            outcomes.push(HeldRow::Held {
-                row: observation.row,
-            });
-            continue;
-        };
-        match resolver.assess(row) {
-            Assessment::Settled { .. } => outcomes.push(HeldRow::Held {
-                row: observation.row,
-            }),
-            Assessment::NoFact { reason } => outcomes.push(HeldRow::Settled {
-                row: observation.row,
-                reason,
-            }),
+        outcomes.push(held_row_inside(
+            tx,
+            principal.owner,
+            session,
+            intake,
+            &resolver,
+        )?);
+    }
+    Ok(outcomes)
+}
+
+/// Hold one row, and answer with what it earned — the answer the first call
+/// gave where it is already held.
+///
+/// The three writes a questioned row makes — the row, its question and the
+/// answer — are one transaction, so a kill leaves either the whole of the row's
+/// request or none of it, and the answer the request gave is what a repeat is
+/// answered with (ADR 0042 points 1 and 4).
+fn held_row_inside(
+    tx: &mut dyn StoreTx,
+    owner: OwnerId,
+    session: ImportSessionId,
+    intake: &Intake,
+    resolver: &Resolver,
+) -> Result<HeldRow, AppError> {
+    let payload = serde_json::to_string(intake).map_err(|error| {
+        AppError::Store(format!("import observation could not be written: {error}"))
+    })?;
+    let key = intake.row_key();
+    let held = tx.hold_import_row(
+        owner,
+        session,
+        key.clone(),
+        intake.is_concluded(),
+        payload.clone(),
+    )?;
+    if held.row.payload != payload {
+        return Err(AppError::Conflict {
+            what: format!(
+                "this session already holds row {} under the key {} with another payload",
+                held.row.row,
+                key.as_deref().unwrap_or_default()
+            ),
+        });
+    }
+    if let Some(receipt) = held.receipt {
+        return serde_json::from_str::<HeldRow>(&receipt).map_err(|error| {
+            AppError::Store(format!(
+                "the recorded answer of import row {} could not be read: {error}",
+                held.row.row
+            ))
+        });
+    }
+    let row = held.row.row;
+    let answer = match intake {
+        Intake::Concluded { .. } => HeldRow::Held { row },
+        Intake::Observed { row: observed, .. } => match resolver.assess(observed) {
+            Assessment::Settled { .. } => HeldRow::Held { row },
+            Assessment::NoFact { reason } => HeldRow::Settled { row, reason },
             Assessment::Ambiguous { question } => {
-                let prompt = resolver.render(&question, row);
+                let prompt = resolver.render(&question, observed);
                 let alternatives = question.alternatives();
-                let stored = services
-                    .store
-                    .record_import_question(
-                        principal.owner,
-                        session,
-                        observation.row,
-                        NewImportQuestion {
-                            question: json(&question, "question")?,
-                            alternatives: json(&alternatives, "question alternatives")?,
-                            prompt,
-                        },
-                    )
-                    .await?;
-                outcomes.push(HeldRow::Questioned {
+                let stored = tx.record_import_question(
+                    owner,
+                    session,
+                    row,
+                    NewImportQuestion {
+                        question: json(&question, "question")?,
+                        alternatives: json(&alternatives, "question alternatives")?,
+                        prompt,
+                    },
+                )?;
+                HeldRow::Questioned {
                     asked: AskedQuestion {
                         session,
                         question: stored.id,
@@ -1075,11 +1181,32 @@ pub async fn add_rows(
                         prompt: stored.prompt,
                         alternatives,
                     },
-                });
+                }
             }
-        }
-    }
-    Ok(outcomes)
+        },
+    };
+    // Serialised before the write so that an answer this build cannot render is
+    // an error and not a held row with no answer, exactly as a commit does.
+    let receipt = serde_json::to_string(&answer).map_err(|error| {
+        AppError::Store(format!(
+            "the intake's answer could not be recorded: {error}"
+        ))
+    })?;
+    tx.record_intake_receipt(owner, session, row, &receipt)?;
+    Ok(answer)
+}
+
+/// The owner's accounts, his statements about them and his rules, read inside
+/// the caller's transaction.
+///
+/// One reading, so a batch's rows are all judged against the same directory and
+/// the same rules. [`Resolver::load`] is the same three reads taken outside a
+/// transaction, for the routes that are not one.
+fn resolver_within(tx: &mut dyn StoreTx, owner: OwnerId) -> Result<Resolver, AppError> {
+    let accounts = tx.list_account_details(owner)?;
+    let statements = tx.list_account_transfer_statements(owner)?;
+    let stored = tx.list_classification_rules(owner)?;
+    Resolver::from_views(accounts, statements, stored)
 }
 
 /// What became of the chance to turn one answer into a standing rule.
@@ -1537,9 +1664,27 @@ pub async fn withdraw_answer(
 ///
 /// Steps 2 and 3 were the other way round until `iaam-77hk`, and the swap is the
 /// whole of that bead: the answer is the recorded fact and the rule is derived
-/// from it, so the derived one is written second and a failure costs the
-/// derivation rather than the fact. The reasoning is at the call, together with
-/// what remains possible now that it cannot be made one transaction.
+/// from it, so the derived one is written second. Since `iaam-mkbfh.9.1` the two
+/// are one write in one transaction (ADR 0042 point 1), so the order is what a
+/// reader of the session sees rather than a moment a kill can stop at: a call
+/// that fails leaves neither a standing rule for an answer no session shows nor
+/// an answer whose rule was lost.
+///
+/// **One request is one transaction**, opened here after anything
+/// network-bound, of which an answer has nothing. The session, its rows, its
+/// questions and the owner's accounts, statements and rules are read inside it,
+/// so what this call settles is decided from the session as it now stands, and
+/// the answers, the rule they minted, the stamps on the rows they settled and
+/// the answer this call gives are written together or not at all.
+///
+/// **A repeat of an answer that already ran is answered, not refused** (ADR
+/// 0042 point 4). The session and the question name it, and the answer the
+/// first call gave is kept beside the question by the same transaction that
+/// wrote it: a caller whose response was lost is given that answer and nothing
+/// is written, while the same question under another answer is refused. Who sent
+/// the request is not part of that comparison — the principal decides whether a
+/// rule may be written at all, and a repeat of one command is answered as the
+/// first call answered it.
 ///
 /// **`reach` decides how many rows this settles and never whether a rule is
 /// written** (`iaam-q5og`, decision 0029). [`AnswerReach::ThisRow`] is the
@@ -1569,15 +1714,104 @@ pub async fn answer_question(
     reach: AnswerReach,
 ) -> Result<AnsweredQuestions, AppError> {
     require_submit(principal)?;
-    let contents = read_session(services, principal, session).await?;
-    let stored = contents
-        .questions
+    // One request is one transaction (ADR 0042 point 1), and it is opened here
+    // — after anything network-bound, of which an answer has nothing.
+    let principal = principal.clone();
+    let result = services
+        .store
+        .transact(Box::new(move |tx: &mut dyn StoreTx| {
+            let answered = answer_inside(tx, &principal, session, question, answer, reach)?;
+            Ok(Box::new(answered) as TxResult)
+        }))
+        .await?;
+    result
+        .downcast::<AnsweredQuestions>()
+        .map(|answered| *answered)
+        .map_err(|_| AppError::Store("an import answer returned an unexpected result".to_owned()))
+}
+
+/// What one answer request asked and what it settled, kept with the question it
+/// addressed.
+///
+/// A request is recognised by the session and the question, so this is what a
+/// repeat is compared with and answered from (ADR 0042 point 4). It holds the
+/// **command** — the answer and how far it reached — and the questions the call
+/// settled, and not the response: the response is one function of the session
+/// as it stands and of that list ([`answer_questions_of`]), and a stored
+/// rendering would be a second description of it that could drift from the code
+/// that produces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AnswerReceipt {
+    answer: String,
+    reach: AnswerReach,
+    /// Every question the request settled, in the session's row order, the one
+    /// the caller addressed last.
+    settled: Vec<ImportQuestionId>,
+}
+
+/// The body of [`answer_question`], inside the store's transaction.
+///
+/// Every read here reads through `tx` and every write writes through it: the
+/// answers, the standing rule they minted, the stamps on the rows that rule
+/// filed and the answer this call gives. A returned error — including every
+/// refusal below — rolls the whole thing back.
+fn answer_inside(
+    tx: &mut dyn StoreTx,
+    principal: &Principal,
+    session: ImportSessionId,
+    question: ImportQuestionId,
+    answer: Answer,
+    reach: AnswerReach,
+) -> Result<AnsweredQuestions, AppError> {
+    let view = tx
+        .load_import_session(principal.owner, session)?
+        .ok_or_else(|| AppError::NotFound {
+            what: "an import session",
+            id: session.inner().to_string(),
+        })?;
+    let observations = tx.list_import_observations(principal.owner, session)?;
+    let questions = tx.list_import_questions(principal.owner, session)?;
+    let stored = questions
         .iter()
         .find(|candidate| candidate.id == question)
         .ok_or(AppError::NotFound {
             what: "an import question",
             id: question.inner().to_string(),
         })?;
+    // The owner's accounts, his statements about them and his rules, read here
+    // rather than loaded again: one reading, taken inside the transaction, of
+    // what this answer is judged against and what it is answered with.
+    let accounts = tx.list_account_details(principal.owner)?;
+    let candidates = account_views(&accounts);
+    let resolver = Resolver::from_views(
+        accounts,
+        tx.list_account_transfer_statements(principal.owner)?,
+        tx.list_classification_rules(principal.owner)?,
+    )?;
+    // What this reading settled without the owner's word, folded once. Read
+    // before anything is written, because it also decides how far an answer
+    // that reaches beyond its own row goes.
+    let settlements =
+        SessionReading::with_resolver(resolver, principal, &view, &observations, &questions)
+            .settlements();
+    let payload = json(&answer, "answer")?;
+
+    // **A repeat of an answer that already ran is answered, not refused**
+    // (ADR 0042 point 4), and it is recognised **before every refusal below** —
+    // including the state-dependent ones, «already answered» and «session not
+    // open», which is exactly what a caller whose response was lost would
+    // otherwise be refused with.
+    if let Some(stored_receipt) = tx.import_answer_receipt(principal.owner, session, question)? {
+        let receipt = repeated_request(&stored_receipt, &payload, reach)?;
+        return answer_from_receipt(
+            receipt,
+            &observations,
+            &questions,
+            &candidates,
+            &settlements,
+        );
+    }
+
     let asked: Question = serde_json::from_str(&stored.question).map_err(|error| {
         AppError::Store(format!("stored import question could not be read: {error}"))
     })?;
@@ -1587,16 +1821,9 @@ pub async fn answer_question(
         // function the action queue publishes `/answer` with, so what a refusal
         // offers and what the queue offers cannot drift apart.
         //
-        // Reading the owner's accounts here costs one query on a path that is
-        // already refusing, and it buys the two shapes that name an account the
-        // list of accounts they may name. A read that fails leaves the refusal
-        // as prose rather than turning a rejected answer into a store failure:
-        // what was wrong with the request does not change because the extra
-        // detail could not be fetched.
-        let alternatives = match services.store.list_accounts(principal.owner).await {
-            Ok(accounts) => answer_input(&asked, &accounts).alternatives,
-            Err(_) => Vec::new(),
-        };
+        // The accounts are the ones this transaction read, so the two shapes
+        // that name an account the list of accounts they may name it.
+        let alternatives = answer_input(&asked, &candidates).alternatives;
         return Err(FieldRejection::new(
             "answer",
             asked
@@ -1617,17 +1844,16 @@ pub async fn answer_question(
     // `ObservedRow::resolve` below and again in `Event::validate_transfer`; it
     // is not enforced here, and a reader who trusted the old wording would go
     // looking for the missing check rather than for the two that exist.
-    if let Some(account) = named_account(answer) {
-        let accounts = services.store.list_accounts(principal.owner).await?;
-        if !accounts.iter().any(|known| known.id == account) {
-            return Err(AppError::NotFound {
-                what: "an account of the owner's",
-                id: account.inner().to_string(),
-            });
-        }
+    if let Some(account) = named_account(answer)
+        && !candidates.iter().any(|known| known.id == account)
+    {
+        return Err(AppError::NotFound {
+            what: "an account of the owner's",
+            id: account.inner().to_string(),
+        });
     }
 
-    let observed = observed_row(&contents.observations, stored.row)?;
+    let observed = observed_row(&observations, stored.row)?;
     // Refused before the rule is written rather than at commit: a rule created
     // for an answer the row cannot express would outlive the mistake and
     // reclassify later imports by it.
@@ -1659,7 +1885,7 @@ pub async fn answer_question(
     let targets: Vec<&ImportQuestionView> = match reach {
         AnswerReach::ThisRow => Vec::new(),
         AnswerReach::EveryLikeRowInThisSession => {
-            let Some(subject) = subject_asked(&contents.observations, stored) else {
+            let Some(subject) = subject_asked(&observations, stored) else {
                 return Err(FieldRejection::new(
                     "settles",
                     "a question this build can still read, for an answer that reaches beyond \
@@ -1679,23 +1905,19 @@ pub async fn answer_question(
             // must be decided from the session as it now stands — the same
             // reason the subject is recomputed rather than read off the
             // assessment.
-            let settlements = SessionReading::of(services, principal, &contents)
-                .await?
-                .settlements();
-            contents
-                .questions
+            questions
                 .iter()
                 .filter(|candidate| {
                     candidate.id != question
                         && settlements.awaits_answer(candidate)
-                        && subject_asked(&contents.observations, candidate)
+                        && subject_asked(&observations, candidate)
                             .is_some_and(|of_candidate| of_candidate == subject)
                 })
                 .collect()
         }
     };
     for target in &targets {
-        let row = observed_row(&contents.observations, target.row)?;
+        let row = observed_row(&observations, target.row)?;
         row.resolve_with(answer)
             .map_err(|rejection| AppError::Invalid {
                 field: format!("settles/{}", target.row),
@@ -1704,69 +1926,29 @@ pub async fn answer_question(
             })?;
     }
 
-    // **The answer is written before the rule, and this is iaam-77hk.** It used
-    // to be the other way round: the rule was created, and its identifier was
-    // passed to the write that recorded the answer. A failure of that second
-    // write left the owner holding a standing rule for an answer no session
-    // shows — a rule whose origin he never sees, whose question still reads as
-    // open, and which he cannot reach from the row that made it.
+    // **All of it is one write** (ADR 0042 points 1 and 4): the answers, the
+    // rule they minted, the question that names it, the rows that rule was
+    // stamped on and the answer this call gives. The answer is the owner's fact
+    // and the rule is derived from it, so the derived one goes second — an
+    // order a reader of the session sees, and no longer a moment a kill can stop
+    // at.
     //
-    // The two writes cannot be one. `services.store` and `services.rules` are
-    // separate ports; neither signature carries a transaction handle and the
-    // rule store need not even be the same database, so a promise of atomicity
-    // here would be a promise nothing keeps. What is left is the order, and the
-    // order is decided by which fact is the owner's: the answer is what he said
-    // about the row, and the rule is derived from it. The derived one goes
-    // second.
-    //
-    // What remains possible is stated rather than hidden, and there are two
-    // windows rather than one, because the rule is now stamped on the
-    // observations as well as on the question (`iaam-73xv`).
-    //
-    // A failure between the answers and the rule leaves the row settled and no
-    // rule recorded at all — exactly `Generalisation::Available`, a state the
-    // action queue offers an act for, so the owner is one call from the rule
-    // rather than back at the row.
-    //
-    // A failure at the last of the three writes, `attach_import_answer_rule`,
-    // leaves the rule created, the question naming it and no observation
-    // stamped. `generalisation_of` reads the question, so it reports
-    // `Recorded` — true, and a state the queue offers nothing for, because
-    // there is nothing left for him to adopt. `resolution_of` reads the minted
-    // rule off the observation, so the rows commit as `NoRule` and the group
-    // that one decision reached is not assembled. What is lost is the grouping
-    // this wave added; the rule stands, the answer stands, and the row is
-    // classified exactly as he answered it, which is what happened before the
-    // grouping existed.
-    //
-    // A caller that sees this call fail must in either case re-read the session
-    // rather than repeat the call: the answer may already stand, and answering
-    // twice is refused.
-    //
-    // The reach makes one addition to that reasoning and no change to it. The
-    // rows this answer also settles are answered **before** the row it was asked
-    // about, and that order is chosen for recovery rather than for precedence:
-    // every one of them is the owner's own fact, so decision 0027's «his fact
-    // before the derived one» is satisfied whichever comes first among them,
-    // while answering a question twice is refused — so a call that failed
-    // half-way must be repeatable, and it is repeatable only if the question the
-    // caller addresses is the last one written. On a repeat the session is read
-    // again, the rows already settled are no longer open, and they are simply
-    // not among the targets.
-    let payload = json(&answer, "answer")?;
+    // The rows this answer also settles are answered **before** the row it was
+    // asked about, and that order is kept from the partial-failure days because
+    // it still reads best: the question the caller addressed is the last one
+    // this call touches, so a caller reading the receipt or the session finds
+    // the addressed question as the record of what the whole call did.
     let mut also_settled = Vec::with_capacity(targets.len());
     for target in &targets {
-        also_settled.push(
-            services
-                .store
-                .answer_import_question(principal.owner, session, target.id, payload.clone())
-                .await?,
-        );
+        also_settled.push(tx.answer_import_question(
+            principal.owner,
+            session,
+            target.id,
+            payload.clone(),
+        )?);
     }
-    let answered = services
-        .store
-        .answer_import_question(principal.owner, session, question, payload)
-        .await?;
+    let answered =
+        tx.answer_import_question(principal.owner, session, question, payload.clone())?;
     // One rule at most, whatever the reach, and it is minted from the row the
     // caller addressed. A rule per settled row would be one decision recorded
     // many times — and `matcher_for` builds them all from the same field of the
@@ -1785,24 +1967,23 @@ pub async fn answer_question(
     // [`Generalisation::DoesNotGeneralise`]; the mixed-ground case remains
     // available for an informed owner adoption.
     let answered = match matcher_for(&observed)
-        .filter(|matcher| matcher_ground_is_single_shape(matcher, &contents.observations))
+        .filter(|matcher| matcher_ground_is_single_shape(matcher, &observations))
         .filter(|_| may_generalise(principal))
         .filter(|_| answer.shape().generalises())
     {
         Some(matcher) => {
-            let rule = services
-                .rules
-                .create_rule(principal.owner, matcher, answer.classification(), None)
-                .await?;
-            let named = services
-                .store
-                .attach_import_question_rule(
-                    principal.owner,
-                    session,
-                    question,
-                    rule.id.to_string(),
-                )
-                .await?;
+            let rule = tx.create_classification_rule(
+                principal.owner,
+                matcher,
+                answer.classification(),
+                None,
+            )?;
+            let named = tx.attach_import_question_rule(
+                principal.owner,
+                session,
+                question,
+                rule.id.to_string(),
+            )?;
             // And on the rows themselves, which is what the commit reads
             // (`iaam-73xv`). The question is what the owner is shown; the
             // observation is what the fact is written from, so a rule recorded
@@ -1828,47 +2009,131 @@ pub async fn answer_question(
                 .map(|target| target.row)
                 .chain(std::iter::once(named.row))
                 .collect();
-            services
-                .store
-                .attach_import_answer_rule(
-                    principal.owner,
-                    session,
-                    &settled,
-                    ClassificationRuleId(rule.id),
-                    rule.version,
-                )
-                .await?;
+            tx.attach_import_answer_rule(
+                principal.owner,
+                session,
+                &settled,
+                ClassificationRuleId(rule.id),
+                rule.version,
+            )?;
             named
         }
         None => answered,
     };
+    // What this call asked and settled, kept with the question it addressed: a
+    // caller repeating the identical request is answered from here instead of
+    // being refused as «already answered» (ADR 0042 point 4). Serialised before
+    // the write so that an answer this build cannot render is an error and not
+    // an answered question whose repeat has nothing to give.
+    let receipt = AnswerReceipt {
+        answer: payload,
+        reach,
+        settled: targets
+            .iter()
+            .map(|target| target.id)
+            .chain(std::iter::once(answered.id))
+            .collect(),
+    };
+    let receipt = serde_json::to_string(&receipt).map_err(|error| {
+        AppError::Store(format!(
+            "the answer's receipt could not be recorded: {error}"
+        ))
+    })?;
+    tx.record_answer_receipt(principal.owner, session, question, &receipt)?;
     // Through the same pairing every other reading of a question goes through,
     // rather than an empty list and a generalisation written out here. The
     // answered question offers no candidates *because it is answered*, and what
     // its answer generalised into is one derivation; stated in two places they
     // are rules that can come to disagree with themselves.
-    //
-    // `contents` was read before the answer was written, and that is harmless:
-    // what the generalisation consults it for is the observed row, which an
-    // answer does not change.
-    let mut paired = answerable_questions(
-        services,
-        principal,
-        &contents,
-        &also_settled
-            .iter()
-            .cloned()
-            .chain(std::iter::once(answered.clone()))
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    let asked = paired.pop().unwrap_or(AnswerableQuestion {
-        view: answered,
-        accounts: Vec::new(),
-        generalisation: Generalisation::Unanswered,
-        // The question this call just answered, so nothing else settled it.
-        settled_without_answer: None,
-    });
+    let answered_views: Vec<ImportQuestionView> = also_settled
+        .iter()
+        .cloned()
+        .chain(std::iter::once(answered))
+        .collect();
+    let asked_views: Vec<Option<Question>> = answered_views
+        .iter()
+        .map(|view| view.is_open().then(|| stored_question(view)).flatten())
+        .collect();
+    let mut paired = answer_questions_of(
+        &observations,
+        &answered_views,
+        &asked_views,
+        &candidates,
+        &settlements,
+    );
+    let asked = paired.pop().ok_or_else(|| {
+        AppError::Store("the answer this call wrote could not be read back".to_owned())
+    })?;
+    Ok(AnsweredQuestions {
+        asked,
+        also_settled: paired,
+    })
+}
+
+/// The command a repeat of an answer must carry, read from the receipt the
+/// first call kept.
+///
+/// A repeat of a request is answered as the first call was (ADR 0042 point 4),
+/// and the receipt is how it is recognised: the session and the question name
+/// the key, and this says whether the request is the same one. It is **not**
+/// refused because the caller is another token — who sent the request is
+/// authority, not command.
+fn repeated_request(
+    stored: &str,
+    payload: &str,
+    reach: AnswerReach,
+) -> Result<AnswerReceipt, AppError> {
+    let receipt: AnswerReceipt = serde_json::from_str(stored).map_err(|error| {
+        AppError::Store(format!("the recorded answer could not be read: {error}"))
+    })?;
+    if receipt.answer != payload || receipt.reach != reach {
+        return Err(AppError::Conflict {
+            what: "this question was answered by another request, and answering it again \
+                   is a different act"
+                .to_owned(),
+        });
+    }
+    Ok(receipt)
+}
+
+/// The answer the first call gave, rebuilt from the answer it recorded.
+///
+/// The list of questions that call settled is what makes this possible without
+/// storing a rendering of the response: each entry is rebuilt by
+/// [`answer_questions_of`], the same pairing the answering route publishes and
+/// the first call itself went through, so a retry cannot describe the session
+/// in a shape the current build no longer produces.
+fn answer_from_receipt(
+    receipt: AnswerReceipt,
+    observations: &[ImportObservationView],
+    questions: &[ImportQuestionView],
+    accounts: &[AccountView],
+    settlements: &QuestionSettlements,
+) -> Result<AnsweredQuestions, AppError> {
+    let settled: Vec<ImportQuestionView> = receipt
+        .settled
+        .iter()
+        .map(|id| {
+            questions
+                .iter()
+                .find(|candidate| candidate.id == *id)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::Store(format!(
+                        "the question the recorded answer settled, {}, is not in the session",
+                        id.inner()
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let asked: Vec<Option<Question>> = settled
+        .iter()
+        .map(|view| view.is_open().then(|| stored_question(view)).flatten())
+        .collect();
+    let mut paired = answer_questions_of(observations, &settled, &asked, accounts, settlements);
+    let asked = paired
+        .pop()
+        .ok_or_else(|| AppError::Store("the recorded answer settled no question".to_owned()))?;
     Ok(AnsweredQuestions {
         asked,
         also_settled: paired,
@@ -1891,7 +2156,7 @@ pub async fn answer_question(
 /// explicit reach makes the fan-out a decision, and the assessment publishes
 /// [`OpenQuestion::alike`] so the decision is an informed one rather than a
 /// guess about how many rows are alike.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AnswerReach {
     /// Only the row the question names. The behaviour before decision 0029, and
     /// the default, so a caller that says nothing settles exactly what it
@@ -4059,8 +4324,13 @@ impl SessionReading {
         principal: &Principal,
         contents: &SessionContents,
     ) -> Result<Self, AppError> {
-        let resolver = Resolver::load(services, principal.owner).await?;
-        Ok(Self::with_resolver(resolver, principal, contents))
+        Ok(Self::with_resolver(
+            Resolver::load(services, principal.owner).await?,
+            principal,
+            &contents.session,
+            &contents.observations,
+            &contents.questions,
+        ))
     }
 
     /// The same reading, against a resolver already loaded.
@@ -4069,14 +4339,22 @@ impl SessionReading {
     /// and the commit takes that list inside its transaction (ADR 0042 point 2):
     /// a plan that loaded its own resolver again would read the accounts and the
     /// rules twice, and the second reading could be of a different state from the
-    /// one the caller's plan was computed from.
+    /// one the caller's plan was computed from. An answer is read the same way,
+    /// from reads taken inside its own transaction.
+    ///
+    /// It takes the three parts of a session it reads rather than a
+    /// [`SessionContents`], because a caller may hold the rows without holding
+    /// the control figures — an answer never reads those, and assembling them
+    /// for it would be a value that lies about what the session holds.
     fn with_resolver(
         resolver: Resolver,
         principal: &Principal,
-        contents: &SessionContents,
+        session: &ImportSessionView,
+        observations: &[ImportObservationView],
+        questions: &[ImportQuestionView],
     ) -> Self {
-        let mut read_rows = Vec::with_capacity(contents.observations.len());
-        for observation in &contents.observations {
+        let mut read_rows = Vec::with_capacity(observations.len());
+        for observation in observations {
             let intake = parse_intake(&observation.payload).ok();
             let resolution = resolution_of(observation, &resolver);
             // A settled row that produces nothing leaves the fact pipeline here and
@@ -4120,7 +4398,7 @@ impl SessionReading {
                 reader_of,
             );
             let candidate = operation.clone().and_then(|operation| {
-                let origin = session_origin(principal.owner, &contents.session, operation.account);
+                let origin = session_origin(principal.owner, session, operation.account);
                 normalize(
                     &operation,
                     &NormalizationContext {
@@ -4168,7 +4446,7 @@ impl SessionReading {
         // has been read: the pair is invisible to a reading of either row on its
         // own, which is why the two legs used to reach the journal as two complete
         // transfers, each carrying a leg on each account.
-        let mirrors = mirrored_rows(contents.session.id, &read_rows, &contents.questions);
+        let mirrors = mirrored_rows(session.id, &read_rows, questions);
         settle_mirrored(&mut read_rows, &mirrors);
         Self {
             resolver,
@@ -4309,7 +4587,13 @@ fn assemble_plan(
     let recorded = RecordedIdentities::of(&journal);
 
     let resolver = Resolver::from_views(accounts, transfer_statements, classification_rules)?;
-    let reading = SessionReading::with_resolver(resolver, principal, &contents);
+    let reading = SessionReading::with_resolver(
+        resolver,
+        principal,
+        &contents.session,
+        &contents.observations,
+        &contents.questions,
+    );
     // What this reading settled without a word from the owner, folded once and
     // read by everything below that asks whether a question is still his to
     // answer. See [`QuestionSettlements`].
@@ -6058,7 +6342,7 @@ impl QuestionSettlement {
 /// absent, and deliberately: his word that a row should record nothing would be
 /// a third determination on a third kind of evidence, and it would need an
 /// answer shape this does not add. Naming it as absent is the honest state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NoFactReason {
     /// The identifier the source printed for the far side resolves to the very
     /// account the row is on, so the two sides are two payment instruments over

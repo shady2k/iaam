@@ -20,7 +20,23 @@ use iaam_store::schema::{SCHEMA_VERSION, migrate};
 use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
-fn rewind_tax_and_redemption_columns(conn: &rusqlite::Connection) {
+/// Wind a current database back to the shape a version-1 build left behind.
+///
+/// Everything a migration after the first added and a catch-up `migrate` must
+/// therefore add again: the tables, the columns and the rebuilt
+/// `event_corporate_action`. A database opened by `SqliteStore::open` already
+/// holds all of it, and `migrate` would stop on the first `CREATE TABLE`,
+/// `ADD COLUMN` or rebuild naming something that is there — so **every
+/// migration that adds a column or a table belongs here too**, in the same
+/// commit as the migration.
+fn rewind_later_migrations(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "ALTER TABLE import_observations DROP COLUMN intake_receipt; \
+         ALTER TABLE import_questions DROP COLUMN answer_receipt; \
+         ALTER TABLE import_sessions DROP COLUMN commit_revision; \
+         ALTER TABLE import_sessions DROP COLUMN commit_receipt;",
+    )
+    .expect("remove the import receipts of migrations 0020 and 0021");
     conn.execute_batch("DROP TABLE instrument_broker_blocks;")
         .expect("remove version-18 broker handle evidence");
     conn.execute_batch("ALTER TABLE instruments DROP COLUMN blocked_tca_flag;")
@@ -260,7 +276,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
         "a database this build created is at this build's version"
     );
 
-    rewind_tax_and_redemption_columns(store.connection());
+    rewind_later_migrations(store.connection());
     store
         .connection()
         .execute_batch(
@@ -397,7 +413,7 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
     // `SCHEMA_VERSION` afterwards, and migrations 0004 to 0009 would otherwise
     // find the column and the tables already there from the initial
     // `open_in_memory` and fail on a name that already exists.
-    rewind_tax_and_redemption_columns(connection);
+    rewind_later_migrations(connection);
     connection
         .execute_batch(
             "DROP TABLE event_stated_securities_value; \
@@ -461,7 +477,7 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
 
     // The shape a version-8 build actually leaves behind: everything of
     // migrations 1 to 8, nothing of 0009, and the version number it wrote.
-    rewind_tax_and_redemption_columns(store.connection());
+    rewind_later_migrations(store.connection());
     store
         .connection()
         .execute_batch(
@@ -544,7 +560,7 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
 fn version_ten_redemption_rows_survive_optional_custody_migration() {
     let store = SqliteStore::open_in_memory().expect("open");
     let conn = store.connection();
-    rewind_tax_and_redemption_columns(conn);
+    rewind_later_migrations(conn);
     conn.execute_batch(
         "INSERT INTO accounts (id, owner, title, created_at) VALUES ('a', 'o', 'Account', '2026-01-01T00:00:00Z');
          INSERT INTO instruments (id, kind, symbol, title, denomination_currency, settlement_currency, quote_currency, created_at) VALUES ('i', 'bond', 'BOND', 'Bond', 'RUB', 'RUB', 'RUB', '2026-01-01T00:00:00Z');

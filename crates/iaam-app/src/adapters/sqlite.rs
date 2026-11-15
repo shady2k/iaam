@@ -16,13 +16,13 @@ use crate::ports::{
     BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore,
     CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
     ControlAssertionView, CustodyUpsert, CustodyView, DecisionQuery, DecisionRecord, Declared,
-    DeclinedAccountNameView, DocumentToKeep, ImportCommitReceipt, ImportObservationView,
-    ImportPlanReads, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
-    ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
-    JournalQuery, JournalSourceCategoryQuery, NewImportQuestion, Principal, Recorded,
-    RecordedEvent, Scope, SoleOwner, Store, StoreTx, SyncRefusalFilter, SyncRefusalRecord,
-    TokenAdmin, TokenView, TransactionalWork, TxResult, UnresolvedAccountSourceView,
-    UnresolvedAccountView,
+    DeclinedAccountNameView, DocumentToKeep, HeldImportRow, ImportCommitReceipt,
+    ImportObservationView, ImportPlanReads, ImportQuestionView, ImportSessionState,
+    ImportSessionSummaryView, ImportSessionView, InstrumentDirectory, InstrumentUpsert,
+    InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery, NewImportQuestion,
+    Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store, StoreTx, SyncRefusalFilter,
+    SyncRefusalRecord, TokenAdmin, TokenView, TransactionalWork, TxResult,
+    UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::ports::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, RunHandle, RunOutcome, SeriesKey,
@@ -337,6 +337,215 @@ impl StoreTx for TransactionHandle<'_> {
         self.store
             .commit_import_session_within(owner, session, revision, answer)
             .map(|_closed| ())
+            .map_err(import_session_error)
+    }
+
+    fn load_import_session(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportSessionView>, AppError> {
+        self.store
+            .load_import_session(owner, session)
+            .map(|found| found.map(import_session_view))
+            .map_err(store_error)
+    }
+
+    fn list_import_observations(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportObservationView>, AppError> {
+        self.store
+            .load_import_session(owner, session)
+            .map_err(store_error)?
+            .ok_or(AppError::NotFound {
+                what: "an import session",
+                id: session.inner().to_string(),
+            })?;
+        self.store
+            .list_import_observations(session)
+            .map(|rows| rows.into_iter().map(import_observation_view).collect())
+            .map_err(store_error)
+    }
+
+    fn list_import_questions(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportQuestionView>, AppError> {
+        self.store
+            .load_import_session(owner, session)
+            .map_err(store_error)?
+            .ok_or(AppError::NotFound {
+                what: "an import session",
+                id: session.inner().to_string(),
+            })?;
+        self.store
+            .list_import_questions(session)
+            .map(|rows| rows.into_iter().map(import_question_view).collect())
+            .map_err(store_error)
+    }
+
+    fn list_account_details(&mut self, owner: OwnerId) -> Result<Vec<AccountDetailView>, AppError> {
+        self.store
+            .list_account_details(owner)
+            .map(|accounts| accounts.into_iter().map(account_detail_view).collect())
+            .map_err(store_error)
+    }
+
+    fn list_account_transfer_statements(
+        &mut self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountTransferStatementView>, AppError> {
+        self.store
+            .list_account_transfer_statements(owner)
+            .map(|statements| {
+                statements
+                    .into_iter()
+                    .map(
+                        |record: AccountTransferStatementRecord| AccountTransferStatementView {
+                            account: record.account,
+                            partners: record.partners,
+                        },
+                    )
+                    .collect()
+            })
+            .map_err(store_error)
+    }
+
+    fn list_classification_rules(
+        &mut self,
+        owner: OwnerId,
+    ) -> Result<Vec<ClassificationRuleView>, AppError> {
+        let rules = self.store.rule_history(owner).map_err(store_error)?;
+        rules.into_iter().map(classification_rule_view).collect()
+    }
+
+    fn hold_import_row(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row_key: Option<String>,
+        concluded: bool,
+        payload: String,
+    ) -> Result<HeldImportRow, AppError> {
+        self.store
+            .hold_import_row_within(owner, session, row_key.as_deref(), concluded, &payload)
+            .map(|held| HeldImportRow {
+                row: import_observation_view(held.observation),
+                receipt: held.receipt,
+            })
+            .map_err(import_session_error)
+    }
+
+    fn record_import_question(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        asking: NewImportQuestion,
+    ) -> Result<ImportQuestionView, AppError> {
+        let asking = StoredNewQuestion {
+            question: asking.question,
+            alternatives: asking.alternatives,
+            prompt: asking.prompt,
+        };
+        self.store
+            .record_import_question_within(owner, session, row, &asking)
+            .map(import_question_view)
+            .map_err(import_session_error)
+    }
+
+    fn record_intake_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        receipt: &str,
+    ) -> Result<(), AppError> {
+        self.store
+            .record_intake_receipt_within(owner, session, row, receipt)
+            .map_err(import_session_error)
+    }
+
+    fn answer_import_question(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        answer: String,
+    ) -> Result<ImportQuestionView, AppError> {
+        self.store
+            .answer_import_question_within(owner, session, question, &answer)
+            .map(import_question_view)
+            .map_err(import_session_error)
+    }
+
+    fn attach_import_question_rule(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        rule: String,
+    ) -> Result<ImportQuestionView, AppError> {
+        self.store
+            .attach_import_question_rule_within(owner, session, question, &rule)
+            .map(import_question_view)
+            .map_err(import_session_error)
+    }
+
+    fn attach_import_answer_rule(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        rows: &[u32],
+        rule: ClassificationRuleId,
+        version: u32,
+    ) -> Result<(), AppError> {
+        self.store
+            .attach_import_answer_rule_within(owner, session, rows, rule, version)
+            .map_err(import_session_error)
+    }
+
+    fn create_classification_rule(
+        &mut self,
+        owner: OwnerId,
+        matcher: iaam_ingest::classification::RuleMatcher,
+        outcome: iaam_ingest::classification::Classification,
+        replaces: Option<Uuid>,
+    ) -> Result<ClassificationRuleView, AppError> {
+        let rule = new_rule_from_domain(&matcher, outcome);
+        let stored = match replaces {
+            Some(previous) => self
+                .store
+                .amend_rule(owner, ClassificationRuleId(previous), rule),
+            None => self.store.insert_rule_within(owner, rule),
+        }
+        .map_err(rule_error(replaces))?;
+        classification_rule_view(stored)
+    }
+
+    fn import_answer_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+    ) -> Result<Option<String>, AppError> {
+        self.store
+            .import_answer_receipt(owner, session, question)
+            .map_err(store_error)
+    }
+
+    fn record_answer_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        receipt: &str,
+    ) -> Result<(), AppError> {
+        self.store
+            .record_answer_receipt_within(owner, session, question, receipt)
             .map_err(import_session_error)
     }
 
@@ -2545,6 +2754,23 @@ fn classification_rule_view(
 /// The classifier's own [`RuleMatcher`](iaam_ingest::classification::RuleMatcher)
 /// and [`Classification`](iaam_ingest::classification::Classification), spelled
 /// as `iaam-store`'s typed columns.
+/// The store's answers when a rule write is refused, in this layer's words.
+///
+/// One mapping for the route's write and the one an answer makes inside its
+/// transaction: two would eventually word one refusal two ways.
+fn rule_error(replaces: Option<Uuid>) -> impl FnOnce(iaam_store::StoreError) -> AppError {
+    move |error| match error {
+        iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
+            what: "an active classification rule",
+            id: replaces.map_or_else(String::new, |id| id.to_string()),
+        },
+        iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
+            what: what.to_owned(),
+        },
+        other => store_error(other),
+    }
+}
+
 fn new_rule_from_domain(
     matcher: &iaam_ingest::classification::RuleMatcher,
     outcome: iaam_ingest::classification::Classification,
@@ -2594,16 +2820,7 @@ impl ClassificationRuleStore for SqliteAdapter {
                 Some(previous) => store.amend_rule(owner, ClassificationRuleId(previous), rule),
                 None => store.insert_rule(owner, rule),
             }
-            .map_err(|error| match error {
-                iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
-                    what: "an active classification rule",
-                    id: replaces.map_or_else(String::new, |id| id.to_string()),
-                },
-                iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
-                    what: what.to_owned(),
-                },
-                other => store_error(other),
-            })?;
+            .map_err(rule_error(replaces))?;
             classification_rule_view(stored)
         })
         .await

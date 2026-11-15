@@ -195,6 +195,171 @@ pub trait StoreTx {
         answer: &str,
     ) -> Result<(), AppError>;
 
+    /// The session as it stands, read inside the caller's transaction.
+    ///
+    /// `None` when the session is not the owner's or not there, which are one
+    /// answer (§14). An answer's request reads the session it answers here
+    /// rather than before the transaction, so the state the write depends on —
+    /// open, and holding the question the caller named — is the state the write
+    /// runs under (ADR 0042 point 2).
+    fn load_import_session(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportSessionView>, AppError>;
+
+    /// The rows a session holds, in submission order, read inside the caller's
+    /// transaction.
+    fn list_import_observations(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportObservationView>, AppError>;
+
+    /// The questions a session holds, in row order, read inside the caller's
+    /// transaction.
+    fn list_import_questions(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportQuestionView>, AppError>;
+
+    /// The owner's accounts with everything they declare, read inside the
+    /// caller's transaction: what a submitted row or an answer is resolved
+    /// against.
+    fn list_account_details(&mut self, owner: OwnerId) -> Result<Vec<AccountDetailView>, AppError>;
+
+    /// What the owner has said about which of his accounts money moves
+    /// between, read inside the caller's transaction.
+    fn list_account_transfer_statements(
+        &mut self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountTransferStatementView>, AppError>;
+
+    /// The owner's classification rules, retired ones included, read inside the
+    /// caller's transaction.
+    ///
+    /// All of them rather than the active ones, so that a rule retired between a
+    /// caller's reading and the write is seen as the change it is; the caller
+    /// drops the retired ones itself (`Resolver::from_views`).
+    fn list_classification_rules(
+        &mut self,
+        owner: OwnerId,
+    ) -> Result<Vec<ClassificationRuleView>, AppError>;
+
+    /// Hold one submitted line inside the caller's transaction, and say what
+    /// answer the request that wrote it gave.
+    ///
+    /// The row's key is what a repeat of an intake request is recognised by
+    /// (ADR 0042 point 4): a key this session already holds returns the row it
+    /// occupies — with the payload it was written from, which the caller checks
+    /// its own command against — and `receipt` is the answer the first call
+    /// gave, where a request of this build gave one. Nothing is written for a
+    /// key already held.
+    fn hold_import_row(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row_key: Option<String>,
+        concluded: bool,
+        payload: String,
+    ) -> Result<HeldImportRow, AppError>;
+
+    /// Record the question one held row raises, or return the one it already
+    /// raised, inside the caller's transaction.
+    fn record_import_question(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        asking: NewImportQuestion,
+    ) -> Result<ImportQuestionView, AppError>;
+
+    /// Keep the answer one intake request gave for one row.
+    ///
+    /// Written after the row it answers, in the same transaction, so a kill
+    /// leaves neither a row whose request never answered it nor an answer to a
+    /// row that is not there (ADR 0042 points 1 and 4).
+    fn record_intake_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        receipt: &str,
+    ) -> Result<(), AppError>;
+
+    /// Record the owner's answer on one question and on the row it is about,
+    /// inside the caller's transaction.
+    fn answer_import_question(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        answer: String,
+    ) -> Result<ImportQuestionView, AppError>;
+
+    /// Name the standing rule an answered question was generalised into,
+    /// inside the caller's transaction.
+    fn attach_import_question_rule(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        rule: String,
+    ) -> Result<ImportQuestionView, AppError>;
+
+    /// Stamp a minted rule onto every row one answer settled, inside the
+    /// caller's transaction.
+    fn attach_import_answer_rule(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        rows: &[u32],
+        rule: ClassificationRuleId,
+        version: u32,
+    ) -> Result<(), AppError>;
+
+    /// Create a classification rule inside the caller's transaction.
+    ///
+    /// The rule an answer mints is written with the answer, so a kill cannot
+    /// leave a standing rule for an answer no session shows (`iaam-77hk`,
+    /// ADR 0042 point 1). A rule is a different port's fact; this is that
+    /// port's write, made to take part in the one transaction the request is.
+    fn create_classification_rule(
+        &mut self,
+        owner: OwnerId,
+        matcher: iaam_ingest::classification::RuleMatcher,
+        outcome: iaam_ingest::classification::Classification,
+        replaces: Option<uuid::Uuid>,
+    ) -> Result<ClassificationRuleView, AppError>;
+
+    /// What the answer request that answered this question answered, as it
+    /// answered it, read inside the caller's transaction.
+    ///
+    /// `None` for a question no answer request of this build has answered: a
+    /// question still open, one answered before the answer was kept, and one in
+    /// a session that is not the owner's. A caller that finds nothing has no
+    /// first answer to give and says so.
+    fn import_answer_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+    ) -> Result<Option<String>, AppError>;
+
+    /// Keep the answer one answer request gave, with the question it addressed.
+    ///
+    /// Written after the answers it describes, in the same transaction, so a
+    /// kill leaves neither an answered question whose request recorded no answer
+    /// nor an answer to a question nothing answered (ADR 0042 points 1 and 4).
+    fn record_answer_receipt(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        receipt: &str,
+    ) -> Result<(), AppError>;
+
     /// Write one page of price observations to an unfinished run.
     ///
     /// The five methods from here to [`StoreTx::finish_run`] are the steps of
@@ -1725,9 +1890,11 @@ pub trait Store: Send + Sync {
 
     /// Name the standing rule an already-recorded answer was generalised into.
     ///
-    /// Separate from the answer because the rule is a different port's fact and
-    /// no transaction spans the two. Refused for a question that is still open
-    /// or already names a rule: this may not invent a generalisation for an
+    /// Separate from the answer because the rule is a different port's fact; an
+    /// answer writes it through [`StoreTx::create_classification_rule`] and names
+    /// it here inside the same transaction, so no kill can leave the rule
+    /// standing unnamed (ADR 0042 point 1). Refused for a question that is still
+    /// open or already names a rule: this may not invent a generalisation for an
     /// unanswered question, and it may not overwrite one.
     async fn attach_import_question_rule(
         &self,
@@ -1933,6 +2100,21 @@ pub struct ImportCommitReceipt {
     pub revision: String,
     /// What the commit answered.
     pub answer: String,
+}
+
+/// One row a session holds, with the answer the request that wrote it gave.
+///
+/// The pair is what a repeat of an intake request finds (ADR 0042 point 4): the
+/// row carries the command — the payload it was written from — and `receipt` is
+/// what the first call answered, in the application's own vocabulary. The port
+/// carries it as a string because a receipt is stored and read back unchanged;
+/// the store neither mints nor interprets it, exactly as it neither mints nor
+/// interprets an observation's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldImportRow {
+    pub row: ImportObservationView,
+    /// `None` for a row no request of this build has answered yet.
+    pub receipt: Option<String>,
 }
 
 /// Everything one session's plan is computed from, read as one thing.

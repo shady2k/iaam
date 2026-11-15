@@ -83,6 +83,25 @@ impl SqliteStore {
         Ok(stored)
     }
 
+    /// Create a new rule inside the caller's transaction (ADR 0042 point 1).
+    ///
+    /// The rule an answer mints is written with the answer that minted it and
+    /// the rows it was stamped on, so a kill leaves either the whole decision or
+    /// none of it — instead of a standing rule for an answer no session shows,
+    /// which is what `iaam-77hk` cost. Called with no transaction open it
+    /// refuses, naming itself.
+    pub fn insert_rule_within(
+        &mut self,
+        owner: OwnerId,
+        rule: NewRule,
+    ) -> Result<StoredRule, StoreError> {
+        self.require_transaction("insert_rule_within")?;
+        let stored = write_rule(&self.conn, owner, rule, None)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fault::write_completed();
+        Ok(stored)
+    }
+
     /// Edit a rule: retire the previous one and create a new one.
     ///
     /// Both records are written in one transaction: there is no point at which

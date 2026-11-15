@@ -571,13 +571,10 @@ mod tests {
         );
 
         let error = outcome.expect_err("the deferred foreign key fails the commit");
-        match &error {
-            StoreError::Sqlite(source) => assert!(
-                source.to_string().contains("FOREIGN KEY"),
-                "the commit's own refusal is kept: {source}"
-            ),
-            other => panic!("expected the commit's failure, got {other:?}"),
-        }
+        assert!(
+            matches!(&error, StoreError::Sqlite(source) if source.to_string().contains("FOREIGN KEY")),
+            "the commit's own refusal is kept: {error}"
+        );
         assert!(
             store.connection().is_autocommit(),
             "the connection is out of the refused transaction"
